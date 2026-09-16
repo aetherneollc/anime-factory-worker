@@ -1077,7 +1077,7 @@ def test_run_anim_progress_requires_qc_and_successful_r2_upload(tmp_path, monkey
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(b"x" * 5000)
 
-    monkeypatch.setattr(session, "_submit_h3", submit)
+    monkeypatch.setattr(session, "_submit_h3_gpu", submit)
     monkeypatch.setattr(session, "_normalize_h3_for_qc", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         session,

@@ -84,6 +84,14 @@ from gpu_worker.preflight import RECYCLE_FAILURE_CLASSES, recycle_failure_class
 from gpu_worker.stack import stop_comfy_for_longlive
 from gpu_worker.stills import generate_still, unload_still_models
 from gpu_worker.vast_client import VastClient
+from gpu_worker.h3_session import (
+    H3PrepPool,
+    H3SessionTracker,
+    can_prefetch_staging,
+    instrument_h3_session,
+    model_load_count_for_modes,
+    modes_for_shots,
+)
 from gpu_worker.weights import ensure_h3_dits_for_shots, join_h3_weights
 from anime_factory.video_backend import (
     VideoBackendLockError,
@@ -1493,7 +1501,7 @@ def _stage_first_frame(shot: dict, root: Path) -> dict:
     return shot
 
 
-def _submit_h3(
+def _submit_h3_gpu(
     router: ComfyRouter,
     shot: dict,
     root: Path,
@@ -1603,6 +1611,106 @@ def _submit_h3(
     except Exception:
         pass
     return {"shot": shot["id"], "path": str(dest), "bytes": len(blob), "last_frame": shot.get("last_frame_path")}
+
+
+def _submit_h3(
+    router: ComfyRouter,
+    shot: dict,
+    root: Path,
+    dest: Path,
+    progress: ProgressCallback | None = None,
+) -> dict:
+    """GPU sampling only. Tests and legacy callers still patch this symbol."""
+    return _submit_h3_gpu(router, shot, root, dest, progress=progress)
+
+
+def _h3_normalize_and_qc(
+    root: Path,
+    conn,
+    shot: dict,
+    dest: Path,
+    prev: dict | None,
+    *,
+    version: int,
+    rel: str,
+    story_id: str,
+    progress: ProgressCallback | None = None,
+) -> tuple[str, str, Path | None]:
+    sid = str(shot.get("id") or "")
+    used_mode = select_mode(shot)
+    _normalize_h3_for_qc(dest, h3_resolution_profile(shot), progress=progress)
+    print({"h3_done": sid, "bytes": dest.stat().st_size if dest.is_file() else 0}, flush=True)
+    last_path = Path(str(shot.get("last_frame_path") or ""))
+    if not last_path.is_file():
+        last_path = _ensure_last_frame(root, shot, dest)
+    meta = _probe_video(dest)
+    verdict = incremental_qc_segment(
+        conn,
+        EP,
+        sid,
+        meta,
+        float(shot.get("duration") or 8.0),
+        segment=shot,
+        prev_segment=prev,
+        used_mode=used_mode,
+    )
+    try:
+        record_generation_result(
+            conn,
+            sid,
+            version,
+            join_story(story_id, rel),
+            shot.get("seed"),
+            used_mode,
+            "completed" if verdict == "pass" else "failed",
+            verdict,
+        )
+    except Exception:
+        pass
+    return verdict, sid, last_path
+
+
+def _h3_upload_passing(
+    story_id: str,
+    root: Path,
+    conn,
+    sid: str,
+    dest: Path,
+    rel: str,
+    last_path: Path | None,
+    progress: ProgressCallback | None = None,
+) -> str:
+    """R2 upload + sqlite flush after QC pass. Safe to queue while the next GPU shot runs."""
+    upload = put_file(join_story(story_id, rel), dest, "video/mp4")
+    if not _upload_ok(upload):
+        raise RuntimeError(f"shot R2 upload failed: {sid}")
+    if last_path is None or not last_path.is_file() or last_path.stat().st_size < 32:
+        raise RuntimeError(f"shot last.png missing: {sid}")
+    last_upload = put_file(
+        join_story(story_id, f"episodes/{EP}/keyframes/{sid}/last.png"),
+        last_path,
+        "image/png",
+    )
+    if not _upload_ok(last_upload):
+        raise RuntimeError(f"shot last.png R2 upload failed: {sid}")
+    mark_completed_passing(conn, sid, join_story(story_id, rel))
+    _checkpoint_story(conn, story_id, root, progress=progress, upload=True)
+    if progress:
+        progress(f"shot_uploaded:{sid}")
+    return sid
+
+
+def flush_gpu_artifacts(
+    story_id: str,
+    root: Path,
+    conn,
+    progress: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    """Push the latest sqlite + per-shot uploads before compose/idle teardown."""
+    result = _checkpoint_story(conn, story_id, root, progress=progress, upload=True)
+    if progress:
+        progress("gpu_flushed")
+    return result if isinstance(result, dict) else {"ok": True}
 
 
 def _stage_longlive_first_frame(shot: dict, root: Path, src: Path) -> dict:
@@ -2062,6 +2170,236 @@ def _longlive_cpu_post(
     return sid
 
 
+def _run_anim_h3(
+    story_id: str,
+    root: Path,
+    conn,
+    router: ComfyRouter | None,
+    progress: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    shots = _board_shots(root)
+    done: list[str] = []
+    failed: list[Any] = []
+    skipped: list[str] = []
+    repaired: list[str] = []
+    resolution = {
+        **h3_resolution_profile(shots[0] if shots else {}),
+        "delivery_width": VIDEO_WIDTH,
+        "delivery_height": VIDEO_HEIGHT,
+        "video_backend": "h3",
+    }
+    session_tracker = H3SessionTracker()
+    prep_pool = H3PrepPool(lambda shot: _stage_first_frame(shot, root))
+    cpu = CpuPostQueue()
+    try:
+        for index, shot in enumerate(shots):
+            sid = str(shot.get("id") or "")
+            try:
+                if progress:
+                    if index == 0:
+                        progress(f"production_started:{sid}")
+                    progress(f"anim:{sid}")
+                prev = shots[index - 1] if index else None
+                if int(shot.get("chain_index") or 0) > 0:
+                    prev_last = prev.get("last_frame_path") if prev else None
+                    if (
+                        prev
+                        and prev.get("chain_id") == shot.get("chain_id")
+                        and prev_last
+                        and not is_directory_like(prev_last)
+                    ):
+                        shot = apply_chain_first_frame(shot, prev_last)
+                        shots[index] = shot
+                    else:
+                        failed.append({"id": sid, "error": "pending_chain_missing_last_frame"})
+                        continue
+                existing = existing_generation_file(root, sid)
+                if existing is not None:
+                    skipped.append(sid)
+                    rel = existing.relative_to(root).as_posix()
+                    mark_completed_passing(conn, sid, join_story(story_id, rel))
+                    last_path = _ensure_last_frame(root, shot, existing)
+                    if last_path is not None:
+                        _link_next_chain(shots, index, last_path)
+                        try:
+                            put_file(
+                                join_story(story_id, f"episodes/{EP}/keyframes/{sid}/last.png"),
+                                last_path,
+                                "image/png",
+                            )
+                        except Exception:
+                            pass
+                    try:
+                        _upload_ok(put_file(join_story(story_id, rel), existing, "video/mp4"))
+                    except Exception:
+                        pass
+                    next_shot = shots[index + 1] if index + 1 < len(shots) else None
+                    if next_shot is not None and can_prefetch_staging(next_shot):
+                        prep_pool.schedule(next_shot)
+                    continue
+                if router is None:
+                    failed.append({"id": sid, "error": "no_comfy_router"})
+                    continue
+                shot = prep_pool.prime(shot)
+                shots[index] = shot
+                next_shot = shots[index + 1] if index + 1 < len(shots) else None
+                if next_shot is not None and can_prefetch_staging(next_shot):
+                    prep_pool.schedule(next_shot)
+                version, rel = next_generation_path(root, sid)
+                dest = root / rel
+                used_mode = select_mode(shot)
+                session_tracker.note_mode(used_mode)
+                print(
+                    {
+                        "h3_submit": sid,
+                        "mode": used_mode,
+                        "backend": "h3",
+                        "chain_index": shot.get("chain_index", 0),
+                    },
+                    flush=True,
+                )
+                submit_error: BaseException | None = None
+                for submit_attempt in range(H3_MAX_RETRIES + 1):
+                    try:
+                        _submit_h3_gpu(router, shot, root, dest, progress)
+                        submit_error = None
+                        break
+                    except (BudgetExceeded, ProgressStalled, StartupTimeout):
+                        raise
+                    except Exception as exc:  # noqa: BLE001 — retry the segment; do not DEALLOCATE
+                        submit_error = exc
+                        if recycle_failure_class(exc):
+                            break
+                        print(
+                            {
+                                "h3_submit_retry": sid,
+                                "attempt": submit_attempt + 1,
+                                "backend": "h3",
+                                "error": str(exc)[:800],
+                            },
+                            flush=True,
+                        )
+                if submit_error is not None:
+                    classified = recycle_failure_class(submit_error)
+                    if classified:
+                        raise RuntimeError(f"{classified}:{submit_error}") from submit_error
+                    raise submit_error
+                last_path = Path(str(shot.get("last_frame_path") or ""))
+                if not last_path.is_file():
+                    last_path = _ensure_last_frame(root, shot, dest)
+                if last_path is not None:
+                    _link_next_chain(shots, index, last_path)
+                    _db_execute(
+                        conn,
+                        "UPDATE segments SET last_frame_path = ? WHERE id = ?",
+                        (str(last_path), sid),
+                    )
+                attempt = 0
+                verdict = "pass"
+                last_path: Path | None = None
+                while True:
+                    verdict, _, last_path = _h3_normalize_and_qc(
+                        root,
+                        conn,
+                        shot,
+                        dest,
+                        prev,
+                        version=version,
+                        rel=rel,
+                        story_id=story_id,
+                        progress=progress,
+                    )
+                    if verdict != "retry" or attempt >= H3_MAX_RETRIES or router is None:
+                        break
+                    attempt += 1
+                    c_verdict, c_details = continuity_qc(prev, shot, used_mode)
+                    issues = list((c_details.get("issues") or [])) or ["visual_retry"]
+                    repair = plan_repair(shot, issues, attempt)
+                    open_repair_task(conn, sid, issues, attempt, shot.get("h3_prompt"), repair)
+                    shot = dict(
+                        shot,
+                        seed=repair["seed"],
+                        h3_prompt=repair["h3_prompt"],
+                        h3_mode=repair.get("h3_mode") or shot.get("h3_mode"),
+                    )
+                    shots[index] = shot
+                    version, rel = next_generation_path(root, sid)
+                    dest = root / rel
+                    used_mode = select_mode(shot)
+                    session_tracker.note_mode(used_mode)
+                    print(
+                        {
+                            "h3_repair": sid,
+                            "attempt": attempt,
+                            "strategy": repair["strategy"],
+                            "backend": "h3",
+                        },
+                        flush=True,
+                    )
+                    _submit_h3_gpu(router, shot, root, dest, progress)
+                    last_path = _ensure_last_frame(root, shot, dest)
+                    if last_path is not None:
+                        _link_next_chain(shots, index, last_path)
+                    repaired.append(sid)
+                if verdict == "pass":
+                    cpu.submit(
+                        _h3_upload_passing,
+                        story_id,
+                        root,
+                        conn,
+                        sid,
+                        dest,
+                        rel,
+                        last_path,
+                        progress,
+                    )
+                else:
+                    failed.append({"id": sid, "verdict": verdict})
+                if next_shot is not None and int(next_shot.get("chain_index") or 0) > 0:
+                    prep_pool.schedule(dict(next_shot))
+            except (BudgetExceeded, ProgressStalled, StartupTimeout):
+                try:
+                    flush_gpu_artifacts(story_id, root, conn, progress=progress)
+                except Exception:
+                    pass
+                raise
+            except Exception as exc:  # noqa: BLE001 — do not silent-truncate the episode
+                classified = recycle_failure_class(exc)
+                print(
+                    {"h3_fail": sid, "error": str(exc)[:800], "failure_class": classified},
+                    flush=True,
+                )
+                if classified:
+                    raise
+                failed.append({"id": sid, "error": str(exc)[:800]})
+        posted = cpu.drain()
+        done.extend(posted)
+    finally:
+        prep_pool.close()
+    expected = model_load_count_for_modes(modes_for_shots(shots))
+    actual = session_tracker.model_load_count
+    if expected and actual > expected:
+        raise RuntimeError(
+            f"{FAIL_CLOSED}: expected model_load_count<={expected}, got {actual} "
+            f"({session_tracker.loaded_unets})"
+        )
+    instrument = instrument_h3_session(shots, warmed=actual > 0)
+    instrument["model_load_count"] = actual
+    print(json.dumps({"h3_session": instrument}, ensure_ascii=False), flush=True)
+    return {
+        "shots_total": len(shots),
+        "shots_done": len(done) + len(skipped),
+        "generated": done,
+        "skipped_existing": skipped,
+        "repaired": repaired,
+        "failed": failed,
+        "resolution": resolution,
+        "model_load_count": actual,
+        "h3_session": instrument,
+        "gpu_done": not failed and (len(done) + len(skipped)) > 0,
+    }
+
+
 def run_anim(
     story_id: str,
     root: Path,
@@ -2076,237 +2414,7 @@ def run_anim(
         raise RuntimeError(str(exc)) from exc
     if backend == "longlive":
         return _run_anim_longlive(story_id, root, conn, progress)
-    done = []
-    failed = []
-    skipped = []
-    repaired = []
-    resolution = {
-        **h3_resolution_profile(shots[0] if shots else {}),
-        "delivery_width": VIDEO_WIDTH,
-        "delivery_height": VIDEO_HEIGHT,
-        "video_backend": backend,
-    }
-    for index, shot in enumerate(shots):
-        sid = shot["id"]
-        uploaded = False
-        try:
-            if progress:
-                if index == 0:
-                    progress(f"production_started:{sid}")
-                progress(f"anim:{sid}")
-            prev = shots[index - 1] if index else None
-            if int(shot.get("chain_index") or 0) > 0:
-                prev_last = prev.get("last_frame_path") if prev else None
-                if prev and prev.get("chain_id") == shot.get("chain_id") and prev_last and not is_directory_like(prev_last):
-                    shot = apply_chain_first_frame(shot, prev_last)
-                    shots[index] = shot
-                else:
-                    failed.append({"id": sid, "error": "pending_chain_missing_last_frame"})
-                    continue
-            existing = existing_generation_file(root, sid)
-            if existing is not None:
-                skipped.append(sid)
-                rel = existing.relative_to(root).as_posix()
-                mark_completed_passing(conn, sid, join_story(story_id, rel))
-                last_path = _ensure_last_frame(root, shot, existing)
-                if last_path is not None:
-                    _link_next_chain(shots, index, last_path)
-                    try:
-                        put_file(join_story(story_id, f"episodes/{EP}/keyframes/{sid}/last.png"), last_path, "image/png")
-                    except Exception:
-                        pass
-                try:
-                    uploaded = _upload_ok(put_file(join_story(story_id, rel), existing, "video/mp4"))
-                except Exception:
-                    uploaded = False
-                continue
-            if router is None and backend != "longlive":
-                failed.append({"id": sid, "error": "no_comfy_router"})
-                continue
-            version, rel = next_generation_path(root, sid)
-            dest = root / rel
-            if backend == "longlive":
-                shot = _prepare_longlive_shot(shot, root)
-                shots[index] = shot
-                first = Path(str(shot.get("first_frame_path") or ""))
-                if first.is_file():
-                    try:
-                        put_file(
-                            join_story(story_id, f"episodes/{EP}/keyframes/{sid}/f1.png"),
-                            first,
-                            "image/png",
-                        )
-                    except Exception:
-                        pass
-            used_mode = select_mode(shot)
-            print(
-                {
-                    "h3_submit": sid,
-                    "mode": used_mode,
-                    "backend": backend,
-                    "chain_index": shot.get("chain_index", 0),
-                },
-                flush=True,
-            )
-            submit_error: BaseException | None = None
-            for submit_attempt in range(H3_MAX_RETRIES + 1):
-                try:
-                    _submit_video(router, shot, root, dest, progress, backend)
-                    submit_error = None
-                    break
-                except (BudgetExceeded, ProgressStalled, StartupTimeout):
-                    raise
-                except Exception as exc:  # noqa: BLE001 — retry the segment; do not DEALLOCATE
-                    submit_error = exc
-                    if backend == "longlive" and is_longlive_fatal_error(exc):
-                        break
-                    if recycle_failure_class(exc):
-                        break
-                    print(
-                        {
-                            "h3_submit_retry": sid,
-                            "attempt": submit_attempt + 1,
-                            "backend": backend,
-                            "error": str(exc)[:800],
-                        },
-                        flush=True,
-                    )
-            if submit_error is not None:
-                if backend == "longlive" and is_longlive_fatal_error(submit_error):
-                    raise RuntimeError(f"{FAIL_CLOSED}:{submit_error}") from submit_error
-                classified = recycle_failure_class(submit_error)
-                if classified:
-                    raise RuntimeError(f"{classified}:{submit_error}") from submit_error
-                raise submit_error
-            if backend == "longlive":
-                _normalize_h3_for_qc(
-                    dest,
-                    {"width": LONGLIVE_NATIVE_WIDTH, "height": LONGLIVE_NATIVE_HEIGHT},
-                    progress=progress,
-                )
-            else:
-                _normalize_h3_for_qc(dest, h3_resolution_profile(shot), progress=progress)
-            print({"h3_done": sid, "bytes": dest.stat().st_size if dest.is_file() else 0}, flush=True)
-            last_path = Path(str(shot.get("last_frame_path") or ""))
-            if not last_path.is_file():
-                last_path = _ensure_last_frame(root, shot, dest)
-            if last_path is not None:
-                _link_next_chain(shots, index, last_path)
-                _db_execute(
-                    conn,
-                    "UPDATE segments SET last_frame_path = ? WHERE id = ?",
-                    (str(last_path), sid),
-                )
-            meta = _probe_video(dest)
-            verdict = incremental_qc_segment(
-                conn,
-                EP,
-                sid,
-                meta,
-                float(shot.get("duration") or 8.0),
-                segment=shot,
-                prev_segment=prev,
-                used_mode=used_mode,
-            )
-            attempt = 0
-            while verdict == "retry" and attempt < H3_MAX_RETRIES and router is not None:
-                attempt += 1
-                c_verdict, c_details = continuity_qc(prev, shot, used_mode)
-                issues = list((c_details.get("issues") or [])) or ["visual_retry"]
-                repair = plan_repair(shot, issues, attempt)
-                open_repair_task(conn, sid, issues, attempt, shot.get("h3_prompt"), repair)
-                shot = dict(shot, seed=repair["seed"], h3_prompt=repair["h3_prompt"], h3_mode=repair.get("h3_mode") or shot.get("h3_mode"))
-                shots[index] = shot
-                version, rel = next_generation_path(root, sid)
-                dest = root / rel
-                print({"h3_repair": sid, "attempt": attempt, "strategy": repair["strategy"], "backend": backend}, flush=True)
-                _submit_video(router, shot, root, dest, progress, backend)
-                if backend == "longlive":
-                    _normalize_h3_for_qc(
-                        dest,
-                        {"width": LONGLIVE_NATIVE_WIDTH, "height": LONGLIVE_NATIVE_HEIGHT},
-                        progress=progress,
-                    )
-                else:
-                    _normalize_h3_for_qc(dest, h3_resolution_profile(shot), progress=progress)
-                last_path = _ensure_last_frame(root, shot, dest)
-                if last_path is not None:
-                    _link_next_chain(shots, index, last_path)
-                meta = _probe_video(dest)
-                used_mode = select_mode(shot)
-                verdict = incremental_qc_segment(
-                    conn,
-                    EP,
-                    sid,
-                    meta,
-                    float(shot.get("duration") or 8.0),
-                    segment=shot,
-                    prev_segment=prev,
-                    used_mode=used_mode,
-                )
-                repaired.append(sid)
-            try:
-                record_generation_result(
-                    conn,
-                    sid,
-                    version,
-                    join_story(story_id, rel),
-                    shot.get("seed"),
-                    used_mode,
-                    "completed" if verdict == "pass" else "failed",
-                    verdict,
-                )
-            except Exception:
-                pass
-            if verdict == "pass":
-                upload = put_file(join_story(story_id, rel), dest, "video/mp4")
-                if not _upload_ok(upload):
-                    raise RuntimeError(f"shot R2 upload failed: {sid}")
-                if last_path is None or not last_path.is_file() or last_path.stat().st_size < 32:
-                    raise RuntimeError(f"shot last.png missing: {sid}")
-                last_upload = put_file(
-                    join_story(story_id, f"episodes/{EP}/keyframes/{sid}/last.png"),
-                    last_path,
-                    "image/png",
-                )
-                if not _upload_ok(last_upload):
-                    raise RuntimeError(f"shot last.png R2 upload failed: {sid}")
-                mark_completed_passing(conn, sid, join_story(story_id, rel))
-                done.append(sid)
-                uploaded = True
-            else:
-                failed.append({"id": sid, "verdict": verdict})
-        except (BudgetExceeded, ProgressStalled, StartupTimeout):
-            try:
-                _checkpoint_story(conn, story_id, root, upload=True)
-            except Exception:
-                pass
-            raise
-        except Exception as exc:  # noqa: BLE001 — do not silent-truncate the episode
-            classified = recycle_failure_class(exc)
-            print({"h3_fail": sid, "error": str(exc)[:800], "failure_class": classified}, flush=True)
-            if classified:
-                raise
-            failed.append({"id": sid, "error": str(exc)[:800]})
-        try:
-            _checkpoint_story(conn, story_id, root, progress=progress)
-            if uploaded and progress:
-                progress(f"shot_uploaded:{sid}")
-        except (BudgetExceeded, ProgressStalled, StartupTimeout):
-            try:
-                _checkpoint_story(conn, story_id, root, upload=True)
-            except Exception:
-                pass
-            raise
-    return {
-        "shots_total": len(shots),
-        "shots_done": len(done) + len(skipped),
-        "generated": done,
-        "skipped_existing": skipped,
-        "repaired": repaired,
-        "failed": failed,
-        "resolution": resolution,
-    }
+    return _run_anim_h3(story_id, root, conn, router, progress=progress)
 
 
 def _run_checked(
@@ -2915,6 +3023,11 @@ def run_gpu_episode(
     if backend == "longlive":
         stop_comfy_for_longlive()
     anim = run_anim(story_id, root, conn, router, progress=progress)
+    if backend != "longlive" and anim.get("gpu_done"):
+        try:
+            flush_gpu_artifacts(story_id, root, conn, progress=progress)
+        except Exception:
+            pass
     remaining, allow_compose = compose_gate(anim)
     if control:
         if allow_compose:
@@ -2983,6 +3096,7 @@ def run_gpu_episode(
         "compose": compose,
         "remaining": remaining,
         "truncated": False,
+        "gpu_done": bool((anim or {}).get("gpu_done")),
     }
 
 
