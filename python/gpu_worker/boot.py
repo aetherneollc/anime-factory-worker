@@ -204,12 +204,13 @@ def assert_pre_lease(flags: dict[str, str] | None) -> None:
 
 
 def assert_lease_capabilities(capabilities: dict | None) -> None:
-    """Refuse PUT /asks/ unless the image reports comfy + h3 + 生图."""
+    """Refuse PUT /asks/ unless the image reports comfy + 生图 + one video line."""
     if image_can_lease(capabilities):
         return
     raise ImageCapabilityError(
-        "refuse lease: image must have comfy:true, h3:true, and kolors/image_gen:true; "
-        "do not PUT /asks/ for a card that cannot 生图 + H3"
+        "refuse lease: image must have comfy:true, kolors/image_gen:true, and "
+        "exactly one of h3:true or longlive:true; do not PUT /asks/ for a card "
+        "that cannot 生图 + video"
     )
 
 

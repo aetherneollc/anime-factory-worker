@@ -12,7 +12,8 @@ ARG COMFYUI_REF=7ba217d6b5ac7ef984b157f7e5dfc93465b9937d
 ENV DEBIAN_FRONTEND=noninteractive \
     VIRTUAL_ENV=/opt/venv \
     PATH=/opt/venv/bin:$PATH \
-    PIP_ONLY_BINARY=:all:
+    PIP_ONLY_BINARY=:all: \
+    AF_IMAGE_CAPABILITY=h3
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -156,6 +157,7 @@ ENV PYTHONPATH=/app/python \
 
 LABEL org.aetherneo.anime-factory.comfy="true" \
       org.aetherneo.anime-factory.h3="true" \
+      org.aetherneo.anime-factory.video-backend="h3" \
       org.aetherneo.anime-factory.kolors="true" \
       org.aetherneo.anime-factory.image-gen="true" \
       org.aetherneo.anime-factory.agent="true"

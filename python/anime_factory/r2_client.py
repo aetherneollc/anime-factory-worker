@@ -111,8 +111,19 @@ def delete_keys(keys: list[str]) -> dict[str, Any]:
     return {"ok": errors == 0, "deleted": deleted, "errors": errors, "bucket": cfg["bucket"]}
 
 
-def download_prefix(prefix: str, dest_root: Path, strip_prefix: str | None = None) -> list[str]:
-    """Download R2 keys under prefix into dest_root, preserving relative paths."""
+def download_prefix(
+    prefix: str,
+    dest_root: Path,
+    strip_prefix: str | None = None,
+    *,
+    skip_existing: bool = True,
+    key_filter=None,
+) -> list[str]:
+    """Download R2 keys under prefix into dest_root, preserving relative paths.
+
+    ``skip_existing`` keeps local files whose size matches the remote listing so a
+    batch can incrementally sync instead of re-pulling the whole story tree.
+    """
     keys = list_prefix(prefix)
     cut = strip_prefix if strip_prefix is not None else prefix
     written = []
@@ -120,8 +131,18 @@ def download_prefix(prefix: str, dest_root: Path, strip_prefix: str | None = Non
         key = item.get("key") or ""
         if not key or key.endswith("/"):
             continue
+        if key_filter is not None and not key_filter(key):
+            continue
         rel = key[len(cut) :] if key.startswith(cut) else key
         dest = dest_root / rel
+        remote_size = item.get("size")
+        if skip_existing and dest.is_file():
+            try:
+                if remote_size is None or int(remote_size) == dest.stat().st_size:
+                    written.append(rel)
+                    continue
+            except (OSError, TypeError, ValueError):
+                pass
         if download_file(key, dest):
             written.append(rel)
     return written

@@ -61,17 +61,7 @@ VISUAL_QC_CLIP_PRETRAINED_TAG = "openai"
 VISUAL_QC_CLIP_MIN_BYTES = 600_000_000
 VISUAL_QC_CLIP_CONFIG_MIN_BYTES = 32
 
-H3_FILES: list[dict[str, str]] = [
-    {
-        "repo": H3_DIT_REPO,
-        "hf": "minimax_h3_fl2va_pruned_nvfp4.safetensors",
-        "dest": "models/diffusion_models/minimax_h3_fl2va_pruned_nvfp4.safetensors",
-    },
-    {
-        "repo": H3_DIT_REPO,
-        "hf": "minimax_h3_ref2va_pruned_nvfp4.safetensors",
-        "dest": "models/diffusion_models/minimax_h3_ref2va_pruned_nvfp4.safetensors",
-    },
+H3_CORE_FILES: list[dict[str, str]] = [
     {
         "repo": H3_ORG_REPO,
         "hf": "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
@@ -82,12 +72,23 @@ H3_FILES: list[dict[str, str]] = [
         "hf": "vae/minimax_h3_video_vae_fp16.safetensors",
         "dest": "models/vae/minimax_h3_video_vae_fp16.safetensors",
     },
+]
+H3_FL2VA_FILES: list[dict[str, str]] = [
     {
-        "repo": H3_ORG_REPO,
-        "hf": "vae/minimax_h3_audio_vae_fp32.safetensors",
-        "dest": "models/vae/minimax_h3_audio_vae_fp32.safetensors",
+        "repo": H3_DIT_REPO,
+        "hf": "minimax_h3_fl2va_pruned_nvfp4.safetensors",
+        "dest": "models/diffusion_models/minimax_h3_fl2va_pruned_nvfp4.safetensors",
     },
 ]
+H3_REF2VA_FILES: list[dict[str, str]] = [
+    {
+        "repo": H3_DIT_REPO,
+        "hf": "minimax_h3_ref2va_pruned_nvfp4.safetensors",
+        "dest": "models/diffusion_models/minimax_h3_ref2va_pruned_nvfp4.safetensors",
+    },
+]
+# Audio VAE is never decoded (CosyVoice2 is the mix). Do not download it.
+H3_FILES: list[dict[str, str]] = [*H3_CORE_FILES, *H3_FL2VA_FILES, *H3_REF2VA_FILES]
 STILL_FILES: list[dict[str, str]] = [
     {
         "repo": STILL_CKPT_REPO,
@@ -329,14 +330,51 @@ def ensure_weights(
 
 
 def runtime_weight_bytes(comfy_dir: Path | str | None = None) -> int:
-    """Count completed and in-progress local model bytes for startup monitoring."""
-    root = Path(comfy_dir or os.environ.get("COMFYUI_DIR") or "/opt/ComfyUI") / "models"
+    """Count completed and in-progress local model bytes for the selected backend."""
+    backend = ""
+    try:
+        from anime_factory.video_backend import locked_video_backend, select_video_backend
+
+        backend = locked_video_backend() or select_video_backend()
+    except Exception:  # noqa: BLE001 — accounting must not crash boot
+        backend = (os.environ.get("AF_VIDEO_BACKEND") or "h3").strip().lower()
     total = 0
-    if not root.is_dir():
+    if backend != "longlive":
+        root = Path(comfy_dir or os.environ.get("COMFYUI_DIR") or "/opt/ComfyUI") / "models"
+        total += _dir_bytes(root)
         return total
+    still_root = Path(comfy_dir or os.environ.get("COMFYUI_DIR") or "/opt/ComfyUI") / "models"
+    for rel in (
+        "checkpoints",
+        "ipadapter",
+        "clip_vision",
+        "visual_qc",
+    ):
+        total += _dir_bytes(still_root / rel)
+    try:
+        from gpu_worker.longlive import generator_ckpt, longlive_root, wan_dir
+
+        for path in (generator_ckpt(), wan_dir(), longlive_root() / "checkpoints"):
+            total += _dir_bytes(path if path.is_dir() else path.parent)
+    except Exception:  # noqa: BLE001
+        pass
+    return total
+
+
+def _dir_bytes(root: Path) -> int:
+    total = 0
+    if root.is_file():
+        try:
+            return root.stat().st_size
+        except OSError:
+            return 0
+    if not root.is_dir():
+        return 0
     for path in root.rglob("*"):
         try:
             if path.is_file() and not path.is_symlink():
+                if "minimax_h3" in path.name and "longlive" in str(root).lower():
+                    continue
                 total += path.stat().st_size
         except OSError:
             continue
@@ -390,37 +428,81 @@ def ensure_still_weights(
     return out
 
 
+def _refuse_h3_on_longlive() -> None:
+    try:
+        from anime_factory.video_backend import locked_video_backend, select_video_backend
+
+        backend = locked_video_backend() or select_video_backend()
+    except Exception:  # noqa: BLE001
+        backend = (os.environ.get("AF_VIDEO_BACKEND") or "").strip().lower()
+    cap = (os.environ.get("AF_IMAGE_CAPABILITY") or "").strip().lower()
+    if backend == "longlive" or cap == "longlive":
+        raise RuntimeError(
+            "capability_mismatch:video_backend: refuse H3 weight download on LongLive image/path"
+        )
+
+
+def h3_files_for_modes(modes: set[str] | None = None) -> list[dict[str, str]]:
+    """Core TE+video VAE plus only the DiTs the board actually needs.
+
+    ``None`` keeps the sequential full pull (tests / one-shot). An empty set or
+    ``{"core"}`` is boot: TE + video VAE only. Audio VAE is never included.
+    """
+    files = list(H3_CORE_FILES)
+    if modes is None:
+        files.extend(H3_FL2VA_FILES)
+        files.extend(H3_REF2VA_FILES)
+        return files
+    wanted = {str(m or "").strip().lower() for m in modes if str(m or "").strip()}
+    if not wanted or wanted == {"core"}:
+        return files
+    if any(m.startswith("fl2va") for m in wanted):
+        files.extend(H3_FL2VA_FILES)
+    if "ref2va" in wanted:
+        files.extend(H3_REF2VA_FILES)
+    return files
+
+
 def ensure_h3_weights(
     comfy_dir: Path | str | None = None,
     progress: Callable[[str], None] | None = None,
+    modes: set[str] | None = None,
 ) -> dict:
-    """H3 NVFP4 DiT + TE + VAE. Must finish before anim sampling."""
+    """H3 NVFP4 DiT + TE + video VAE. Must finish before anim sampling. Never audio VAE."""
+    _refuse_h3_on_longlive()
     root = Path(comfy_dir or os.environ.get("COMFYUI_DIR") or "/opt/ComfyUI")
     yaml_path = write_extra_model_paths(root)
     if _skip_weights():
         return _empty_materialize(root, yaml_path)
-    out = _materialize_items(H3_FILES, root, progress=progress)
+    items = h3_files_for_modes(modes)
+    out = _materialize_items(items, root, progress=progress)
     out["extra_model_paths"] = str(yaml_path)
     out["kind"] = "h3"
+    out["modes"] = sorted(modes) if modes else ["core", "fl2va", "ref2va"]
     return out
 
 
-def missing_h3_weight_labels(comfy_dir: Path | str | None = None) -> list[str]:
+def missing_h3_weight_labels(
+    comfy_dir: Path | str | None = None,
+    modes: set[str] | None = None,
+) -> list[str]:
     root = Path(comfy_dir or os.environ.get("COMFYUI_DIR") or "/opt/ComfyUI")
-    return [item["dest"] for item in H3_FILES if not _item_present(root / item["dest"], item)]
+    return [item["dest"] for item in h3_files_for_modes(modes) if not _item_present(root / item["dest"], item)]
 
 
 def start_h3_weights_background(
     comfy_dir: Path | str | None = None,
     progress: Callable[[str], None] | None = None,
+    modes: set[str] | None = None,
 ) -> threading.Thread | None:
-    """Pull H3 while stills (and CosyVoice TTS) run. Anim must join this first."""
+    """Pull H3 core (and optional DiTs) while stills run. Anim must join this first."""
     global _h3_thread, _h3_error
+    _refuse_h3_on_longlive()
     root = Path(comfy_dir or os.environ.get("COMFYUI_DIR") or "/opt/ComfyUI")
     with _h3_lock:
         if _h3_thread is not None and _h3_thread.is_alive():
             return _h3_thread
-        if _h3_done.is_set() and _h3_error is None and not missing_h3_weight_labels(root):
+        if _h3_done.is_set() and _h3_error is None and not missing_h3_weight_labels(root, modes={"core"} if modes is None else modes):
             return _h3_thread
         _h3_error = None
         _h3_done.clear()
@@ -428,7 +510,8 @@ def start_h3_weights_background(
         def run() -> None:
             global _h3_error
             try:
-                ensure_h3_weights(root, progress=progress)
+                # Boot downloads TE + video VAE only; DiTs wait for the board.
+                ensure_h3_weights(root, progress=progress, modes=modes if modes is not None else set())
             except BaseException as exc:  # noqa: BLE001 — join_h3_weights re-raises
                 _h3_error = exc
             finally:
@@ -439,8 +522,13 @@ def start_h3_weights_background(
         return _h3_thread
 
 
-def join_h3_weights(comfy_dir: Path | str | None = None, timeout_s: float | None = None) -> dict:
-    """Block until H3 files are on disk. Call this before H3 sampling, not before stills."""
+def join_h3_weights(
+    comfy_dir: Path | str | None = None,
+    timeout_s: float | None = None,
+    modes: set[str] | None = None,
+) -> dict:
+    """Block until H3 core files are on disk. Call this before H3 sampling, not before stills."""
+    _refuse_h3_on_longlive()
     root = Path(comfy_dir or os.environ.get("COMFYUI_DIR") or "/opt/ComfyUI")
     thread: threading.Thread | None
     with _h3_lock:
@@ -453,14 +541,27 @@ def join_h3_weights(comfy_dir: Path | str | None = None, timeout_s: float | None
         raise RuntimeError(f"h3 weights download failed: {_h3_error}") from _h3_error
     if _skip_weights():
         return {"ok": True, "skipped": True, "missing": []}
-    missing = missing_h3_weight_labels(root)
+    needed = modes if modes is not None else set()
+    missing = missing_h3_weight_labels(root, modes=needed)
     if missing:
         # No background job (tests / AF_SKIP) — pull now so anim still has files.
-        ensure_h3_weights(root)
-        missing = missing_h3_weight_labels(root)
+        ensure_h3_weights(root, modes=needed)
+        missing = missing_h3_weight_labels(root, modes=needed)
     if missing:
         raise RuntimeError(f"h3 weights missing after join: {missing}")
     return {"ok": True, "skipped": False, "missing": []}
+
+
+def ensure_h3_dits_for_shots(
+    shots: list[dict],
+    comfy_dir: Path | str | None = None,
+    progress: Callable[[str], None] | None = None,
+) -> dict:
+    """Download only FL2VA / Ref2VA DiTs the board will actually sample."""
+    from gpu_worker.h3 import select_mode
+
+    modes = {select_mode(shot) for shot in shots or []}
+    return ensure_h3_weights(comfy_dir, progress=progress, modes=modes)
 
 
 def materialize_runtime_weights(

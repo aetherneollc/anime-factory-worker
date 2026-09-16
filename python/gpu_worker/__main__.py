@@ -19,6 +19,22 @@ from gpu_worker.registry import GpuRegistry
 from gpu_worker.vast_client import VastClient
 
 
+def work_queue_depth(payload: dict[str, Any] | None) -> int:
+    """Control-plane items still waiting. Empty queue is required for idle teardown."""
+    if not isinstance(payload, dict):
+        return 0
+    n = 0
+    if payload.get("batch"):
+        n += 1
+    jobs = payload.get("jobs")
+    if isinstance(jobs, list):
+        n += len(jobs)
+    hitch = payload.get("hitchhikers") or payload.get("hitchhiker")
+    if isinstance(hitch, list):
+        n += len(hitch)
+    return n
+
+
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
     if raw is None or raw == "":
@@ -565,6 +581,7 @@ def main() -> int:
     processed_legacy: set[tuple[str, str]] = set()
     pending_reports: dict[str, Any] | None = None
     pending_destroy: dict[str, Any] | None = None
+    last_queue_depth = 0
     recycle_error = recycle_failure_class(runtime.last_error)
     destroy_blocked = stack_failed and (
         str(runtime.last_error or "").startswith("install_failure") and not recycle_error
@@ -656,6 +673,7 @@ def main() -> int:
             ):
                 try:
                     payload = fetch_work(control_base, instance_id) if control_base else {"batch": None, "jobs": []}
+                    last_queue_depth = work_queue_depth(payload)
                     runtime.set_hourly_rate(hourly_rate_from_work(payload, instance_id))
                     runtime.account_for_lease_age(
                         lease_age_seconds_from_work(payload, instance_id)
@@ -707,6 +725,7 @@ def main() -> int:
                         extra = parse_hitchhikers(after)
                         if extra:
                             hitch = extra
+                        last_queue_depth = work_queue_depth(after)
                     live_hitch: list[dict[str, Any]] = []
                     for item in hitch:
                         sid = str(item.get("story_id") or "").strip()
@@ -898,18 +917,26 @@ def main() -> int:
                             else 0
                         )
                     except Exception as exc:  # noqa: BLE001 — unknown queue must fail closed
-                        comfy_inflight = None
+                        longlive = (
+                            str(os.environ.get("AF_IMAGE_CAPABILITY") or "").strip().lower()
+                            == "longlive"
+                            or str(os.environ.get("AF_VIDEO_BACKEND") or "").strip().lower()
+                            == "longlive"
+                            or bool(stack_info.get("h3_skipped_longlive"))
+                        )
+                        comfy_inflight = 0 if longlive else None
                         print(
                             json.dumps(
                                 {
                                     "idle_probe": "comfy_queue_unknown",
                                     "error": f"{type(exc).__name__}:{exc}",
+                                    "longlive_treat_empty": longlive,
                                 },
                                 ensure_ascii=False,
                             ),
                             flush=True,
                         )
-                    if runtime.idle_expired(comfy_inflight):
+                    if runtime.idle_expired(comfy_inflight, pending_jobs=last_queue_depth):
                         pending_destroy = {
                             "reason": "idle_ttl",
                             "error": runtime.last_error,

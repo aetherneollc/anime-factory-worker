@@ -30,6 +30,7 @@ WAN_ARCH_NAME = "Wan2.2-TI2V-5B"
 WAN_DIR_DEFAULT = f"/opt/LongLive/wan_models/{WAN_ARCH_NAME}"
 GENERATOR_DEFAULT = "/opt/LongLive/checkpoints/longlive2_5b_nvfp4_s2/model_4o6.pt"
 LONGLIVE_REPO_URL = "https://github.com/NVlabs/LongLive.git"
+LONGLIVE_REF = os.environ.get("LONGLIVE_REF") or "6b36d20ec6f7958d29d11a704dfa64611a9f2572"
 LONGLIVE_CKPT_REPO = "Efficient-Large-Model/LongLive-2.0-5B-NVFP4-S2"
 LONGLIVE_CKPT_FILE = "model_4o6.pt"
 LONGLIVE_NVFP4_SAMPLING_STEPS = 2  # S2 distillation; S4 would use 4
@@ -696,23 +697,27 @@ def _clone_longlive_repo(progress: ProgressCallback | None = None) -> Path:
     parent.mkdir(parents=True, exist_ok=True)
     if root.exists():
         shutil.rmtree(root, ignore_errors=True)
+    root.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", str(root)], check=True, timeout=60)
     subprocess.run(
-        [
-            "git",
-            "clone",
-            "--single-branch",
-            "--branch",
-            "main",
-            "--depth",
-            "1",
-            LONGLIVE_REPO_URL,
-            str(root),
-        ],
+        ["git", "-C", str(root), "remote", "add", "origin", LONGLIVE_REPO_URL],
+        check=True,
+        timeout=60,
+    )
+    subprocess.run(
+        ["git", "-C", str(root), "fetch", "--depth", "1", "origin", LONGLIVE_REF],
         check=True,
         timeout=180,
     )
+    subprocess.run(
+        ["git", "-C", str(root), "checkout", "--detach", "FETCH_HEAD"],
+        check=True,
+        timeout=60,
+    )
     if not (root / "inference.py").is_file():
-        raise RuntimeError(f"git clone {LONGLIVE_REPO_URL} left no inference.py at {root}")
+        raise RuntimeError(
+            f"git fetch {LONGLIVE_REPO_URL}@{LONGLIVE_REF} left no inference.py at {root}"
+        )
     _patch_wrapper_skip_wan_init()
     _patch_wrapper_t5_lowmem()
     _patch_inference_mmap_load()

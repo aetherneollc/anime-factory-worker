@@ -53,6 +53,8 @@ from gpu_worker.session import _board_shots, _prepare_longlive_shot, _submit_vid
 @pytest.fixture(autouse=True)
 def _clear_backend_env(monkeypatch):
     monkeypatch.delenv("AF_VIDEO_BACKEND", raising=False)
+    monkeypatch.delenv("AF_VIDEO_BACKEND_LOCKED", raising=False)
+    monkeypatch.delenv("AF_IMAGE_CAPABILITY", raising=False)
     monkeypatch.delenv("LONGLIVE_MAX_SECONDS", raising=False)
     monkeypatch.delenv("LONGLIVE_ROOT", raising=False)
     monkeypatch.delenv("LONGLIVE_GENERATOR_CKPT", raising=False)
@@ -297,6 +299,15 @@ def test_ensure_longlive_downloads(monkeypatch, tmp_path: Path):
 
     def fake_run(cmd, **kwargs):
         calls.append(cmd)
+        if cmd[:2] == ["git", "init"]:
+            Path(cmd[2]).mkdir(parents=True, exist_ok=True)
+            return None
+        if cmd and cmd[0] == "git" and "-C" in cmd:
+            dest = Path(cmd[cmd.index("-C") + 1])
+            dest.mkdir(parents=True, exist_ok=True)
+            if "fetch" in cmd or "checkout" in cmd:
+                (dest / "inference.py").write_text("# stub\n", encoding="utf-8")
+            return None
         if cmd[:2] == ["git", "clone"]:
             dest = Path(cmd[-1])
             dest.mkdir(parents=True, exist_ok=True)
@@ -331,7 +342,7 @@ def test_ensure_longlive_downloads(monkeypatch, tmp_path: Path):
     assert (wan / "Wan2.2_VAE.pth").is_file()
     assert (wan / "models_t5_umt5-xxl-enc-bf16.pth").is_file()
     assert not (wan / "diffusion_pytorch_model-00001-of-00003.safetensors").exists()
-    assert any(cmd[:2] == ["git", "clone"] for cmd in calls)
+    assert any("fetch" in cmd and "6b36d20ec6f7958d29d11a704dfa64611a9f2572" in cmd for cmd in calls)
 
 
 def _sheet_png(tag: str = "sheet") -> bytes:

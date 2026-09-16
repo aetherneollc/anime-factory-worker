@@ -576,10 +576,13 @@ def validate_profile(profile_id: str, host: dict[str, Any], stack: dict[str, Any
             {"profile_id": profile_id},
         )
     if profile.require_torch:
+        torch_expected = profile.expected_torch or EXPECTED_TORCH
+        vision_expected = profile.expected_torchvision or EXPECTED_TORCHVISION
+        audio_expected = profile.expected_torchaudio or EXPECTED_TORCHAUDIO
         for key, expected in (
-            ("torch", EXPECTED_TORCH),
-            ("torchvision", EXPECTED_TORCHVISION),
-            ("torchaudio", EXPECTED_TORCHAUDIO),
+            ("torch", torch_expected),
+            ("torchvision", vision_expected),
+            ("torchaudio", audio_expected),
         ):
             if not _version_matches(stack.get(key), expected):
                 raise PreflightFailure(

@@ -9,3 +9,4 @@ test: pytest
 
 docker-check:
 	docker buildx build --check --file deploy/gpu-worker/Dockerfile --progress=plain .
+	docker buildx build --check --file deploy/gpu-worker/Dockerfile.longlive --progress=plain .

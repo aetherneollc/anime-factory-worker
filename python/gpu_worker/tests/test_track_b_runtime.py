@@ -392,7 +392,6 @@ def test_h3_dit_defaults_to_community_pruned_nvfp4():
     ref2va = by_dest["models/diffusion_models/minimax_h3_ref2va_pruned_nvfp4.safetensors"]
     te = by_dest["models/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"]
     video_vae = by_dest["models/vae/minimax_h3_video_vae_fp16.safetensors"]
-    audio_vae = by_dest["models/vae/minimax_h3_audio_vae_fp32.safetensors"]
     still = by_dest["models/checkpoints/animagine-xl-4.0.safetensors"]
     ipadapter = by_dest["models/ipadapter/ip-adapter-plus_sdxl_vit-h.safetensors"]
     clip_vision = by_dest["models/clip_vision/CLIP-ViT-H-14-laion2B-s32B-b79K.safetensors"]
@@ -404,7 +403,7 @@ def test_h3_dit_defaults_to_community_pruned_nvfp4():
     assert ref2va["hf"] == "minimax_h3_ref2va_pruned_nvfp4.safetensors"
     assert te["repo"] == "Comfy-Org/MiniMax-H3"
     assert video_vae["repo"] == "Comfy-Org/MiniMax-H3"
-    assert audio_vae["repo"] == "Comfy-Org/MiniMax-H3"
+    assert "models/vae/minimax_h3_audio_vae_fp32.safetensors" not in by_dest
     # Stills are anime-native SDXL now: real CFG, so FIXED_NEGATIVE is not dead code.
     assert still["repo"] == "cagliostrolab/animagine-xl-4.0"
     assert still["hf"] == "animagine-xl-4.0.safetensors"
@@ -467,7 +466,7 @@ def test_still_weights_do_not_block_on_h3(tmp_path, monkeypatch):
     assert (tmp_path / weights.VISUAL_QC_CLIP_CONFIG_DEST).is_file()
     assert not (tmp_path / "models/diffusion_models/minimax_h3_fl2va_pruned_nvfp4.safetensors").exists()
 
-    def slow_h3(comfy_dir=None, progress=None):
+    def slow_h3(comfy_dir=None, progress=None, modes=None):
         (tmp_path / "models/diffusion_models").mkdir(parents=True, exist_ok=True)
         for item in weights.H3_FILES:
             dest = tmp_path / item["dest"]
@@ -793,9 +792,10 @@ def test_stack_boot_reports_startup_stages_and_font_verification(monkeypatch):
     assert "startup_health:ready" in events
 
 
-def test_stack_boot_longlive_skips_comfy_and_stills(monkeypatch):
+def test_stack_boot_longlive_starts_comfy_stills_skips_h3(monkeypatch):
     events = []
     monkeypatch.setenv("AF_VIDEO_BACKEND", "longlive")
+    monkeypatch.setenv("AF_IMAGE_CAPABILITY", "longlive")
     monkeypatch.setattr(stack, "run_hardware_preflight", lambda **_k: {"profile_id": "longlive-nvfp4-sm120", "preflight": {"ok": True}})
     monkeypatch.setattr(stack, "ensure_torch", lambda: None)
     monkeypatch.setattr(stack, "ensure_c_compiler", lambda: None)
@@ -808,24 +808,48 @@ def test_stack_boot_longlive_skips_comfy_and_stills(monkeypatch):
     monkeypatch.setattr(stack, "ensure_infer_schema_sitecustomize", lambda: None)
     monkeypatch.setattr(stack, "patch_kitchen_triton_optional", lambda: False)
     monkeypatch.setattr(stack, "patch_comfy_kitchen_for_torch26", lambda: [])
-    monkeypatch.setattr(stack, "stop_comfy_for_longlive", lambda: {"ok": True, "killed": []})
+
+    def stills(_root, progress=None):
+        if progress:
+            progress("startup_bytes:2048")
+        return {
+            "hits": [],
+            "misses": ["animagine"],
+            "downloaded": ["animagine"],
+            "source": "huggingface",
+            "kind": "stills",
+        }
 
     def boom(*_a, **_k):
-        raise AssertionError("longlive boot must not start Comfy or pull Flux/H3")
+        raise AssertionError("longlive boot must not download H3")
 
-    monkeypatch.setattr(stack, "ensure_still_weights", boom)
+    monkeypatch.setattr(stack, "ensure_still_weights", stills)
     monkeypatch.setattr(stack, "start_h3_weights_background", boom)
-    monkeypatch.setattr(stack, "start_comfy", boom)
-    monkeypatch.setattr(stack, "start_router", boom)
-    monkeypatch.setattr(stack, "start_tunnel", boom)
-    monkeypatch.setattr(stack, "wait_router_ready", boom)
-    monkeypatch.setattr(stack, "default_register_capabilities", lambda: {})
+    monkeypatch.setattr(stack, "runtime_weight_bytes", lambda _root: 2048)
+    comfy_proc = SimpleNamespace(pid=21, poll=lambda: None)
+    monkeypatch.setattr(stack, "start_comfy", lambda: comfy_proc)
+    monkeypatch.setattr(stack, "start_router", lambda: SimpleNamespace(pid=22))
+    monkeypatch.setattr(stack, "start_tunnel", lambda: None)
+    monkeypatch.setattr(stack, "wait_comfy_process", lambda *_a, **_k: {"ok": True})
+    monkeypatch.setattr(stack.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        stack,
+        "wait_router_ready",
+        lambda progress=None: progress("startup_health:ready") is None,
+    )
+    monkeypatch.setattr(
+        stack,
+        "verify_tunnel_connection",
+        lambda timeout_s=None: {"connected": False},
+    )
+    monkeypatch.setattr(stack, "default_register_capabilities", lambda: {"longlive": True, "h3": False})
     result = stack.boot_gpu_stack(progress=events.append)
     assert result["router_ready"] is True
-    assert result["comfy_skipped_longlive"] is True
-    assert result["comfy_pid"] is None
-    assert "startup_stage:comfy_skipped_longlive" in events
-    assert "startup_stage:weights:stills_skipped_longlive" in events
+    assert result["comfy_skipped_longlive"] is False
+    assert result["h3_skipped_longlive"] is True
+    assert result["comfy_pid"] == 21
+    assert "startup_stage:weights:stills" in events
+    assert "startup_stage:weights:h3_skipped_longlive" in events
     assert "startup_health:ready" in events
 
 
@@ -1592,6 +1616,7 @@ def test_run_gpu_episode_compose_error_keeps_remaining_and_does_not_finish(tmp_p
     monkeypatch.setattr(session, "ComfyRouter", lambda: (_ for _ in ()).throw(RuntimeError("no comfy")))
     monkeypatch.setattr(session, "generate_missing_stills", lambda *_args, **_kwargs: {"ok": True})
     monkeypatch.setattr(session, "join_h3_weights", lambda: None)
+    monkeypatch.setattr(session, "ensure_h3_dits_for_shots", lambda *_a, **_k: {"ok": True})
     monkeypatch.setattr(session, "unload_still_models", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         session,

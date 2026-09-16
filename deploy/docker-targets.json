@@ -12,12 +12,11 @@
     },
     {
       "id": "longlive",
-      "enabled": false,
+      "enabled": true,
       "dockerfile": "deploy/gpu-worker/Dockerfile.longlive",
       "image_name": "anime-factory-gpu-longlive",
       "platforms": ["linux/amd64"],
-      "capabilities": ["longlive", "comfy"],
-      "blocked_reason": "Dockerfile.longlive not present yet; enable after validated LongLive image lands."
+      "capabilities": ["longlive", "comfy", "kolors", "image-gen", "agent"]
     }
   ]
 }

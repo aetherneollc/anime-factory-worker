@@ -83,7 +83,7 @@ def test_run_pre_gpu_if_needed_pulls_r2_before_produce(tmp_path, monkeypatch):
 
     pulled = []
     produced = []
-    monkeypatch.setattr(session, "pull_story", lambda sid, root: pulled.append((sid, str(root))) or ["board.json"])
+    monkeypatch.setattr(session, "pull_story", lambda *args, **kwargs: pulled.append((args[0], str(args[1]))) or ["board.json"])
     monkeypatch.setattr(session, "pre_gpu_artifacts_ready", lambda root, ep: True)
     monkeypatch.setattr(
         session,

@@ -30,7 +30,14 @@ from anime_factory.directors.common import (
     spoken_items,
     world_maps,
 )
-from anime_factory.models import H3_MAX_SECONDS, LONGLIVE_MAX_SECONDS, TARGET_EPISODE_SECONDS, scrub_copycat
+from anime_factory.models import (
+    H3_MAX_SECONDS,
+    LONGLIVE_MAX_SECONDS,
+    LONGLIVE_SHORT_MAX_SECONDS,
+    LONGLIVE_SHORT_TARGET_SECONDS,
+    TARGET_EPISODE_SECONDS,
+    scrub_copycat,
+)
 
 _CONTINUE_CAMERAS = ("Static Shot", "Slow Pan", "Push-in")
 
@@ -53,6 +60,12 @@ def board_longlive(
     shot_seconds: float = LONGLIVE_MAX_SECONDS,
 ) -> list[dict[str, Any]]:
     take_max = max(H3_MAX_SECONDS, float(shot_seconds or LONGLIVE_MAX_SECONDS))
+    short_mode = False
+    if target_seconds is not None:
+        creative_hint = float(target_seconds)
+        if 0 < creative_hint <= LONGLIVE_SHORT_TARGET_SECONDS * 1.25:
+            short_mode = True
+            take_max = min(take_max, LONGLIVE_SHORT_MAX_SECONDS)
     scenes, cast, locations, interiors = world_maps(script)
     if not scenes:
         raise ValueError(f"{episode_code}: script has no scenes to board")
@@ -161,4 +174,33 @@ def board_longlive(
 
     if creative:
         scale_shot_durations(shots, creative)
+    if short_mode:
+        from anime_factory.longlive_workflow import LongLiveWorkflowError, pack_short_takes
+
+        try:
+            packed = pack_short_takes(shots, max_take_s=take_max)
+        except LongLiveWorkflowError:
+            return shots
+        by_id = {str(s.get("id") or ""): s for s in shots}
+        merged: list[dict[str, Any]] = []
+        for take in packed:
+            head_id = str((take.get("source_shot_ids") or [take.get("id")])[0] or "")
+            head = dict(by_id.get(head_id) or shots[0])
+            head.update(
+                {
+                    "id": take["take_id"],
+                    "take_id": take["take_id"],
+                    "duration": take["duration"],
+                    "start_frame": take["start_frame"],
+                    "end_frame": take["end_frame"],
+                    "cuts": take.get("cuts") or head.get("cuts"),
+                    "cast": take.get("cast"),
+                    "continue_from": take.get("continue_from"),
+                    "keyframe_source": take.get("keyframe_source"),
+                    "scene_id": take.get("scene_id") or head.get("scene_id"),
+                    "h3_prompt": take.get("prompt") or head.get("h3_prompt"),
+                }
+            )
+            merged.append(head)
+        return merged
     return shots

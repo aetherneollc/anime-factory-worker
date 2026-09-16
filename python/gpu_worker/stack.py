@@ -31,7 +31,7 @@ from gpu_worker.preflight import (
     run_hardware_preflight,
     select_profile_id,
 )
-from anime_factory.video_backend import select_video_backend
+from anime_factory.video_backend import VideoBackendLockError, lock_video_backend
 from gpu_worker.weights import (
     ensure_still_weights,
     runtime_weight_bytes,
@@ -1068,34 +1068,93 @@ def boot_gpu_stack(progress: Callable[[str], None] | None = None) -> dict:
     ensure_infer_schema_sitecustomize()
     patch_kitchen_triton_optional()
     patch_comfy_kitchen_for_torch26()
-    longlive = select_video_backend() == "longlive"
+    try:
+        backend = lock_video_backend()
+    except VideoBackendLockError as exc:
+        raise PreflightFailure(
+            "capability_mismatch",
+            "video_backend",
+            str(exc),
+            {"requested": os.environ.get("AF_VIDEO_BACKEND"), "image": os.environ.get("AF_IMAGE_CAPABILITY")},
+        ) from exc
+    longlive = backend == "longlive"
+    h3_thread = None
     if longlive:
         if progress:
             progress("startup_stage:weights:h3_skipped_longlive")
-            progress("startup_stage:weights:stills_skipped_longlive")
-            progress("startup_stage:comfy_skipped_longlive")
-        stop_comfy_for_longlive()
+            progress("startup_stage:weights:stills")
+        weights = ensure_still_weights(COMFY_DIR, progress=progress)
+        if progress:
+            progress("startup_stage:start_comfy")
+        comfy = start_comfy()
+        comfy_wait = wait_comfy_process(
+            comfy,
+            timeout_s=float(os.environ.get("AF_COMFY_BOOT_WAIT_S") or COMFY_STARTUP_TIMEOUT_S),
+        )
+        comfy_error: str | None = None
+        if not comfy_wait.get("ok"):
+            restarted_box: dict[str, Any] = {}
+
+            def _restart_ll() -> dict:
+                restarted = start_comfy()
+                waited = wait_comfy_process(
+                    restarted,
+                    timeout_s=float(os.environ.get("AF_COMFY_BOOT_WAIT_S") or COMFY_STARTUP_TIMEOUT_S),
+                )
+                restarted_box["proc"] = restarted
+                restarted_box["wait"] = waited
+                return {"wait_ok": bool(waited.get("ok")), "exit_code": waited.get("exit_code")}
+
+            rec = adapter.apply("restart_comfy", before={"exit_code": comfy_wait.get("exit_code")}, repair=_restart_ll)
+            waited = restarted_box.get("wait") or comfy_wait
+            if rec.get("result") == "ok" and isinstance(waited, dict) and waited.get("ok"):
+                comfy = restarted_box.get("proc") or comfy
+                comfy_wait = waited
+            else:
+                code = comfy_wait.get("exit_code")
+                tail = str(comfy_wait.get("tail") or "").strip()
+                comfy_error = f"comfy_startup_failed:exit_{code}"
+                if tail:
+                    comfy_error = f"{comfy_error}:{tail[-400:]}"
+        if progress:
+            progress("startup_stage:start_router")
+        router = start_router()
+        time.sleep(2)
+        if progress:
+            progress("startup_stage:start_tunnel")
+        tunnel = start_tunnel()
+        if progress:
+            progress("startup_stage:wait_comfy")
+        ready = False if comfy_error else wait_router_ready(progress=progress)
         caps = default_register_capabilities()
         if handshake is None:
             handshake = handshake_payload(profile_id=profile_id, adaptations=adapter.as_list())
         handshake = _attach_adaptations(handshake, adapter)
         if progress:
-            progress("startup_health:ready")
+            progress(f"startup_health:{'ready' if ready else 'failed'}")
+        tunnel_status = verify_tunnel_connection(timeout_s=0 if tunnel is None else None)
         return {
-            "comfy_pid": None,
-            "router_pid": None,
-            "tunnel_pid": None,
-            "tunnel": {"connected": False, "skipped": "longlive"},
-            "router_ready": True,
-            "comfy_skipped_longlive": True,
+            "comfy_pid": getattr(comfy, "pid", None),
+            "router_pid": getattr(router, "pid", None),
+            "tunnel_pid": getattr(tunnel, "pid", None),
+            "tunnel": tunnel_status,
+            "router_ready": ready,
+            "comfy_error": comfy_error,
+            "comfy_skipped_longlive": False,
+            "h3_skipped_longlive": True,
             "fonts": fonts,
             "capabilities": caps,
             "handshake": handshake,
             "adaptations": adapter.as_list(),
             "profile_id": profile_id,
-            "startup_downloaded_bytes": 0,
+            "startup_downloaded_bytes": runtime_weight_bytes(COMFY_DIR),
             "h3_weights_background": False,
-            "weights": {"kind": "skipped_longlive"},
+            "video_backend": backend,
+            "weights": {
+                k: weights.get(k)
+                for k in ("hits", "misses", "downloaded", "source", "kind")
+                if k in weights
+            },
         }
     if progress:
         progress("startup_stage:weights:h3_background")

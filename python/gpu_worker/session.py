@@ -79,12 +79,18 @@ from gpu_worker.longlive import (
     is_longlive_fatal_error,
     submit_longlive,
 )
+from gpu_worker.longlive_batch import submit_longlive_batch
 from gpu_worker.preflight import RECYCLE_FAILURE_CLASSES, recycle_failure_class
 from gpu_worker.stack import stop_comfy_for_longlive
 from gpu_worker.stills import generate_still, unload_still_models
 from gpu_worker.vast_client import VastClient
-from gpu_worker.weights import join_h3_weights
-from anime_factory.video_backend import max_seconds_for_backend, select_video_backend
+from gpu_worker.weights import ensure_h3_dits_for_shots, join_h3_weights
+from anime_factory.video_backend import (
+    VideoBackendLockError,
+    lock_video_backend,
+    max_seconds_for_backend,
+    select_video_backend,
+)
 
 # Default keeps existing EP001 artifacts; override via AF_EPISODE / run_gpu_episode(episode_code=).
 EP = DEFAULT_EPISODE
@@ -184,6 +190,7 @@ DEFAULT_MAX_LEASE_MINUTES = 3600.0
 DEFAULT_MAX_LEASE_USD = 40.0
 GLOBAL_MAX_LEASE_USD = 100.0
 DEFAULT_IDLE_MINUTES = 15.0
+DEFAULT_POST_CHECKPOINT_IDLE_SECONDS = 30.0
 DEFAULT_WATCH_USD = 20.0
 DEFAULT_STARTUP_TIMEOUT_MINUTES = 150.0
 PREFLIGHT_TIMEOUT_SECONDS = 120.0
@@ -270,6 +277,13 @@ class BatchBudget:
     max_minutes: float = DEFAULT_MAX_LEASE_MINUTES
     max_usd: float = DEFAULT_MAX_LEASE_USD
     idle_minutes: float = DEFAULT_IDLE_MINUTES
+    idle_seconds: float | None = None
+    post_checkpoint_idle_seconds: float = DEFAULT_POST_CHECKPOINT_IDLE_SECONDS
+
+    def idle_ttl_seconds(self) -> float:
+        if self.idle_seconds is not None:
+            return max(0.0, float(self.idle_seconds))
+        return max(0.0, float(self.idle_minutes) * 60.0)
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any] | None = None) -> "BatchBudget":
@@ -283,6 +297,16 @@ class BatchBudget:
                 return max(0.0, float(default if raw in (None, "") else raw))
             except (TypeError, ValueError):
                 return default
+
+        idle_seconds_raw = payload.get("idle_seconds")
+        if idle_seconds_raw in (None, ""):
+            idle_seconds_raw = os.environ.get("VAST_IDLE_SECONDS")
+        idle_seconds: float | None = None
+        if idle_seconds_raw not in (None, ""):
+            try:
+                idle_seconds = max(0.0, float(idle_seconds_raw))
+            except (TypeError, ValueError):
+                idle_seconds = None
 
         return cls(
             max_minutes=number(
@@ -298,6 +322,12 @@ class BatchBudget:
                 "idle_minutes",
                 "VAST_IDLE_MINUTES",
                 DEFAULT_IDLE_MINUTES,
+            ),
+            idle_seconds=idle_seconds,
+            post_checkpoint_idle_seconds=number(
+                "post_checkpoint_idle_seconds",
+                "VAST_POST_CHECKPOINT_IDLE_SECONDS",
+                DEFAULT_POST_CHECKPOINT_IDLE_SECONDS,
             ),
         )
 
@@ -662,14 +692,28 @@ class LeaseRuntime:
         if reached:
             raise reached
 
-    def idle_timer_expired(self) -> bool:
-        return (
-            self.budget.idle_minutes > 0
-            and self.idle_seconds() >= self.budget.idle_minutes * 60.0
-        )
+    def idle_wait_seconds(self) -> float:
+        configured = self.budget.idle_ttl_seconds()
+        if configured <= 0:
+            return 0.0
+        if self.last_checkpoint_at is not None:
+            post = float(self.budget.post_checkpoint_idle_seconds or 0.0)
+            if post > 0:
+                return min(configured, post)
+        return configured
 
-    def idle_expired(self, comfy_inflight: int | None) -> bool:
+    def idle_timer_expired(self) -> bool:
+        wait = self.idle_wait_seconds()
+        return wait > 0 and self.idle_seconds() >= wait
+
+    def idle_expired(self, comfy_inflight: int | None, pending_jobs: int | None = 0) -> bool:
         if self.phase == "startup":
+            return False
+        try:
+            pending = int(pending_jobs or 0)
+        except (TypeError, ValueError):
+            pending = 0
+        if pending > 0:
             return False
         return (
             not self.job_active
@@ -970,10 +1014,35 @@ def _probe_video(path: Path) -> dict:
     return meta
 
 
-def pull_story(story_id: str, root: Path) -> list[str]:
+def pull_story(
+    story_id: str,
+    root: Path,
+    episode_code: str | None = None,
+    *,
+    skip_existing: bool = True,
+) -> list[str]:
+    """Incremental R2 sync. Reuses local files and, when episode-scoped, skips other episodes."""
     root.mkdir(parents=True, exist_ok=True)
     prefix = story_prefix(story_id)
-    return download_prefix(prefix, root, strip_prefix=prefix)
+    ep = ""
+    if episode_code:
+        ep = _normalize_episode_code(episode_code)
+
+    def key_filter(key: str) -> bool:
+        if not ep:
+            return True
+        rel = key[len(prefix) :] if key.startswith(prefix) else key
+        if rel.startswith("episodes/"):
+            return rel.startswith(f"episodes/{ep}/")
+        return True
+
+    return download_prefix(
+        prefix,
+        root,
+        strip_prefix=prefix,
+        skip_existing=skip_existing,
+        key_filter=key_filter if ep else None,
+    )
 
 
 def _upload_ok(result: Any) -> bool:
@@ -1638,6 +1707,60 @@ def _normalize_h3_for_qc(
         normalized.unlink(missing_ok=True)
 
 
+def _keep_native_strip_audio(
+    path: Path,
+    progress: ProgressCallback | None = None,
+) -> None:
+    """LongLive native 1280×704 stays until compose scale/pad. Strip audio only."""
+    silent = path.with_name(f"{path.stem}.silent{path.suffix}")
+    try:
+        _run_checked(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(path),
+                "-map",
+                "0:v:0",
+                "-c:v",
+                "copy",
+                "-an",
+                str(silent),
+            ],
+            progress=progress,
+            stage="anim",
+        )
+        silent.replace(path)
+    except Exception:
+        silent.unlink(missing_ok=True)
+        return
+    finally:
+        silent.unlink(missing_ok=True)
+
+
+class CpuPostQueue:
+    """CPU ffprobe / encode / upload after GPU sampling, sqlite-safe sequential drain."""
+
+    def __init__(self) -> None:
+        self._jobs: list[Any] = []
+
+    def submit(self, fn, *args, **kwargs) -> None:
+        self._jobs.append((fn, args, kwargs))
+
+    def drain(self) -> list[Any]:
+        out: list[Any] = []
+        errors: list[BaseException] = []
+        for fn, args, kwargs in self._jobs:
+            try:
+                out.append(fn(*args, **kwargs))
+            except BaseException as exc:  # noqa: BLE001 — collect then fail closed
+                errors.append(exc)
+        self._jobs.clear()
+        if errors:
+            raise errors[0]
+        return out
+
+
 def _db_execute(conn, sql: str, params: tuple = ()) -> None:
     execute = getattr(conn, "execute", None)
     if not callable(execute):
@@ -1667,8 +1790,32 @@ def _link_next_chain(shots: list[dict], index: int, last_path: Path) -> None:
     shots[index + 1] = apply_chain_first_frame(nxt, dest)
 
 
+def _link_longlive_continuation(shots: list[dict], index: int, last_path: Path) -> None:
+    """Same-scene takes continue from prior last frame; scene changes stay hard cuts."""
+    if index + 1 >= len(shots) or not last_path.is_file():
+        return
+    nxt = dict(shots[index + 1])
+    source = str(nxt.get("keyframe_source") or "")
+    if source == "new_keyframe_hard_cut":
+        return
+    cur = shots[index]
+    same_scene = str(nxt.get("scene_id") or nxt.get("chain_id") or "") == str(
+        cur.get("scene_id") or cur.get("chain_id") or ""
+    )
+    if source == "prior_last_frame" or (same_scene and source != "qc_keyframe"):
+        sid = str(nxt.get("id") or nxt.get("take_id") or "next")
+        dest = last_path.parent.parent / sid / "chain_first.png"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.resolve() != last_path.resolve():
+            shutil.copy2(last_path, dest)
+        shots[index + 1] = apply_chain_first_frame(nxt, dest)
+        return
+    _link_next_chain(shots, index, last_path)
+
+
 def _ensure_last_frame(root: Path, shot: dict, video: Path) -> Path | None:
-    last_path = root / "episodes" / EP / "keyframes" / shot["id"] / "last.png"
+    sid = str(shot.get("id") or shot.get("take_id") or "")
+    last_path = root / "episodes" / EP / "keyframes" / sid / "last.png"
     if last_path.is_file() and last_path.stat().st_size > 32:
         shot["last_frame_path"] = str(last_path)
         return last_path
@@ -1682,6 +1829,235 @@ def _ensure_last_frame(root: Path, shot: dict, video: Path) -> Path | None:
         return None
 
 
+def _longlive_infer_hook(**kwargs: Any) -> Path:
+    """Seam for tests. Production samples with the one loaded NVFP4 pipeline."""
+    from gpu_worker.longlive_batch import infer_with_loaded_pipeline
+
+    return infer_with_loaded_pipeline(**kwargs)
+
+
+def _run_anim_longlive(
+    story_id: str,
+    root: Path,
+    conn,
+    progress: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    shots = _board_shots(root)
+    done: list[str] = []
+    failed: list[Any] = []
+    skipped: list[str] = []
+    repaired: list[str] = []
+    resolution = {
+        "width": LONGLIVE_NATIVE_WIDTH,
+        "height": LONGLIVE_NATIVE_HEIGHT,
+        "delivery_width": VIDEO_WIDTH,
+        "delivery_height": VIDEO_HEIGHT,
+        "video_backend": "longlive",
+        "scale_pad_only": True,
+        "native_audio": False,
+    }
+    pending: list[dict[str, Any]] = []
+    dests: dict[str, Path] = {}
+    cpu = CpuPostQueue()
+    stop_comfy_for_longlive()
+
+    for index, shot in enumerate(shots):
+        sid = str(shot.get("id") or shot.get("take_id") or f"take-{index + 1:02d}")
+        shot = dict(shot)
+        shot["id"] = sid
+        shot["take_id"] = str(shot.get("take_id") or sid)
+        shots[index] = shot
+        try:
+            if progress:
+                if index == 0:
+                    progress(f"production_started:{sid}")
+            prev = shots[index - 1] if index else None
+            if int(shot.get("chain_index") or 0) > 0:
+                prev_last = prev.get("last_frame_path") if prev else None
+                if prev and prev.get("chain_id") == shot.get("chain_id") and prev_last and not is_directory_like(prev_last):
+                    shot = apply_chain_first_frame(shot, prev_last)
+                    shots[index] = shot
+                elif shot.get("keyframe_source") == "prior_last_frame":
+                    failed.append({"id": sid, "error": "pending_chain_missing_last_frame"})
+                    continue
+            existing = existing_generation_file(root, sid)
+            if existing is not None:
+                skipped.append(sid)
+                rel = existing.relative_to(root).as_posix()
+                mark_completed_passing(conn, sid, join_story(story_id, rel))
+                last_path = _ensure_last_frame(root, shot, existing)
+                if last_path is not None:
+                    _link_longlive_continuation(shots, index, last_path)
+                    try:
+                        put_file(join_story(story_id, f"episodes/{EP}/keyframes/{sid}/last.png"), last_path, "image/png")
+                    except Exception:
+                        pass
+                try:
+                    _upload_ok(put_file(join_story(story_id, rel), existing, "video/mp4"))
+                except Exception:
+                    pass
+                continue
+            shot = _prepare_longlive_shot(shot, root)
+            shots[index] = shot
+            first = Path(str(shot.get("first_frame_path") or ""))
+            if first.is_file():
+                try:
+                    put_file(
+                        join_story(story_id, f"episodes/{EP}/keyframes/{sid}/f1.png"),
+                        first,
+                        "image/png",
+                    )
+                except Exception:
+                    pass
+            version, rel = next_generation_path(root, sid)
+            dest = root / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            take_id = str(shot.get("take_id") or sid)
+            shot["_index"] = index
+            shot["_rel"] = rel
+            shot["_version"] = version
+            pending.append(shot)
+            dests[take_id] = dest
+        except (BudgetExceeded, ProgressStalled, StartupTimeout):
+            raise
+        except Exception as exc:  # noqa: BLE001
+            failed.append({"id": sid, "error": str(exc)[:800]})
+
+    def infer(**kwargs: Any) -> Path:
+        take = dict(kwargs["take"])
+        dest = Path(kwargs["dest"])
+        if progress:
+            progress(f"anim:{take.get('take_id') or take.get('id')}")
+        produced = _longlive_infer_hook(**kwargs)
+        src = Path(produced) if produced else dest
+        last_path = _ensure_last_frame(root, take, src)
+        idx = take.get("_index")
+        if last_path is not None and idx is not None:
+            _link_longlive_continuation(shots, int(idx), last_path)
+            nxt_idx = int(idx) + 1
+            if nxt_idx < len(shots):
+                nxt = shots[nxt_idx]
+                nxt_tid = str(nxt.get("take_id") or nxt.get("id") or "")
+                for item in pending:
+                    if str(item.get("take_id") or item.get("id") or "") == nxt_tid:
+                        item["first_frame_path"] = nxt.get("first_frame_path")
+                        break
+        cpu.submit(
+            _longlive_cpu_post,
+            story_id,
+            root,
+            conn,
+            take,
+            src,
+            last_path,
+            progress,
+        )
+        return src
+
+    mapped: dict[str, Any] = {}
+    if pending:
+        batch = submit_longlive_batch(pending, dests, progress=progress, infer=infer)
+        mapped = batch.get("mapped") or {}
+        if int(batch.get("model_load_count") or 0) != 1:
+            raise RuntimeError(
+                f"{FAIL_CLOSED}: expected model_load_count==1, got {batch.get('model_load_count')}"
+            )
+        if int(batch.get("h3_downloads") or 0) != 0:
+            raise RuntimeError(f"{FAIL_CLOSED}: LongLive path downloaded H3 weights")
+
+    posted: list[str] = []
+    try:
+        posted = [sid for sid in cpu.drain() if sid]
+    except (BudgetExceeded, ProgressStalled, StartupTimeout):
+        raise
+    except Exception as exc:  # noqa: BLE001
+        failed.append({"id": "cpu_post", "error": str(exc)[:800]})
+
+    done.extend(posted)
+    for take in pending:
+        sid = str(take.get("id") or take.get("take_id"))
+        if sid in posted or sid in skipped:
+            continue
+        dest = dests.get(str(take.get("take_id") or sid))
+        if dest is None or not dest.is_file() or dest.stat().st_size < 32:
+            if not any(isinstance(row, dict) and row.get("id") == sid for row in failed):
+                failed.append({"id": sid, "error": "longlive produced no video"})
+
+    return {
+        "shots_total": len(shots),
+        "shots_done": len(done) + len(skipped),
+        "generated": done,
+        "skipped_existing": skipped,
+        "repaired": repaired,
+        "failed": failed,
+        "resolution": resolution,
+        "mapped": {tid: row.get("path") for tid, row in mapped.items()},
+        "model_load_count": 1 if pending else 0,
+        "native_audio": False,
+    }
+
+
+def _longlive_cpu_post(
+    story_id: str,
+    root: Path,
+    conn,
+    take: dict[str, Any],
+    dest: Path,
+    last_path: Path | None,
+    progress: ProgressCallback | None,
+) -> str:
+    sid = str(take.get("id") or take.get("take_id") or "")
+    rel = str(take.get("_rel") or dest.relative_to(root).as_posix())
+    version = take.get("_version") or 1
+    _keep_native_strip_audio(dest, progress=progress)
+    meta = _probe_video(dest)
+    from gpu_worker.longlive import select_longlive_mode as _ll_mode
+
+    used_mode = _ll_mode(take)
+    verdict = incremental_qc_segment(
+        conn,
+        EP,
+        sid,
+        meta,
+        float(take.get("duration") or 8.0),
+        segment=take,
+        prev_segment=None,
+        used_mode=used_mode,
+    )
+    try:
+        record_generation_result(
+            conn,
+            sid,
+            version,
+            join_story(story_id, rel),
+            take.get("seed"),
+            used_mode,
+            "completed" if verdict == "pass" else "failed",
+            verdict,
+        )
+    except Exception:
+        pass
+    if verdict != "pass":
+        raise RuntimeError(f"{FAIL_CLOSED}: longlive qc {sid} verdict={verdict}")
+    upload = put_file(join_story(story_id, rel), dest, "video/mp4")
+    if not _upload_ok(upload):
+        raise RuntimeError(f"shot R2 upload failed: {sid}")
+    if last_path is None or not last_path.is_file() or last_path.stat().st_size < 32:
+        raise RuntimeError(f"shot last.png missing: {sid}")
+    last_upload = put_file(
+        join_story(story_id, f"episodes/{EP}/keyframes/{sid}/last.png"),
+        last_path,
+        "image/png",
+    )
+    if not _upload_ok(last_upload):
+        raise RuntimeError(f"shot last.png R2 upload failed: {sid}")
+    mark_completed_passing(conn, sid, join_story(story_id, rel))
+    _checkpoint_story(conn, story_id, root, progress=progress)
+    if progress:
+        progress(f"shot_uploaded:{sid}")
+    return sid
+
+
 def run_anim(
     story_id: str,
     root: Path,
@@ -1690,7 +2066,12 @@ def run_anim(
     progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     shots = _board_shots(root)
-    backend = select_video_backend(root=root)
+    try:
+        backend = lock_video_backend(root=root)
+    except VideoBackendLockError as exc:
+        raise RuntimeError(str(exc)) from exc
+    if backend == "longlive":
+        return _run_anim_longlive(story_id, root, conn, progress)
     done = []
     failed = []
     skipped = []
@@ -2292,13 +2673,16 @@ def run_pre_gpu_if_needed(
     control: ControlPlane | None = None,
     title: str | None = None,
     logline: str | None = None,
+    *,
+    skip_pull: bool = False,
 ) -> dict[str, Any]:
     """Hosted bible→board (CosyVoice TTS) on this box when the laptop never ran produce.
 
     design/keyframe stills wait for Flux weights + Comfy, not for H3. Callers run
     generate_missing_stills after this, then join_h3_weights before anim.
     """
-    pull_story(story_id, root)
+    if not skip_pull:
+        pull_story(story_id, root, episode_code=episode_code)
     if pre_gpu_artifacts_ready(root, episode_code):
         return {"skipped": True, "reason": "pre_gpu_ready"}
     return produce_episode(
@@ -2419,7 +2803,7 @@ def run_gpu_episode(
         )
     if progress:
         progress("pull")
-    pulled = pull_story(story_id, root)
+    pulled = pull_story(story_id, root, episode_code=EP)
     if episode_finals_ready(root, EP, episode_langs):
         return _idle_episode_result(
             story_id,
@@ -2435,6 +2819,7 @@ def run_gpu_episode(
         EP,
         langs=episode_langs,
         control=control,
+        skip_pull=True,
     )
     if pre_gpu.get("blocked"):
         return {
@@ -2506,7 +2891,10 @@ def run_gpu_episode(
         control.job(story_id, "design", "succeeded", episode_code=EP)
         control.job(story_id, "keyframe", "succeeded", episode_code=EP)
         control.job(story_id, "anim", "running", episode_code=EP)
-    backend = select_video_backend(root=root)
+    try:
+        backend = lock_video_backend(root=root)
+    except VideoBackendLockError as exc:
+        raise RuntimeError(str(exc)) from exc
     if backend == "longlive":
         if progress:
             progress("weights:longlive")
@@ -2518,6 +2906,7 @@ def run_gpu_episode(
         if progress:
             progress("weights:h3_join")
         join_h3_weights()
+        ensure_h3_dits_for_shots(_board_shots(root))
     unload_still_models(router)
     if backend == "longlive":
         stop_comfy_for_longlive()

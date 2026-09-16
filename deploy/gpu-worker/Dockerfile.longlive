@@ -1,0 +1,244 @@
+# Anime Factory GPU worker — dedicated LongLive 2.0 NVFP4 image.
+# ComfyUI + Animagine stills (IP-Adapter) for missing keyframes; never H3 weights.
+# Weights are NOT baked — first boot pulls HuggingFace onto instance-local disk (never R2).
+# FourOverSix / flash-attn / LongLive KV-dequant ARE baked for Blackwell SM 12.0
+# (recovered from SoundStoryWriter2 git history before 2e90b9b).
+# Final stage is CUDA runtime-only (no nvcc). Python 3.12. Do not pip install -e fouroversix.
+
+FROM nvidia/cuda:12.8.1-devel-ubuntu24.04 AS nvfp4
+
+ARG LONGLIVE_REF=6b36d20ec6f7958d29d11a704dfa64611a9f2572
+ARG FLASH_ATTN_WHEEL_URL=https://github.com/Zarrac/my-pytorch-builds/releases/download/flash-attn-2.7.4.post1-cuda12.8/flash_attn-2.7.4.post1%2Bpt270cu128cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    CUDA_HOME=/usr/local/cuda \
+    CUDA_ARCHS=120 \
+    TORCH_CUDA_ARCH_LIST=12.0 \
+    MAX_JOBS=1 \
+    NVCC_THREADS=1 \
+    CMAKE_BUILD_PARALLEL_LEVEL=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:/usr/local/cuda/bin:$PATH
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+         python3 python3-venv python3-dev git ninja-build g++ ca-certificates curl \
+    && python3 -m venv /opt/venv \
+    && rm -rf /var/lib/apt/lists/*
+
+# Known-working Blackwell stack: torch 2.7.0+cu128 matches the sm_120 flash-attn wheel.
+RUN pip install --no-cache-dir --upgrade pip wheel \
+    && pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 \
+         torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0+cu128 \
+    && pip install --no-cache-dir ninja packaging psutil "setuptools>=77.0.3" \
+    && rm -rf /root/.cache /tmp/* /var/tmp/*
+
+# Pin NVlabs/LongLive. Vendored fouroversix has no .git / third_party; CUTLASS
+# must be copied from mit-han-lab/fouroversix before `pip wheel`.
+RUN git init /opt/LongLive \
+    && git -C /opt/LongLive remote add origin https://github.com/NVlabs/LongLive.git \
+    && git -C /opt/LongLive fetch --depth 1 origin "${LONGLIVE_REF}" \
+    && git -C /opt/LongLive checkout --detach FETCH_HEAD \
+    && git clone --depth 1 https://github.com/mit-han-lab/fouroversix.git /tmp/fouroversix-src \
+    && git -C /tmp/fouroversix-src submodule update --init third_party/cutlass \
+    && mkdir -p /opt/LongLive/fouroversix/third_party \
+    && mv /tmp/fouroversix-src/third_party/cutlass /opt/LongLive/fouroversix/third_party/cutlass \
+    && rm -rf /tmp/fouroversix-src \
+    && test -d /opt/LongLive/fouroversix/third_party/cutlass/include \
+    && test -f /opt/LongLive/inference.py
+
+WORKDIR /opt/LongLive/fouroversix
+RUN mkdir -p /opt/longlive-wheels \
+    && pip wheel --no-cache-dir --no-build-isolation --no-deps -w /opt/longlive-wheels . \
+    && pip install --no-cache-dir --no-deps --no-build-isolation /opt/longlive-wheels/fouroversix*.whl \
+    && rm -rf build /root/.cache /tmp/* /var/tmp/*
+
+# flash-attn: prebuilt Blackwell wheel (Zarrac/my-pytorch-builds v2.7.4.post1, pt270cu128, sm_80/90/100/120).
+# PyPI / official Dao-AILab wheels lack sm_120; source compile was ~6h on GHA.
+RUN curl -fsSL -o /opt/longlive-wheels/flash_attn-2.7.4.post1+pt270cu128cxx11abiTRUE-cp312-cp312-linux_x86_64.whl \
+         "${FLASH_ATTN_WHEEL_URL}" \
+    && pip install --no-cache-dir --no-deps --no-build-isolation \
+         /opt/longlive-wheels/flash_attn-2.7.4.post1+pt270cu128cxx11abiTRUE-cp312-cp312-linux_x86_64.whl \
+    && python -c "import flash_attn; print('flash_attn', flash_attn.__version__)" \
+    && rm -rf /root/.cache /tmp/* /var/tmp/*
+
+WORKDIR /opt/LongLive/utils/kernel
+RUN python setup.py build_ext --inplace \
+    && rm -rf /root/.cache /tmp/* /var/tmp/*
+
+# Runtime has CUDA libs (not nvcc). First boot imports fouroversix; it does not compile it.
+FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04
+
+ARG TARGETARCH=amd64
+ARG COMFYUI_REF=7ba217d6b5ac7ef984b157f7e5dfc93465b9937d
+ARG LONGLIVE_REF=6b36d20ec6f7958d29d11a704dfa64611a9f2572
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:$PATH \
+    CUDA_ARCHS=120 \
+    LONGLIVE_WHEELS=/opt/longlive-wheels \
+    AF_IMAGE_CAPABILITY=longlive \
+    AF_VIDEO_BACKEND=longlive \
+    AF_GPU_PROFILE=longlive-nvfp4-sm120
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+         python3 python3-venv ca-certificates curl ffmpeg git git-lfs \
+         fontconfig fonts-noto-cjk \
+    && case "${TARGETARCH}" in amd64|x86_64) cf_arch=amd64 ;; arm64|aarch64) cf_arch=arm64 ;; *) cf_arch=amd64 ;; esac \
+    && curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}" \
+         -o /usr/local/bin/cloudflared \
+    && chmod +x /usr/local/bin/cloudflared \
+    && git lfs install \
+    && git init /opt/ComfyUI \
+    && git -C /opt/ComfyUI remote add origin https://github.com/comfyanonymous/ComfyUI.git \
+    && git -C /opt/ComfyUI fetch --depth 1 origin "${COMFYUI_REF}" \
+    && git -C /opt/ComfyUI checkout --detach FETCH_HEAD \
+    && COMFYUI_REF="${COMFYUI_REF}" LONGLIVE_REF="${LONGLIVE_REF}" python3 - <<'PY'
+import json
+import os
+import subprocess
+from pathlib import Path
+
+comfy = Path("/opt/ComfyUI")
+
+def head(repo: Path) -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            text=True,
+        ).strip()
+    except Exception:
+        return ""
+
+manifest = {
+    "comfyui_ref": os.environ["COMFYUI_REF"],
+    "comfyui_sha": head(comfy),
+    "longlive_ref": os.environ.get("LONGLIVE_REF", ""),
+}
+(comfy / ".af-source-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+PY
+    && rm -rf /var/lib/apt/lists/*
+
+# Character consistency needs IPAdapterAdvanced, which core ComfyUI does not ship.
+# Baked into the image so first boot does not clone on the leased card; the weights
+# themselves still come from HuggingFace at boot (weights.STILL_FILES). Never H3.
+ARG IPADAPTER_PLUS_REF=a0f451a5113cf9becb0847b92884cb10cbdec0ef
+RUN git init /opt/ComfyUI/custom_nodes/ComfyUI_IPAdapter_plus \
+    && git -C /opt/ComfyUI/custom_nodes/ComfyUI_IPAdapter_plus remote add origin \
+         https://github.com/cubiq/ComfyUI_IPAdapter_plus.git \
+    && git -C /opt/ComfyUI/custom_nodes/ComfyUI_IPAdapter_plus fetch --depth 1 origin "${IPADAPTER_PLUS_REF}" \
+    && git -C /opt/ComfyUI/custom_nodes/ComfyUI_IPAdapter_plus checkout --detach FETCH_HEAD \
+    && IPADAPTER_PLUS_REF="${IPADAPTER_PLUS_REF}" python3 - <<'PY'
+import json
+import os
+import subprocess
+from pathlib import Path
+
+comfy = Path("/opt/ComfyUI")
+ip = comfy / "custom_nodes" / "ComfyUI_IPAdapter_plus"
+manifest_path = comfy / ".af-source-manifest.json"
+manifest = {}
+if manifest_path.is_file():
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+manifest["ipadapter_ref"] = os.environ["IPADAPTER_PLUS_REF"]
+try:
+    manifest["ipadapter_sha"] = subprocess.check_output(
+        ["git", "-C", str(ip), "rev-parse", "HEAD"], text=True
+    ).strip()
+except Exception:
+    manifest["ipadapter_sha"] = ""
+manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+PY
+    && mkdir -p /opt/ComfyUI/models/ipadapter /opt/ComfyUI/models/clip_vision /opt/ComfyUI/models/visual_qc
+
+COPY --from=nvfp4 /opt/venv /opt/venv
+COPY --from=nvfp4 /opt/LongLive /opt/LongLive
+COPY --from=nvfp4 /opt/longlive-wheels /opt/longlive-wheels
+
+WORKDIR /app
+
+COPY python/ /app/python/
+COPY schema/ /app/schema/
+COPY workflows/ /app/workflows/
+COPY config/ /app/config/
+COPY deploy/gpu-worker/start.sh /usr/local/bin/af-start
+RUN chmod +x /usr/local/bin/af-start \
+    && mkdir -p /work \
+    && pip install --no-cache-dir --only-binary=:all: \
+         "Pillow>=10,<12" huggingface_hub boto3 "open_clip_torch==2.32.0" \
+         omegaconf einops easydict imageio imageio-ffmpeg av opencv-python-headless \
+         ftfy sentencepiece peft "transformers>=4.49.0,<5" "accelerate>=1.1.1" \
+         "diffusers==0.31.0" tqdm "torchao==0.16.0" \
+    && python3 - <<'PY'
+from pathlib import Path
+import subprocess
+import sys
+
+req = Path("/opt/ComfyUI/requirements.txt")
+skip = {"torch", "torchvision", "torchaudio", "open_clip_torch", "open-clip-torch"}
+kept: list[str] = []
+for line in req.read_text(encoding="utf-8").splitlines():
+    pkg = line.strip().split("#", 1)[0].strip().split("[", 1)[0].split("==")[0].split(">=")[0].strip().lower()
+    if pkg and pkg not in skip:
+        kept.append(line)
+filt = req.parent / ".af-comfy-requirements.filtered.txt"
+filt.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+if kept:
+    subprocess.check_call(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--no-cache-dir",
+            "--only-binary=:all:",
+            "-r",
+            str(filt),
+            "--extra-index-url",
+            "https://download.pytorch.org/whl/cu128",
+        ]
+    )
+PY
+
+ENV PYTHONPATH=/app/python \
+    PYTHONUNBUFFERED=1 \
+    VAST_DRY_RUN=1 \
+    VAST_ALLOW_REPLACE=0 \
+    ANIME_FACTORY_LIVE_VAST=0 \
+    AF_START_COMFY=1 \
+    AF_COMFY_REQS_BAKED=1 \
+    AF_PRODUCTION_STACK=1 \
+    ANIME_FACTORY_GPU_STILLS=1 \
+    COMFYUI_DIR=/opt/ComfyUI \
+    COMFYUI_BASE_URL=http://127.0.0.1:8199 \
+    COMFY_BACKENDS=http://127.0.0.1:8188 \
+    COMFY_ROUTER_HOST=127.0.0.1 \
+    COMFY_ROUTER_PORT=8199 \
+    LONGLIVE_ROOT=/opt/LongLive \
+    LONGLIVE_WAN_DIR=/opt/LongLive/wan_models/Wan2.2-TI2V-5B \
+    LONGLIVE_GENERATOR_CKPT=/opt/LongLive/checkpoints/longlive2_5b_nvfp4_s2/model_4o6.pt \
+    LONGLIVE_WHEELS=/opt/longlive-wheels \
+    LONGLIVE_REF=6b36d20ec6f7958d29d11a704dfa64611a9f2572 \
+    CUDA_ARCHS=120 \
+    OPEN_CLIP_TORCH_VERSION=2.32.0 \
+    AF_VISUAL_QC_CLIP_DIR=/opt/ComfyUI/models/visual_qc \
+    AF_VISUAL_QC_CLIP_WEIGHTS=/opt/ComfyUI/models/visual_qc/open_clip_model.safetensors \
+    AF_VISUAL_QC_CLIP_CONFIG=/opt/ComfyUI/models/visual_qc/open_clip_config.json \
+    AF_OPEN_CLIP_MODEL=ViT-B-32 \
+    AF_OPEN_CLIP_PRETRAINED=openai
+
+LABEL org.aetherneo.anime-factory.comfy="true" \
+      org.aetherneo.anime-factory.h3="false" \
+      org.aetherneo.anime-factory.longlive="true" \
+      org.aetherneo.anime-factory.video-backend="longlive" \
+      org.aetherneo.anime-factory.kolors="true" \
+      org.aetherneo.anime-factory.image-gen="true" \
+      org.aetherneo.anime-factory.agent="true"
+
+WORKDIR /app
+
+ENTRYPOINT ["/usr/local/bin/af-start"]

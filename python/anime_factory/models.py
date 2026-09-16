@@ -155,6 +155,11 @@ H3_MAX_SECONDS = 8.0
 # (384-1)*4+1 = 1533 video frames ≈ 63.9s @ 24fps; 64s snaps exactly to 384 latents.
 # 5090 + local_attn_size=32 is the AR window, not an 8s H3 slice.
 LONGLIVE_MAX_SECONDS = 64.0
+# ~120s shorts pack into 2–3 AR takes; each take is ≤60s (compose scales 1280×704).
+LONGLIVE_SHORT_MAX_SECONDS = 60.0
+LONGLIVE_SHORT_TARGET_SECONDS = 120.0
+LONGLIVE_SHORT_MIN_TAKES = 2
+LONGLIVE_SHORT_MAX_TAKES = 3
 VIDEO_BACKENDS = ("h3", "longlive")
 DEFAULT_VIDEO_BACKEND = "h3"
 H3_MAX_REFS = 9

@@ -64,22 +64,27 @@ class GpuImage:
     install_comfy: bool
     note: str
     digest: str | None = None
+    longlive: bool = False
 
     def capabilities(self) -> dict:
         return {
             "comfy": self.comfy,
             "h3": self.h3,
+            "longlive": self.longlive,
             "kolors": self.kolors,
             "image_gen": self.image_gen,
             "agent": self.agent,
             "install_comfy": self.install_comfy,
+            "video_backend": "longlive" if self.longlive and not self.h3 else "h3" if self.h3 else "",
         }
 
 
 AGENT_IMAGE = "docker.io/aetherneo/anime-factory-gpu"
+LONGLIVE_IMAGE = "docker.io/aetherneo/anime-factory-gpu-longlive"
 LEGACY_AGENT_ONLY_IMAGE = "docker.io/aetherneo/anime-factory-gpu-agent"
 PYTORCH_IMAGE = "pytorch/pytorch"
 COMFY_TEMPLATE_IMAGE = "vast-template/comfy-h3"
+IMAGE_CAPABILITY_ENV = "AF_IMAGE_CAPABILITY"
 
 # Canonical catalog. Keys are normalized (no tag, no docker.io prefix variants).
 IMAGE_CATALOG: dict[str, GpuImage] = {
@@ -92,6 +97,18 @@ IMAGE_CATALOG: dict[str, GpuImage] = {
         agent=True,
         install_comfy=False,
         note="Hub image: ComfyUI + MiniMax H3 + Flux 生图 + agent. Probe :8199. One card does stills and video.",
+        longlive=False,
+    ),
+    LONGLIVE_IMAGE: GpuImage(
+        name=LONGLIVE_IMAGE,
+        comfy=True,
+        h3=False,
+        kolors=True,
+        image_gen=True,
+        agent=True,
+        install_comfy=False,
+        note="Hub image: ComfyUI + Animagine stills + LongLive NVFP4. Never H3. Probe :8199 for keyframes.",
+        longlive=True,
     ),
     LEGACY_AGENT_ONLY_IMAGE: GpuImage(
         name=LEGACY_AGENT_ONLY_IMAGE,
@@ -130,6 +147,10 @@ _ALIASES = {
     "docker.io/aetherneo/anime-factory-gpu": AGENT_IMAGE,
     "docker.io/aetherneo/anime-factory-gpu:main": AGENT_IMAGE,
     "anime-factory-gpu": AGENT_IMAGE,
+    "aetherneo/anime-factory-gpu-longlive": LONGLIVE_IMAGE,
+    "docker.io/aetherneo/anime-factory-gpu-longlive": LONGLIVE_IMAGE,
+    "docker.io/aetherneo/anime-factory-gpu-longlive:main": LONGLIVE_IMAGE,
+    "anime-factory-gpu-longlive": LONGLIVE_IMAGE,
     "aetherneo/anime-factory-gpu-agent": LEGACY_AGENT_ONLY_IMAGE,
     "docker.io/aetherneo/anime-factory-gpu-agent": LEGACY_AGENT_ONLY_IMAGE,
     "pytorch/pytorch": PYTORCH_IMAGE,
@@ -142,7 +163,13 @@ def normalize_image(image: str | None) -> str:
     if raw in _ALIASES:
         return _ALIASES[raw]
     no_tag = raw.rsplit(":", 1)[0] if ":" in raw.rsplit("/", 1)[-1] else raw
-    return _ALIASES.get(no_tag, no_tag if no_tag in IMAGE_CATALOG else AGENT_IMAGE)
+    if no_tag in _ALIASES:
+        return _ALIASES[no_tag]
+    if no_tag in IMAGE_CATALOG:
+        return no_tag
+    if "longlive" in raw.lower():
+        return LONGLIVE_IMAGE
+    return AGENT_IMAGE
 
 
 def resolve_image(image: str | None) -> GpuImage:
@@ -164,11 +191,53 @@ def stills_capable(capabilities: dict | None) -> bool:
     return bool(capabilities.get("kolors") or capabilities.get("image_gen") or capabilities.get("image-gen"))
 
 
+def video_capability(capabilities: dict | None) -> str:
+    """Return the video line this image may run: h3, longlive, or empty."""
+    if not capabilities:
+        return ""
+    if capabilities.get("longlive") and not capabilities.get("h3"):
+        return "longlive"
+    if capabilities.get("h3"):
+        return "h3"
+    if capabilities.get("longlive"):
+        return "longlive"
+    return ""
+
+
+def image_supports_backend(capabilities: dict | None, backend: str) -> bool:
+    wanted = str(backend or "").strip().lower()
+    have = video_capability(capabilities)
+    return bool(have) and have == wanted
+
+
 def image_can_lease(capabilities: dict | None) -> bool:
-    """Lease only when the image can run Comfy, H3, and 生图 on the same card."""
+    """Lease when the image can run Comfy + 生图 and exactly one video line."""
     if not capabilities:
         return False
-    return bool(capabilities.get("comfy") and capabilities.get("h3") and stills_capable(capabilities))
+    return bool(
+        capabilities.get("comfy")
+        and stills_capable(capabilities)
+        and video_capability(capabilities) in {"h3", "longlive"}
+    )
+
+
+def running_image_name() -> str | None:
+    for key in ("VAST_GPU_IMAGE", "GPU_IMAGE", "AF_GPU_IMAGE"):
+        raw = (os.environ.get(key) or "").strip()
+        if raw:
+            return raw
+    return None
+
+
+def running_image_capability() -> str:
+    """Video line baked into this container. Fail closed when unset on mismatch checks."""
+    raw = (os.environ.get(IMAGE_CAPABILITY_ENV) or "").strip().lower()
+    if raw in {"h3", "longlive"}:
+        return raw
+    image = running_image_name()
+    if image:
+        return video_capability(image_capabilities(image)) or "h3"
+    return "h3"
 
 
 def should_probe_comfy(image: str | None = None, capabilities: dict | None = None) -> bool:
@@ -179,9 +248,19 @@ def should_probe_comfy(image: str | None = None, capabilities: dict | None = Non
 
 
 def default_register_capabilities() -> dict:
-    caps = image_capabilities(AGENT_IMAGE)
+    name = running_image_name()
+    if running_image_capability() == "longlive":
+        caps = image_capabilities(name or LONGLIVE_IMAGE)
+        caps["h3"] = False
+        caps["longlive"] = True
+        caps["video_backend"] = "longlive"
+    else:
+        caps = image_capabilities(name or AGENT_IMAGE)
+        caps.setdefault("longlive", False)
+        caps["video_backend"] = "h3"
     caps["profile_id"] = default_profile_id()
     caps["image_digest"] = handshake_image_digest()
+    caps["image_capability"] = running_image_capability()
     return caps
 
 
@@ -197,6 +276,9 @@ class CapabilityProfile:
     require_flash_attn: bool = False
     require_fouroversix: bool = False
     expected_image_digest: str | None = None
+    expected_torch: str | None = None
+    expected_torchvision: str | None = None
+    expected_torchaudio: str | None = None
     note: str = ""
 
 
@@ -215,6 +297,9 @@ CAPABILITY_PROFILES: dict[str, CapabilityProfile] = {
         require_torch=True,
         require_flash_attn=True,
         require_fouroversix=True,
+        expected_torch="2.7.0+cu128",
+        expected_torchvision="0.22.0+cu128",
+        expected_torchaudio="2.7.0+cu128",
         note="LongLive NVFP4 on Blackwell sm_120; wheels must be baked.",
     ),
     # 4090 sm_89 is intentionally absent until a validated sm_89 image exists.
