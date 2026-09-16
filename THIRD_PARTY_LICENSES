@@ -50,52 +50,108 @@ License: BSD-style license (see PyTorch LICENSE file at time of install)
 Installed from the official PyTorch CUDA 12.8 wheel index during image build.
 
 ------------------------------------------------------------------------------
-5. Python dependencies installed via pip in the container / dev environment
+5. LongLive 2.0 source and runtime model
 ------------------------------------------------------------------------------
 
-Representative packages include Pillow, huggingface_hub, boto3, open_clip_torch,
-and ComfyUI requirements filtered at build time. Each package is governed by
-its own upstream license (typically permissive OSS licenses). Refer to the
-installed package metadata in a built environment for exact versions and texts.
+Source: NVlabs/LongLive
+Source license: Apache License 2.0
+Runtime checkpoint: Efficient-Large-Model/LongLive-2.0-5B-NVFP4-S2
+Checkpoint terms: NVIDIA Open Model License Agreement
+
+The dedicated LongLive image pins and includes the inference source but does
+not include the checkpoint. The checkpoint and Wan sidecar files are fetched
+onto instance-local storage at runtime. NVIDIA's model terms, notices, and any
+terms attached to the Wan components apply independently of this repository's
+Apache-2.0 license.
 
 ------------------------------------------------------------------------------
-6. cloudflared (container binary)
+6. MOSS-SoundEffect v2
+------------------------------------------------------------------------------
+
+Source: OpenMOSS/MOSS-TTS, moss_soundeffect_v2
+Model: OpenMOSS-Team/MOSS-SoundEffect-v2.0
+License: Apache License 2.0
+
+The source is pinned in a separate Python runtime in the container. Model
+weights are not included in the image and are downloaded only when the
+Freesound path cannot supply an acceptable effect.
+
+------------------------------------------------------------------------------
+7. MiniMax H3
+------------------------------------------------------------------------------
+
+Model: MiniMaxAI/MiniMax-H3 and related runtime files
+Terms: MiniMax H3 Community License Agreement
+
+The H3 image contains integration code but no H3 weights. The Community
+License excludes the European Union, United Kingdom, Republic of Korea, and
+United States from its "Applicable Territory" unless the operator obtains
+separate authorization from MiniMax. Its restrictions also address model
+outputs. Operators are solely responsible for deployment geography,
+authorization, downstream terms, and compliance; this repository grants no
+rights to H3.
+
+------------------------------------------------------------------------------
+8. Animagine XL 4.0, IP-Adapter, and visual-QC weights
+------------------------------------------------------------------------------
+
+- Animagine XL 4.0: CreativeML Open RAIL++-M.
+- IP-Adapter model files: terms published by h94/IP-Adapter.
+- OpenCLIP architecture/code: MIT; pretrained weights may have separate terms.
+
+These weights are fetched at runtime. CreativeML Open RAIL++-M includes
+use-based restrictions and redistribution/notice requirements that remain
+applicable when the model is hosted or redistributed.
+
+------------------------------------------------------------------------------
+9. Freesound assets
+------------------------------------------------------------------------------
+
+Freesound audio is not bundled with this repository or image. The worker
+accepts CC0 effects and, when enabled for a cue, CC-BY effects with creator,
+source URL, and license provenance. CC-BY-NC and unknown licenses are rejected.
+Users distributing final media must retain any required CC-BY attribution.
+
+------------------------------------------------------------------------------
+10. Python dependencies installed via pip
+------------------------------------------------------------------------------
+
+Representative packages include Pillow, huggingface_hub, boto3,
+open_clip_torch, PyTorch ecosystem packages, and filtered ComfyUI
+requirements. Each package is governed by its own upstream license. Refer to
+the installed package metadata and license files in a built image for the
+exact pinned versions and notices.
+
+------------------------------------------------------------------------------
+11. cloudflared
 ------------------------------------------------------------------------------
 
 Upstream: https://github.com/cloudflare/cloudflared
-License: Apache License 2.0 (see upstream repository)
+License: Apache License 2.0
 
 Downloaded as a release binary during image build when tunnel egress is used.
 
 ------------------------------------------------------------------------------
-7. ffmpeg and Ubuntu base packages
+12. NVIDIA CUDA images, ffmpeg, and Ubuntu packages
 ------------------------------------------------------------------------------
 
-Installed from Ubuntu 24.04 repositories in the CUDA runtime base image.
-Licenses vary by package (GPL/LGPL/Apache/etc.). See Debian/Ubuntu copyright
-files in a built image for details.
+The container is based on NVIDIA CUDA images, which are governed by NVIDIA's
+container/CUDA terms. ffmpeg and other packages are installed from Ubuntu
+24.04; their licenses vary (including GPL/LGPL/Apache and permissive terms).
+See the package copyright files in a built image.
 
 ------------------------------------------------------------------------------
-8. Runtime-downloaded model weights (NOT in git; fetched on instance boot)
+13. Other runtime-downloaded model weights
 ------------------------------------------------------------------------------
 
-The worker intentionally does not commit model checkpoints. At runtime, weights
-are pulled from Hugging Face and similar hosts into instance-local disk. Common
-artifacts referenced by the worker include, without limitation:
-
-- MiniMax H3 video model weights (MiniMax-H3 and related files)
-- Animagine XL 4.0 SDXL checkpoint (cagliostrolab/animagine-xl-4.0)
-- IP-Adapter and CLIP vision weights for still generation
-- OpenCLIP ViT-B-32 weights for visual QC (timm/vit_base_patch32_clip_224.openai)
-- Additional ComfyUI model files declared in gpu_worker.weights
-
-Each model repository publishes its own license (commercial, research, open,
-or custom). Operators must comply with upstream model license terms, including
-any attribution, usage restriction, or fee requirements. This repository does
-not grant rights to third-party model weights.
+No model checkpoint is committed to git or intentionally baked into the
+published images. At runtime, files are pulled from their authoritative model
+repositories into instance-local storage and are never mirrored to project R2.
+Each model's own terms control. Operators must verify those terms at the pinned
+revision before use.
 
 ------------------------------------------------------------------------------
-9. ComfyUI workflow JSON in /workflows
+14. ComfyUI workflow JSON in /workflows
 ------------------------------------------------------------------------------
 
 Workflow files in this repository are Apache-2.0 project assets describing node
