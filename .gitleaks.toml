@@ -1,0 +1,10 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Known synthetic Freesound credential used by redaction tests"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "line"
+paths = ['''^tests/test_sfx_freesound\.py$''']
+regexes = ['''monkeypatch\.setenv\("FREESOUND_API_KEY", "fs-secret-xyz-778899"\)''']
