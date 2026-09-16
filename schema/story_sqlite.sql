@@ -94,6 +94,10 @@ CREATE TABLE IF NOT EXISTS cuts (
     keyframe_path TEXT
 );
 
+-- gender is validated by the application (anime_factory.tts.resolve_gender), not by a
+-- CHECK here. Legacy rows may be NULL until backfilled; the voice-lock path requires an
+-- explicit cast gender or a 1boy/1girl identity tag before it will synthesize speech,
+-- it no longer defaults an unmarked speaker to male.
 CREATE TABLE IF NOT EXISTS characters (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -105,7 +109,8 @@ CREATE TABLE IF NOT EXISTS characters (
     current_costume_id TEXT,
     current_location_id TEXT,
     seed INTEGER,
-    sheet_dir TEXT
+    sheet_dir TEXT,
+    gender TEXT
 );
 
 CREATE TABLE IF NOT EXISTS character_relationships (
@@ -121,6 +126,12 @@ CREATE TABLE IF NOT EXISTS character_relationships (
 -- A hardcoded CHECK (lang IN ('zh','en','ja')) turned "adding a language is one registry row"
 -- into an IntegrityError the moment 'ko' was registered, and an existing story.sqlite keeps its
 -- old CHECK anyway, so the constraint could never be the real gate.
+-- lock_version increments only on an explicit voice-profile migration (new clone,
+-- speaker swap). A non-empty voice_uri is otherwise preserved across episodes:
+-- recomputing a stock_voice_uri must never silently overwrite an established lock.
+-- profile_fingerprint is anime_factory.tts.profile_fingerprint(character_id, gender,
+-- voice_uri, model, lock_version) — it identifies the locked voice identity, independent
+-- of any single line's text, and is what cross-episode reuse checks against.
 CREATE TABLE IF NOT EXISTS character_voice (
     character_id TEXT NOT NULL,
     lang TEXT NOT NULL,
@@ -129,7 +140,26 @@ CREATE TABLE IF NOT EXISTS character_voice (
     speed REAL,
     emotion TEXT,
     version TEXT,
+    lock_version INTEGER NOT NULL DEFAULT 1,
+    profile_fingerprint TEXT,
     PRIMARY KEY (character_id, lang)
+);
+
+-- One row per synthesized line wav. fingerprint is anime_factory.tts.line_fingerprint(...)
+-- over (character_id, gender, voice_uri, model, speed, lang, cleaned_text, lock_version).
+-- compose/produce only reuse an on-disk wav when its stored fingerprint still matches;
+-- any drift (voice migration, text edit, speed change) invalidates the cached take.
+CREATE TABLE IF NOT EXISTS line_audio (
+    segment_id TEXT NOT NULL,
+    lang TEXT NOT NULL,
+    character_id TEXT,
+    fingerprint TEXT NOT NULL,
+    wav_path TEXT,
+    duration REAL,
+    sample_rate INTEGER,
+    content_hash TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (segment_id, lang)
 );
 
 CREATE TABLE IF NOT EXISTS locations (
@@ -370,4 +400,40 @@ CREATE TABLE IF NOT EXISTS repair_tasks (
     status TEXT NOT NULL DEFAULT 'open',
     created_at TEXT NOT NULL,
     completed_at TEXT
+);
+
+-- SFX cue resolution: Freesound is always attempted before MOSS-SoundEffect v2.
+-- One row per resolved cue (a board/segment SFX need, or a shared ambience bed).
+-- provenance_json carries the full audit trail: query/tags/scores for Freesound
+-- hits (creator, source_url, license, sample_rate, freesound id) or the MOSS
+-- seed/prompt/duration/commit for a fallback generation. content_hash is the
+-- sha256 of the normalized PCM WAV, used for cache dedup and provenance.
+-- r2_key follows anime_factory.r2_paths sfx helpers: episodes/<EP>/audio/sfx/...
+-- for episode-local cues, shared/sfx/... for reusable/ambience assets. Model
+-- weights are never written to R2 (see anime_factory.sfx_moss).
+CREATE TABLE IF NOT EXISTS sfx_cues (
+    id TEXT PRIMARY KEY,
+    episode_code TEXT,
+    segment_id TEXT,
+    cue_key TEXT NOT NULL,
+    prompt TEXT,
+    tags_json TEXT,
+    duration_target REAL,
+    bus TEXT NOT NULL DEFAULT 'sfx',
+    source TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    license TEXT,
+    creator TEXT,
+    source_url TEXT,
+    content_hash TEXT,
+    sample_rate INTEGER,
+    duration_actual REAL,
+    r2_key TEXT,
+    local_path TEXT,
+    shared INTEGER NOT NULL DEFAULT 0,
+    provenance_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (bus IN ('sfx', 'ambience')),
+    CHECK (status IN ('pending', 'resolved', 'failed', 'rejected'))
 );

@@ -12,10 +12,12 @@ import sqlite3
 import struct
 import sys
 import wave
+from pathlib import Path
 from typing import Callable, Sequence
 from urllib.request import Request, urlopen
 
 from anime_factory.config import load_settings
+from anime_factory.db import utcnow
 from anime_factory.instrument import Counters
 from anime_factory.langs import normalize_langs
 from anime_factory.models import H3_MAX_SECONDS, SILICONFLOW_BASE_URL, TTS_MODEL
@@ -104,6 +106,30 @@ class VoiceGenderError(RuntimeError):
     def __init__(self, message: str):
         super().__init__(message)
         self.blocked = True
+
+
+class GenderRequiredError(VoiceGenderError):
+    """No explicit cast gender, 1boy/1girl tag, or textual marker for this speaker.
+
+    The old fallback silently called every unmarked speaker male. That is gone:
+    an unresolved gender blocks the episode instead of guessing.
+    """
+
+    def __init__(self, character_id: str):
+        super().__init__(
+            f"{character_id}: gender is required (explicit cast gender, 1boy/1girl identity "
+            "tag, or an unambiguous textual marker) before a voice can be locked"
+        )
+        self.character_id = character_id
+
+
+class GenderConflictError(VoiceGenderError):
+    """Explicit cast gender disagrees with the identity's 1boy/1girl tag or markers."""
+
+    def __init__(self, character_id: str, signals: dict[str, str]):
+        super().__init__(f"{character_id}: conflicting gender signals {signals}")
+        self.character_id = character_id
+        self.signals = dict(signals)
 
 
 class SpeechTextError(ValueError):
@@ -213,6 +239,75 @@ def _marker_in(blob: str, markers: tuple[str, ...]) -> bool:
     return False
 
 
+_GENDER_TAG_RE = re.compile(r"\b(1boy|1girl)\b", re.I)
+_GENDER_FIELD_MAP = {
+    "female": "female",
+    "f": "female",
+    "woman": "female",
+    "girl": "female",
+    "male": "male",
+    "m": "male",
+    "man": "male",
+    "boy": "male",
+}
+
+
+def _explicit_gender_field(gender: str | None) -> str | None:
+    raw = str(gender or "").strip().lower()
+    return _GENDER_FIELD_MAP.get(raw)
+
+
+def _identity_gender_tag(identity: str | None) -> str | None:
+    match = _GENDER_TAG_RE.search(str(identity or ""))
+    if not match:
+        return None
+    return "male" if match.group(1).lower() == "1boy" else "female"
+
+
+def resolve_gender(
+    character_id: str,
+    *,
+    gender: str | None = None,
+    identity: str | None = None,
+    name: str | None = None,
+) -> str:
+    """Derive a speaker's gender from explicit signals only. Never guess.
+
+    Priority is: explicit cast `gender` field and the identity's 1boy/1girl tag
+    (both "structured" signals — if they disagree that is a real authoring bug,
+    not a coin flip). Failing those, an unambiguous textual marker in the
+    identity/name blob or a literal role id (e.g. `girl`, `hero`) is accepted.
+    A character with none of these signals raises `GenderRequiredError`
+    instead of defaulting to male, which is the bug this replaces.
+    """
+    cid = str(character_id or "").strip()
+    explicit = _explicit_gender_field(gender)
+    tag = _identity_gender_tag(identity)
+    blob = " ".join(str(x or "") for x in (identity, name))
+    female_hit = _marker_in(blob, _FEMALE_MARKERS)
+    male_hit = _marker_in(blob, _MALE_MARKERS)
+    role = _ROLE_GENDER.get(cid.lower())
+
+    signals: dict[str, str] = {}
+    if explicit:
+        signals["gender_field"] = explicit
+    if tag:
+        signals["identity_tag"] = tag
+    if female_hit and not male_hit:
+        signals["identity_marker"] = "female"
+    elif male_hit and not female_hit:
+        signals["identity_marker"] = "male"
+    if role:
+        signals["role_id"] = role
+
+    distinct = set(signals.values())
+    if len(distinct) > 1:
+        raise GenderConflictError(cid or "character", signals)
+    if distinct:
+        return distinct.pop()
+    raise GenderRequiredError(cid or "character")
+
+
 def infer_gender(
     character_id: str,
     *,
@@ -220,23 +315,8 @@ def infer_gender(
     identity: str | None = None,
     name: str | None = None,
 ) -> str:
-    raw = str(gender or "").strip().lower()
-    if raw in {"female", "f", "woman", "girl"}:
-        return "female"
-    if raw in {"male", "m", "man", "boy"}:
-        return "male"
-    blob = " ".join(str(x or "") for x in (identity, name))
-    female_hit = _marker_in(blob, _FEMALE_MARKERS)
-    male_hit = _marker_in(blob, _MALE_MARKERS)
-    if female_hit and not male_hit:
-        return "female"
-    if male_hit and not female_hit:
-        return "male"
-    role = _ROLE_GENDER.get(str(character_id or "").strip().lower())
-    if role:
-        return role
-    # Unknown must not fall into the old all-female zh pool.
-    return "female" if _marker_in(character_id, _FEMALE_MARKERS) else "male"
+    """Back-compat alias for `resolve_gender`. Raises instead of defaulting to male."""
+    return resolve_gender(character_id, gender=gender, identity=identity, name=name)
 
 
 def infer_age_band(age: int | float | None, personality: str | None = None) -> str:
@@ -592,6 +672,160 @@ def lock_voices_or_block(
     for cid in character_ids:
         for lang in normalize_langs(langs):
             require_voice_uri(conn, cid, lang)
+
+
+# ---------------------------------------------------------------------------
+# Voice-profile / line fingerprints and cross-episode lock preservation.
+#
+# A character's locked voice_uri must survive into the next episode untouched:
+# recomputing stock_voice_uri from the same identity/gender is deterministic,
+# but an author edit (name, personality wording) must not silently reassign
+# the speaker mid-series. Preservation is keyed on lock_version: bumping it is
+# the only sanctioned way to force a new profile (a real clone swap).
+# ---------------------------------------------------------------------------
+
+
+def profile_fingerprint(
+    character_id: str,
+    gender: str,
+    voice_uri: str,
+    model: str = TTS_MODEL,
+    lock_version: int = 1,
+) -> str:
+    """Identity fingerprint for a locked character/lang voice profile.
+
+    Independent of any single line's text — this is what cross-episode reuse
+    and lock-preservation checks compare against, not `line_fingerprint`.
+    """
+    payload = "|".join(
+        (
+            "profile:v1",
+            str(character_id or ""),
+            str(gender or ""),
+            str(voice_uri or ""),
+            str(model or ""),
+            str(int(lock_version or 1)),
+        )
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def line_fingerprint(
+    character_id: str,
+    gender: str,
+    voice_uri: str,
+    model: str,
+    speed: float,
+    lang: str,
+    cleaned_text: str,
+    lock_version: int = 1,
+) -> str:
+    """Fingerprint over every input that can change what a line wav sounds like.
+
+    Reuse of an on-disk line wav is only valid when this matches exactly:
+    character, gender, voice URI, model, speed, lang, the exact cleaned
+    (stage-direction-stripped) text, and the voice-lock version. Any drift —
+    a voice migration, a text edit, a speed retune — must regenerate.
+    """
+    payload = "|".join(
+        (
+            "line:v1",
+            str(character_id or ""),
+            str(gender or ""),
+            str(voice_uri or ""),
+            str(model or ""),
+            f"{float(speed or 1.0):.4f}",
+            str(lang or ""),
+            str(cleaned_text or ""),
+            str(int(lock_version or 1)),
+        )
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def existing_voice_lock(
+    conn: sqlite3.Connection, character_id: str, lang: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT voice_uri, speed, lock_version, profile_fingerprint FROM character_voice "
+        "WHERE character_id = ? AND lang = ?",
+        (character_id, lang),
+    ).fetchone()
+
+
+def resolve_locked_voice_uri(
+    conn: sqlite3.Connection,
+    character_id: str,
+    lang: str,
+    candidate_uri: str,
+    *,
+    migrate: bool = False,
+) -> tuple[str, int]:
+    """Preserve an established voice_uri across episodes unless explicitly migrated.
+
+    A non-empty `character_voice.voice_uri` already on disk wins over any
+    freshly recomputed `candidate_uri` — recomputing stock_voice_uri from a
+    lightly-edited identity string must not reassign an established speaker.
+    `migrate=True` is the only way to force `candidate_uri` in and bump
+    `lock_version`, e.g. an intentional clone swap.
+    Returns (uri, lock_version) to persist.
+    """
+    row = existing_voice_lock(conn, character_id, lang)
+    established = str(row["voice_uri"]) if row and row["voice_uri"] else ""
+    current_version = int(row["lock_version"] or 1) if row else 1
+    if migrate:
+        return candidate_uri, current_version + 1
+    if established:
+        return established, current_version
+    return candidate_uri, current_version
+
+
+def line_wav_reusable(
+    conn: sqlite3.Connection,
+    segment_id: str,
+    lang: str,
+    expected_fingerprint: str,
+    wav_path: Path | str,
+) -> bool:
+    """True only if `wav_path` exists and its recorded fingerprint still matches."""
+    path = Path(wav_path)
+    if not path.is_file() or path.stat().st_size <= 100:
+        return False
+    row = conn.execute(
+        "SELECT fingerprint FROM line_audio WHERE segment_id = ? AND lang = ?",
+        (segment_id, lang),
+    ).fetchone()
+    return bool(row) and str(row["fingerprint"]) == str(expected_fingerprint)
+
+
+def record_line_audio(
+    conn: sqlite3.Connection,
+    segment_id: str,
+    lang: str,
+    character_id: str,
+    fingerprint: str,
+    wav_path: str,
+    duration: float,
+    sample_rate: int,
+    content_hash: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO line_audio (segment_id, lang, character_id, fingerprint, wav_path,
+                                 duration, sample_rate, content_hash, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(segment_id, lang) DO UPDATE SET
+            character_id = excluded.character_id,
+            fingerprint = excluded.fingerprint,
+            wav_path = excluded.wav_path,
+            duration = excluded.duration,
+            sample_rate = excluded.sample_rate,
+            content_hash = excluded.content_hash,
+            created_at = excluded.created_at
+        """,
+        (segment_id, lang, character_id, fingerprint, wav_path, duration, sample_rate, content_hash, utcnow()),
+    )
+    conn.commit()
 
 
 def clamp_speed(requested: float, tolerance: float | None = None) -> float:

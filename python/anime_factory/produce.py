@@ -60,6 +60,7 @@ from anime_factory.models import (
     STYLE_PREFIX,
     TARGET_EPISODE_SECONDS,
     DEFAULT_SHORT_SECONDS,
+    TTS_MODEL,
     normalize_story_kind,
 )
 from anime_factory.r2_client import upload_tree
@@ -67,13 +68,23 @@ from anime_factory.script import draft_episode_script, produce_script
 from anime_factory.video_backend import max_seconds_for_backend, select_video_backend
 from anime_factory.tts import (
     CosyVoiceClient,
+    GenderRequiredError,
     LineDurationError,
     SpeechTextError,
     VoiceGenderError,
     assert_locked_voices,
+    existing_voice_lock,
+    line_fingerprint,
+    line_wav_reusable,
+    pcm_duration_seconds,
+    profile_fingerprint,
+    record_line_audio,
+    resolve_gender,
+    resolve_locked_voice_uri,
     stock_voice_uri,
     strip_stage_directions,
     synthesize_line,
+    wav_sha256,
 )
 from anime_factory.world import init_fiction_world, write_bible
 
@@ -330,17 +341,37 @@ def _lock_voice(
     character_id: str,
     langs: Sequence[str] | None = None,
     uri_for: dict[str, str] | None = None,
+    *,
+    gender: str | None = None,
+    migrate: bool = False,
 ) -> None:
+    """Lock voice_uri per lang, preserving an established (non-empty) URI.
+
+    Recomputing `uri_for` from the same character every episode is
+    deterministic, but a lightly-edited identity string must not silently
+    reassign an already-locked speaker. `resolve_locked_voice_uri` keeps
+    whatever is already on disk unless `migrate=True` (an intentional
+    voice-profile change), in which case `lock_version` is bumped so stale
+    line wavs (fingerprinted against the old version) invalidate.
+    """
     for lang in normalize_langs(langs):
-        uri = (uri_for or {}).get(lang) or f"voice://{character_id}/{lang}"
+        candidate = (uri_for or {}).get(lang) or f"voice://{character_id}/{lang}"
+        uri, lock_version = resolve_locked_voice_uri(
+            conn, character_id, lang, candidate, migrate=migrate
+        )
+        fp = profile_fingerprint(character_id, str(gender or ""), uri, TTS_MODEL, lock_version)
         try:
             conn.execute(
                 """
-                INSERT INTO character_voice (character_id, lang, voice_uri, reference_audio, speed, emotion, version)
-                VALUES (?, ?, ?, ?, 1.0, 'neutral', 'v1')
-                ON CONFLICT(character_id, lang) DO UPDATE SET voice_uri = excluded.voice_uri
+                INSERT INTO character_voice (character_id, lang, voice_uri, reference_audio, speed,
+                    emotion, version, lock_version, profile_fingerprint)
+                VALUES (?, ?, ?, ?, 1.0, 'neutral', 'v1', ?, ?)
+                ON CONFLICT(character_id, lang) DO UPDATE SET
+                    voice_uri = excluded.voice_uri,
+                    lock_version = excluded.lock_version,
+                    profile_fingerprint = excluded.profile_fingerprint
                 """,
-                (character_id, lang, uri, f"assets/voice/{character_id}.{lang}.wav"),
+                (character_id, lang, uri, f"assets/voice/{character_id}.{lang}.wav", lock_version, fp),
             )
         except sqlite3.IntegrityError as exc:
             raise RuntimeError(
@@ -382,14 +413,16 @@ def init_demo_story(conn: sqlite3.Connection, story_id: str, root: Path) -> dict
     )
     conn.execute(
         """
-        INSERT INTO characters (id, name, identity_prompt, age, alive, seed, current_location_id)
-        VALUES (?, ?, ?, 24, 1, 11, ?)
-        ON CONFLICT(id) DO UPDATE SET identity_prompt = excluded.identity_prompt
+        INSERT INTO characters (id, name, identity_prompt, age, alive, seed, current_location_id, gender)
+        VALUES (?, ?, ?, 24, 1, 11, ?, 'male')
+        ON CONFLICT(id) DO UPDATE SET identity_prompt = excluded.identity_prompt,
+            gender = COALESCE(characters.gender, excluded.gender)
         """,
         (
             KEEPER,
             "阿柯",
-            "young East Asian hacker, short messy black hair, dark hoodie, quiet eyes, night loft, character design sheet",
+            "1boy, young East Asian hacker, short messy black hair, dark hoodie, quiet eyes, "
+            "night loft, character design sheet",
             LOC,
         ),
     )
@@ -541,12 +574,25 @@ def apply_script_world(
         )
     first_location = next(iter(script.get("locations") or []), {}).get("id")
     for char in script.get("cast") or []:
+        identity = str(char.get("identity_prompt") or "")
+        try:
+            gender = resolve_gender(
+                str(char["id"]),
+                gender=char.get("gender"),
+                identity=identity,
+                name=char.get("name"),
+            )
+        except GenderRequiredError:
+            # Persist what we have; voice-lock (produce_episode) is where an
+            # unresolved gender actually blocks the episode, not script ingest.
+            gender = None
         conn.execute(
             """
-            INSERT INTO characters (id, name, identity_prompt, age, alive, current_location_id)
-            VALUES (?, ?, ?, ?, 1, ?)
+            INSERT INTO characters (id, name, identity_prompt, age, alive, current_location_id, gender)
+            VALUES (?, ?, ?, ?, 1, ?, ?)
             ON CONFLICT(id) DO UPDATE SET identity_prompt = excluded.identity_prompt,
-                name = excluded.name
+                name = excluded.name,
+                gender = COALESCE(excluded.gender, characters.gender)
             """,
             (
                 char["id"],
@@ -554,6 +600,7 @@ def apply_script_world(
                 char.get("identity_prompt"),
                 int(char.get("age") or 25),
                 first_location,
+                gender,
             ),
         )
     for prop in script.get("props") or []:
@@ -780,7 +827,8 @@ def _prepare_demo(conn: sqlite3.Connection, story_id: str, root: Path, spec: Epi
             {
                 "id": KEEPER,
                 "name": "阿柯",
-                "identity_prompt": "young East Asian hacker, short messy black hair, dark hoodie, quiet eyes, character design sheet",
+                "identity_prompt": "1boy, young East Asian hacker, short messy black hair, dark hoodie, quiet eyes, character design sheet",
+                "gender": "male",
                 "seed": 11,
             }
         ],
@@ -1001,20 +1049,31 @@ def produce_episode(
     audio_root.mkdir(parents=True, exist_ok=True)
     speakers = sorted({str(s["character_id"]) for s in shots if s.get("character_id")}) or [KEEPER]
     cast_by_id = {str(c.get("id")): c for c in (script.get("cast") or []) if c.get("id")}
+    voice_migrate = str(os.environ.get("ANIME_FACTORY_VOICE_MIGRATE") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    resolved_gender: dict[str, str] = {}
     try:
         for cid in speakers:
             char = cast_by_id.get(cid) or {}
             row = conn.execute(
-                "SELECT name, age, identity_prompt FROM characters WHERE id = ?", (cid,)
+                "SELECT name, age, identity_prompt, gender FROM characters WHERE id = ?", (cid,)
             ).fetchone()
             identity = str(char.get("identity_prompt") or (row["identity_prompt"] if row else "") or "")
             age = char.get("age") if char.get("age") is not None else (row["age"] if row else None)
             nm = str(char.get("name") or (row["name"] if row else cid))
+            cast_or_db_gender = char.get("gender") or (row["gender"] if row else None)
+            gender = resolve_gender(cid, gender=cast_or_db_gender, identity=identity, name=nm)
+            resolved_gender[cid] = gender
+            conn.execute("UPDATE characters SET gender = ? WHERE id = ?", (gender, cid))
             uris = {
                 lang: stock_voice_uri(
                     cid,
                     lang,
-                    gender=char.get("gender"),
+                    gender=gender,
                     age=age,
                     identity=identity,
                     name=nm,
@@ -1024,11 +1083,12 @@ def produce_episode(
             assert_locked_voices(
                 uris,
                 cid,
-                gender=char.get("gender"),
+                gender=gender,
                 identity=identity,
                 name=nm,
             )
-            _lock_voice(conn, cid, spec.langs, uris)
+            _lock_voice(conn, cid, spec.langs, uris, gender=gender, migrate=voice_migrate)
+        conn.commit()
     except VoiceGenderError as exc:
         mark("tts", "blocked", f"voice:{exc}")
         return {"story_id": story_id, "episode_code": ep, "status": status, "blocked": True, "error": str(exc)}
@@ -1037,11 +1097,11 @@ def produce_episode(
             line = shot.get("line")
             if not line:
                 continue
+            sid = str(shot.get("id") or "")
             cid = str(shot.get("character_id") or KEEPER)
+            gender = resolved_gender.get(cid) or ""
             for lang in spec.langs:
                 dest = audio_root / f"{shot['id']}.{lang}.wav"
-                if dest.is_file() and dest.stat().st_size > 100:
-                    continue
                 text = _shot_line_text(line, lang, primary)
                 stripped = strip_stage_directions(text)
                 if stripped != text:
@@ -1049,7 +1109,20 @@ def produce_episode(
                     shot["line"] = line
                 if not stripped:
                     continue
-                audio, _duration = synthesize_line(
+                lock = existing_voice_lock(conn, cid, lang)
+                voice_uri = str(lock["voice_uri"]) if lock and lock["voice_uri"] else ""
+                speed = float(lock["speed"] or 1.0) if lock else 1.0
+                lock_version = int(lock["lock_version"] or 1) if lock else 1
+                expected_fp = line_fingerprint(
+                    cid, gender, voice_uri, TTS_MODEL, speed, lang, stripped, lock_version
+                )
+                if sid and line_wav_reusable(conn, sid, lang, expected_fp, dest):
+                    continue
+                if dest.is_file() and dest.stat().st_size > 100 and not sid:
+                    # No segment id to fingerprint against (legacy caller path);
+                    # fall back to the old "file already exists" skip.
+                    continue
+                audio, duration = synthesize_line(
                     tts,
                     conn,
                     cid,
@@ -1058,6 +1131,18 @@ def produce_episode(
                     target_seconds=float(shot.get("duration") or 0) or None,
                 )
                 dest.write_bytes(audio)
+                if sid:
+                    record_line_audio(
+                        conn,
+                        sid,
+                        lang,
+                        cid,
+                        expected_fp,
+                        str(dest),
+                        duration or pcm_duration_seconds(audio),
+                        24000,
+                        wav_sha256(audio),
+                    )
     except (SpeechTextError, LineDurationError) as exc:
         mark("tts", "blocked", f"speech:{exc}")
         return {"story_id": story_id, "status": status, "blocked": True, "error": str(exc)}

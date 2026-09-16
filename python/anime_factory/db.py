@@ -36,6 +36,8 @@ CHAPTER10_TABLES = (
     "generation_tasks",
     "generation_results",
     "repair_tasks",
+    "line_audio",
+    "sfx_cues",
 )
 
 _ADDITIVE_COLUMNS = (
@@ -51,6 +53,9 @@ _ADDITIVE_COLUMNS = (
     ("assets", "selected_image_id", "TEXT"),
     ("assets", "history_json", "TEXT"),
     ("locations", "plate_prompt", "TEXT"),
+    ("characters", "gender", "TEXT"),
+    ("character_voice", "lock_version", "INTEGER NOT NULL DEFAULT 1"),
+    ("character_voice", "profile_fingerprint", "TEXT"),
 )
 
 # Canon graph — first-class tables, not factions.__meta_* rows.

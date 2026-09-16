@@ -13,9 +13,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+from anime_factory.audio_bus import BUS_SAMPLE_RATE, BusMixResult, build_shared_bed, mix_language_master
 from anime_factory.config import load_settings
 from anime_factory.langs import normalize_langs
 from anime_factory.models import TARGET_EPISODE_SECONDS, VIDEO_FPS, VIDEO_HEIGHT, VIDEO_WIDTH
+from anime_factory.timeline import EpisodeTimeline, build_episode_timeline, write_episode_timeline
 from anime_factory.tts import (
     COSYVOICE_SAMPLE_RATE,
     VOICE_CLONE_TRANSCRIPT,
@@ -768,3 +770,129 @@ def _ts(seconds: float) -> str:
     m, rem = divmod(rem, 60_000)
     s, milli = divmod(rem, 1000)
     return f"{h:02d}:{m:02d}:{s:02d},{milli:03d}"
+
+
+# ---------------------------------------------------------------------------
+# One-frame timeline + dialogue/SFX/ambience buses.
+#
+# The timeline manifest is the single source of truth video duration,
+# subtitles, and audio placement all derive from: it is built from *measured*
+# line-wav durations already on disk, using the same fitted picture durations
+# `mix_dialogue_timeline` used to overlay them. Bus mixing keeps dialogue,
+# SFX and ambience on separate 48 kHz buses (anime_factory.audio_bus) so every
+# language's master shares one SFX+ambience stem instead of re-deriving it.
+# ---------------------------------------------------------------------------
+
+
+def measured_line_wav_durations(
+    workdir: Path, shots: Sequence[dict], langs: Sequence[str] | None = None
+) -> dict[tuple[str, str], float]:
+    """Actual on-disk line-wav durations, keyed (shot_id, lang). Never the estimate."""
+    out: dict[tuple[str, str], float] = {}
+    for shot in shots:
+        sid = str(shot.get("id") or "")
+        if not sid:
+            continue
+        for lang in normalize_langs(langs):
+            path = _line_wav_for_shot(workdir, shot, lang)
+            if path is None:
+                continue
+            out[(sid, lang)] = pcm_duration_seconds(path.read_bytes())
+    return out
+
+
+def build_episode_frame_timeline(
+    workdir: Path,
+    episode_code: str,
+    shots: list[dict],
+    langs: Sequence[str] | None = None,
+    clip_durations: dict[str, float] | None = None,
+    sfx_cues: Sequence[dict] | None = None,
+) -> EpisodeTimeline:
+    """24 fps integer-frame manifest for this episode.
+
+    `clip_durations` should be `fit_clip_durations_to_speech(...)` — the
+    picture duration already fitted to the locked speech — so shot frame
+    offsets and measured dialogue onset/end agree to within ±1 frame.
+    """
+    resolved_langs = normalize_langs(langs)
+    wav_durations = measured_line_wav_durations(workdir, shots, resolved_langs)
+    fitted = clip_durations if clip_durations is not None else fit_clip_durations_to_speech(workdir, shots, resolved_langs)
+    return build_episode_timeline(
+        episode_code,
+        shots,
+        wav_durations=wav_durations,
+        sfx_cues=sfx_cues,
+        langs=resolved_langs,
+        clip_durations=fitted,
+    )
+
+
+def mix_episode_buses(
+    workdir: Path,
+    episode_code: str,
+    dialogue_masters: dict[str, str],
+    duration_s: float,
+    sfx_clips: Sequence[tuple[float, bytes]] = (),
+    ambience_clips: Sequence[tuple[float, bytes]] = (),
+) -> dict[str, BusMixResult]:
+    """Mix each language's dialogue master against one shared 48 kHz SFX+ambience bed.
+
+    `dialogue_masters` is `mix_dialogue_timeline(...)`'s return value
+    (lang -> path to that language's locked-CosyVoice master). The bed is
+    built once from `sfx_clips`/`ambience_clips` and reused for every
+    language, so effects never drift between dub tracks. Results are written
+    back onto the same paths `build_compose_plan` already muxes from, so the
+    mux step needs no changes to pick up the busses.
+    """
+    shared_bed = build_shared_bed(duration_s, sfx_clips, ambience_clips, sample_rate=BUS_SAMPLE_RATE) if (sfx_clips or ambience_clips) else None
+    out: dict[str, BusMixResult] = {}
+    for lang, path_str in dialogue_masters.items():
+        path = Path(path_str)
+        dialogue_wav = path.read_bytes()
+        result = mix_language_master(dialogue_wav, shared_bed, sample_rate=BUS_SAMPLE_RATE)
+        path.write_bytes(result.pcm)
+        out[lang] = result
+    return out
+
+
+def compose_episode_audio(
+    workdir: Path,
+    episode_code: str,
+    shots: list[dict],
+    langs: Sequence[str] | None = None,
+    require_speech: bool = True,
+    clip_durations: dict[str, float] | None = None,
+    video_paths: Sequence[Path] | None = None,
+    audio_metas: dict[str, dict] | None = None,
+    sfx_clips: Sequence[tuple[float, bytes]] = (),
+    ambience_clips: Sequence[tuple[float, bytes]] = (),
+    sfx_cues: Sequence[dict] | None = None,
+) -> tuple[dict[str, str], EpisodeTimeline]:
+    """Full audio integration point: dialogue mux, bus mix, and the frame timeline.
+
+    1. `mix_dialogue_timeline` locks CosyVoice2 dialogue per language (unchanged).
+    2. `mix_episode_buses` overlays one shared SFX/ambience bed at 48 kHz on
+       top of every language's dialogue master, with ducking and safe gain.
+    3. `build_episode_frame_timeline` + `write_episode_timeline` derive and
+       persist the 24 fps manifest video/subtitles/audio all read from.
+    """
+    resolved_langs = normalize_langs(langs)
+    fitted = clip_durations or fit_clip_durations_to_speech(workdir, shots, resolved_langs)
+    mixed = mix_dialogue_timeline(
+        workdir,
+        episode_code,
+        shots,
+        resolved_langs,
+        require_speech=require_speech,
+        clip_durations=fitted,
+        video_paths=video_paths,
+        audio_metas=audio_metas,
+    )
+    aligned = [{**s, "duration": fitted.get(str(s.get("id") or ""), s.get("duration"))} for s in shots]
+    duration_s = sum(float(s.get("duration") or SHOT_SLOT_SECONDS) for s in aligned) or TARGET_EPISODE_SECONDS
+    if sfx_clips or ambience_clips:
+        mix_episode_buses(workdir, episode_code, mixed, duration_s, sfx_clips, ambience_clips)
+    timeline = build_episode_frame_timeline(workdir, episode_code, shots, resolved_langs, fitted, sfx_cues)
+    write_episode_timeline(workdir, timeline)
+    return mixed, timeline
