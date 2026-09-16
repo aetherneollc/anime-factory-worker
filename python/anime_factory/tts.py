@@ -808,22 +808,28 @@ def record_line_audio(
     duration: float,
     sample_rate: int,
     content_hash: str,
+    hosted_fingerprint: str | None = None,
 ) -> None:
+    """`fingerprint` is always the worker's rich local line_fingerprint — the
+    reuse gate. `hosted_fingerprint` additionally records the control plane's
+    16-hex tts_manifest fingerprint when a hosted wav was bridged in, so both
+    identities are stored and neither weakens the other."""
     conn.execute(
         """
-        INSERT INTO line_audio (segment_id, lang, character_id, fingerprint, wav_path,
-                                 duration, sample_rate, content_hash, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO line_audio (segment_id, lang, character_id, fingerprint, hosted_fingerprint,
+                                 wav_path, duration, sample_rate, content_hash, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(segment_id, lang) DO UPDATE SET
             character_id = excluded.character_id,
             fingerprint = excluded.fingerprint,
+            hosted_fingerprint = excluded.hosted_fingerprint,
             wav_path = excluded.wav_path,
             duration = excluded.duration,
             sample_rate = excluded.sample_rate,
             content_hash = excluded.content_hash,
             created_at = excluded.created_at
         """,
-        (segment_id, lang, character_id, fingerprint, wav_path, duration, sample_rate, content_hash, utcnow()),
+        (segment_id, lang, character_id, fingerprint, hosted_fingerprint, wav_path, duration, sample_rate, content_hash, utcnow()),
     )
     conn.commit()
 

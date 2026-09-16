@@ -167,6 +167,47 @@ def sfx_events_from_cues(cues: Sequence[dict], fps: int = FPS) -> list[SfxEvent]
     return out
 
 
+def validate_episode_timeline(timeline: "EpisodeTimeline", *, tolerance: int = FRAME_ALIGNMENT_TOLERANCE) -> None:
+    """Fail-closed frame validation (±1 frame): the manifest is only the single
+    source of truth if its own events are internally consistent.
+
+    - Every dialogue event must start at/after its shot's start frame and end
+      at/before its *fitted* shot boundary (the picture duration compose
+      already stretched to the locked speech).
+    - Every SFX/ambience event must lie inside [0, total_frames].
+
+    Violations raise `FrameAlignmentError` instead of shipping a manifest that
+    quietly claims dialogue/effects extend past the picture that carries them.
+    """
+    frames_by_shot = {s.shot_id: s for s in timeline.shots}
+    for ev in timeline.dialogue:
+        shot = frames_by_shot.get(ev.shot_id)
+        if shot is None:
+            raise FrameAlignmentError(
+                f"dialogue {ev.shot_id}.{ev.lang}: no shot frame span for this event"
+            )
+        if ev.start_frame < shot.start_frame - tolerance:
+            raise FrameAlignmentError(
+                f"dialogue {ev.shot_id}.{ev.lang}: starts at frame {ev.start_frame}, "
+                f"before shot start {shot.start_frame} (±{tolerance})"
+            )
+        if ev.end_frame > shot.end_frame + tolerance:
+            raise FrameAlignmentError(
+                f"dialogue {ev.shot_id}.{ev.lang}: ends at frame {ev.end_frame}, past the fitted "
+                f"shot boundary {shot.end_frame} (±{tolerance}); retime TTS or refit the clip"
+            )
+    for ev in timeline.sfx:
+        if ev.end_frame < ev.start_frame:
+            raise FrameAlignmentError(f"sfx {ev.cue_key}: end frame {ev.end_frame} < start {ev.start_frame}")
+        if ev.start_frame < -tolerance:
+            raise FrameAlignmentError(f"sfx {ev.cue_key}: starts at negative frame {ev.start_frame}")
+        if ev.end_frame > timeline.total_frames + tolerance:
+            raise FrameAlignmentError(
+                f"sfx {ev.cue_key}: ends at frame {ev.end_frame}, past the episode's "
+                f"{timeline.total_frames} frames (±{tolerance})"
+            )
+
+
 def build_episode_timeline(
     episode_code: str,
     shots: Sequence[dict],
@@ -176,12 +217,13 @@ def build_episode_timeline(
     langs: Sequence[str] = ("zh",),
     clip_durations: dict[str, float] | None = None,
     fps: int = FPS,
+    validate: bool = True,
 ) -> EpisodeTimeline:
     shot_frames = shot_frame_offsets(shots, clip_durations, fps)
     total_frames = shot_frames[-1].end_frame if shot_frames else 0
     dialogue = dialogue_events_from_wavs(shots, shot_frames, wav_durations or {}, langs, fps=fps)
     sfx = sfx_events_from_cues(sfx_cues or [], fps=fps)
-    return EpisodeTimeline(
+    timeline = EpisodeTimeline(
         episode_code=episode_code,
         fps=fps,
         total_frames=total_frames,
@@ -189,6 +231,9 @@ def build_episode_timeline(
         dialogue=tuple(dialogue),
         sfx=tuple(sfx),
     )
+    if validate:
+        validate_episode_timeline(timeline)
+    return timeline
 
 
 def timeline_to_manifest(timeline: EpisodeTimeline) -> dict:

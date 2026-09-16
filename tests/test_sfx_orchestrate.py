@@ -11,7 +11,15 @@ from anime_factory.db import migrate, open_db
 from anime_factory.sfx_common import SfxCue
 from anime_factory.sfx_freesound import FreesoundClient
 from anime_factory.sfx_moss import MossRunnerConfig, MossSoundEffectClient
-from anime_factory.sfx_orchestrate import SfxResolutionError, r2_key_for, resolve_cue
+from anime_factory.sfx_orchestrate import (
+    SfxCueSpecError,
+    SfxResolutionError,
+    explicit_cues_from_shots,
+    prepare_episode_sfx,
+    r2_key_for,
+    resolve_cue,
+    sfx_cue_db_id,
+)
 from anime_factory.tts import voiced_dummy_wav
 
 
@@ -106,3 +114,192 @@ def test_r2_key_episode_local_vs_shared():
     shared_key = r2_key_for("story-abc-123", shared_cue)
     assert ep_key == "stories/story-abc-123/episodes/EP002/audio/sfx/door_creak.wav"
     assert shared_key == "shared/sfx/rain_ambience.wav"
+
+
+def test_r2_key_slugifies_hostile_cue_keys():
+    evil = SfxCue(cue_key="../../weights/model.safetensors", query="q", episode_code="EP001")
+    key = r2_key_for("story-abc-123", evil)
+    assert key.startswith("stories/story-abc-123/episodes/EP001/audio/sfx/")
+    assert ".." not in key
+    assert key.endswith(".wav")
+    shared_evil = SfxCue(cue_key="a/b\\c", query="q", shared=True)
+    shared = r2_key_for("story-abc-123", shared_evil)
+    assert shared.startswith("shared/sfx/")
+    assert "/a/" not in shared and "\\" not in shared
+    assert shared.endswith(".wav")
+
+
+def test_db_ids_are_episode_scoped_no_cross_episode_collision(tmp_path):
+    """`id=cue_key` collided across episodes; ids must be episode/shared-scoped."""
+    conn = open_db(tmp_path / "story.sqlite")
+    migrate(conn)
+    wav = voiced_dummy_wav(2.0, freq=380.0)
+    for ep in ("EP001", "EP002"):
+        moss_client = MossSoundEffectClient(
+            config=MossRunnerConfig("py", "script.py", str(tmp_path / "w")), runner=_moss_runner_writing(wav)
+        )
+        cue = SfxCue(cue_key="door_creak", query="door creak", duration_target=2.0, episode_code=ep, seed=3)
+        resolve_cue(
+            cue,
+            tmp_path,
+            story_id="story-abc-123",
+            conn=conn,
+            freesound_client=FreesoundClient("k", opener=_fs_opener([], {})),
+            moss_client=moss_client,
+        )
+    rows = conn.execute(
+        "SELECT id, episode_code FROM sfx_cues WHERE cue_key = 'door_creak' ORDER BY episode_code"
+    ).fetchall()
+    assert len(rows) == 2
+    assert rows[0]["id"] == "EP001:door_creak"
+    assert rows[1]["id"] == "EP002:door_creak"
+    shared = SfxCue(cue_key="door_creak", query="door creak", shared=True)
+    assert sfx_cue_db_id(shared) == "shared:door_creak"
+
+
+def test_failure_reason_in_db_is_secret_redacted(tmp_path, monkeypatch):
+    secret = "moss-hf-token-a1b2c3d4"
+    monkeypatch.setenv("HF_TOKEN", secret)
+    conn = open_db(tmp_path / "story.sqlite")
+    migrate(conn)
+
+    import subprocess
+
+    def leaky_runner(args, env, timeout_s):
+        return subprocess.CompletedProcess(args, returncode=1, stdout=b"", stderr=f"denied for {secret}".encode())
+
+    moss_client = MossSoundEffectClient(
+        config=MossRunnerConfig("py", "script.py", str(tmp_path / "w")), runner=leaky_runner
+    )
+    cue = SfxCue(cue_key="leaky", query="anything", duration_target=1.0, episode_code="EP001")
+    with pytest.raises(SfxResolutionError) as excinfo:
+        resolve_cue(
+            cue,
+            tmp_path,
+            story_id="s",
+            conn=conn,
+            freesound_client=FreesoundClient("k", opener=_fs_opener([], {})),
+            moss_client=moss_client,
+        )
+    assert secret not in str(excinfo.value)
+    row = conn.execute("SELECT provenance_json, status FROM sfx_cues WHERE cue_key = 'leaky'").fetchone()
+    assert row["status"] == "failed"
+    assert secret not in (row["provenance_json"] or "")
+
+
+# ---------------------------------------------------------------------------
+# Pre-compose orchestration: explicit cues only, compose-ready outputs.
+# ---------------------------------------------------------------------------
+
+
+def test_no_explicit_fields_derives_no_cues():
+    shots = [
+        {"id": "s001", "duration": 8.0, "line": {"zh": "你好"}},
+        {"id": "s002", "duration": 8.0},
+    ]
+    assert explicit_cues_from_shots(shots, "EP001") == []
+
+
+def test_explicit_sfx_and_ambience_fields_derive_cues_with_onsets():
+    shots = [
+        {"id": "s001", "duration": 8.0},
+        {
+            "id": "s002",
+            "duration": 6.0,
+            "sfx": [
+                "door creak",
+                {"query": "glass shatter", "key": "glass1", "offset_s": 2.0, "duration_s": 1.0, "tags": ["glass"]},
+            ],
+            "ambience": {"query": "night crickets", "shared": True},
+        },
+    ]
+    derived = explicit_cues_from_shots(shots, "EP001")
+    assert len(derived) == 3
+    creak, glass, amb = derived
+    assert creak["cue"].query == "door creak"
+    assert creak["onset_s"] == 8.0  # shot s002 starts after the 8.0s s001
+    assert creak["required"] is True
+    assert glass["cue"].cue_key == "glass1"
+    assert glass["onset_s"] == 10.0
+    assert glass["cue"].tags == ("glass",)
+    assert amb["cue"].bus == "ambience"
+    assert amb["cue"].shared is True
+    assert amb["cue"].duration_target == 6.0  # spans its shot by default
+
+
+def test_malformed_explicit_entry_raises_spec_error():
+    with pytest.raises(SfxCueSpecError):
+        explicit_cues_from_shots([{"id": "s001", "duration": 8.0, "sfx": [{"tags": ["x"]}]}], "EP001")
+
+
+def test_prepare_episode_sfx_returns_compose_ready_shapes(tmp_path):
+    rows = [_candidate(9, "http://creativecommons.org/publicdomain/zero/1.0/", "https://cdn.freesound.org/p.mp3")]
+    fs_client = FreesoundClient("k", opener=_fs_opener(rows, {"p.mp3": voiced_dummy_wav(1.5, freq=320.0)}))
+    conn = open_db(tmp_path / "story.sqlite")
+    migrate(conn)
+    shots = [
+        {"id": "s001", "duration": 8.0},
+        {"id": "s002", "duration": 6.0, "sfx": [{"query": "door creak", "key": "door1", "duration_s": 1.5}]},
+    ]
+    out = prepare_episode_sfx(
+        shots,
+        tmp_path,
+        "EP001",
+        story_id="story-abc-123",
+        conn=conn,
+        freesound_client=fs_client,
+    )
+    assert len(out["sfx_clips"]) == 1
+    onset, blob = out["sfx_clips"][0]
+    assert onset == 8.0
+    assert blob[:4] == b"RIFF"
+    assert out["ambience_clips"] == []
+    assert len(out["sfx_cues"]) == 1
+    row = out["sfx_cues"][0]
+    assert row["cue_key"] == "door1"
+    assert row["bus"] == "sfx"
+    assert row["onset_s"] == 8.0
+    assert 0 < row["duration_s"] <= 14.0 - 8.0  # clamped inside the episode
+    db_row = conn.execute("SELECT status, r2_key FROM sfx_cues WHERE cue_key = 'door1'").fetchone()
+    assert db_row["status"] == "resolved"
+    assert db_row["r2_key"].endswith(".wav")
+    assert "audio/sfx" in db_row["r2_key"]
+
+    # These shapes feed compose_episode_audio + the frame timeline directly.
+    from anime_factory.timeline import build_episode_timeline
+
+    timeline = build_episode_timeline("EP001", shots, sfx_cues=out["sfx_cues"])
+    assert timeline.sfx[0].cue_key == "door1"
+
+
+def test_prepare_episode_sfx_required_cue_failure_raises(tmp_path, monkeypatch):
+    for key in ("MOSS_SFX_PYTHON", "MOSS_SFX_SCRIPT", "MOSS_SFX_WEIGHTS_DIR"):
+        monkeypatch.delenv(key, raising=False)
+    fs_client = FreesoundClient("k", opener=_fs_opener([], {}))  # freesound has nothing
+    shots = [{"id": "s001", "duration": 8.0, "sfx": [{"query": "impossible sound"}]}]
+    with pytest.raises(SfxResolutionError):
+        prepare_episode_sfx(shots, tmp_path, "EP001", freesound_client=fs_client, moss_client=MossSoundEffectClient())
+
+
+def test_prepare_episode_sfx_optional_cue_failure_continues(tmp_path, monkeypatch):
+    for key in ("MOSS_SFX_PYTHON", "MOSS_SFX_SCRIPT", "MOSS_SFX_WEIGHTS_DIR"):
+        monkeypatch.delenv(key, raising=False)
+    fs_client = FreesoundClient("k", opener=_fs_opener([], {}))
+    shots = [{"id": "s001", "duration": 8.0, "sfx": [{"query": "nice to have", "required": False}]}]
+    out = prepare_episode_sfx(shots, tmp_path, "EP001", freesound_client=fs_client, moss_client=MossSoundEffectClient())
+    assert out["sfx_clips"] == []
+    assert out["sfx_cues"] == []
+
+
+def test_prepare_episode_sfx_never_yields_weight_like_r2_keys(tmp_path):
+    rows = [_candidate(10, "http://creativecommons.org/publicdomain/zero/1.0/", "https://cdn.freesound.org/p.mp3")]
+    fs_client = FreesoundClient("k", opener=_fs_opener(rows, {"p.mp3": voiced_dummy_wav(1.5, freq=320.0)}))
+    conn = open_db(tmp_path / "story.sqlite")
+    migrate(conn)
+    shots = [{"id": "s001", "duration": 8.0, "sfx": [{"query": "door creak", "key": "model.safetensors"}]}]
+    prepare_episode_sfx(shots, tmp_path, "EP001", story_id="story-abc-123", conn=conn, freesound_client=fs_client)
+    for row in conn.execute("SELECT r2_key FROM sfx_cues WHERE r2_key IS NOT NULL").fetchall():
+        key = row["r2_key"]
+        assert key.endswith(".wav")
+        assert "safetensors" not in key.rsplit(".", 1)[-1]
+        assert "/audio/sfx/" in key or key.startswith("shared/sfx/")

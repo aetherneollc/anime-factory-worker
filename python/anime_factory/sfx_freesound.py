@@ -1,12 +1,18 @@
 """Freesound-first SFX search/select/download/normalize/QC pipeline.
 
 Freesound API v2 (https://freesound.org/docs/api/) is queried with
-`FREESOUND_API_KEY` from the environment; the token is read once, attached
-to outbound requests, and never written to a log line, an exception message,
-or a cache/provenance file. Only the HQ preview is fetched — this worker has
-no Freesound OAuth token, so the authenticated original-file download is not
-available; the HQ preview is the highest-quality asset reachable with an API
-key alone.
+`FREESOUND_API_KEY` from the environment; the token is attached as an
+`Authorization: Token …` request header (the documented API-key scheme) —
+never as a URL query parameter, where it would land in proxy/server logs and
+exception reprs. Network exception text is redacted before it can reach a log
+line, a DB failure reason, a cache manifest, or raised error text. Only the
+HQ preview is fetched — this worker has no Freesound OAuth token, so the
+authenticated original-file download is not available; the HQ preview is the
+highest-quality asset reachable with an API key alone.
+
+Host policy is fixed: API search goes to https://freesound.org only, and
+preview downloads are restricted to HTTPS URLs on Freesound-controlled hosts
+(freesound.org / *.freesound.org). Response and download sizes are bounded.
 
 CC0 is preferred. CC-BY is optional per cue (recording creator, source URL,
 and license so attribution can be assembled downstream). CC-BY-NC (and any
@@ -23,7 +29,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 from typing import Callable, Sequence
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 from anime_factory.sfx_common import (
@@ -42,17 +48,24 @@ from anime_factory.sfx_common import (
     classify_license,
     content_hash,
     license_allowed,
+    redact_secrets,
 )
 from anime_factory.tts import decode_pcm16_mono, encode_pcm16_mono
 
 log = logging.getLogger("anime_factory.sfx.freesound")
 
 FREESOUND_BASE_URL = "https://freesound.org/apiv2"
+FREESOUND_API_HOST = "freesound.org"
 FREESOUND_SEARCH_PATH = "/search/text/"
 FREESOUND_SEARCH_FIELDS = (
     "id,name,tags,duration,license,username,previews,avg_rating,num_ratings,samplerate,channels,type"
 )
 FREESOUND_PAGE_SIZE = 15
+# Bounded reads: a search response is small JSON; a preview is an mp3/ogg of
+# at most ~30s of audio. Anything past these caps is a broken/hostile payload.
+MAX_SEARCH_RESPONSE_BYTES = 4 * 1024 * 1024
+MAX_PREVIEW_BYTES = 48 * 1024 * 1024
+REQUEST_TIMEOUT_S = 30
 
 HttpOpener = Callable[[Request], "bytes | dict"]
 
@@ -65,9 +78,30 @@ class FreesoundNoCandidateError(RuntimeError):
     """No search hit cleared the license/QC bar for this cue."""
 
 
+class FreesoundNetworkError(RuntimeError):
+    """A search/preview request failed. Message is always secret-redacted."""
+
+
+class FreesoundHostPolicyError(RuntimeError):
+    """URL is not HTTPS on a Freesound-controlled host."""
+
+
 def freesound_api_key() -> str:
     """Read the API key from the environment only. Callers must never log it."""
     return (os.environ.get("FREESOUND_API_KEY") or "").strip()
+
+
+def assert_freesound_url(url: str, *, allow_subdomains: bool) -> None:
+    """HTTPS + freesound.org (API) or *.freesound.org (preview CDN) only."""
+    parts = urlsplit(str(url or ""))
+    host = (parts.hostname or "").lower()
+    ok_host = host == FREESOUND_API_HOST or (
+        allow_subdomains and host.endswith("." + FREESOUND_API_HOST)
+    )
+    if parts.scheme != "https" or not ok_host:
+        raise FreesoundHostPolicyError(
+            f"refusing non-Freesound/non-HTTPS URL host={host!r} scheme={parts.scheme!r}"
+        )
 
 
 def _candidate_from_json(row: dict) -> SfxCandidate | None:
@@ -111,29 +145,48 @@ def score_candidate(candidate: SfxCandidate, cue: SfxCue) -> float:
 
 
 class FreesoundClient:
-    """Search + preview download. `opener` makes every network call mockable."""
+    """Search + preview download. `opener` makes every network call mockable.
+
+    Live by default in production: a client built without an `opener` performs
+    real HTTPS requests, so a missing mock cannot silently turn every cue into
+    a MOSS fallback. Tests pass `opener=` and never touch the network;
+    `live=False` remains available as an explicit offline kill-switch.
+    """
 
     def __init__(
         self,
         api_key: str | None = None,
         *,
         opener: HttpOpener | None = None,
-        live: bool = False,
+        live: bool | None = None,
         base_url: str = FREESOUND_BASE_URL,
     ):
         self.api_key = api_key if api_key is not None else freesound_api_key()
         self.opener = opener
-        self.live = live
+        self.live = (opener is None) if live is None else bool(live)
         self.base_url = base_url.rstrip("/")
 
-    def _get(self, req: Request) -> bytes:
+    def _get(self, req: Request, *, limit: int) -> bytes:
         if self.opener is not None:
             data = self.opener(req)
-            return data if isinstance(data, (bytes, bytearray)) else json.dumps(data).encode("utf-8")
+            raw = data if isinstance(data, (bytes, bytearray)) else json.dumps(data).encode("utf-8")
+            if len(raw) > limit:
+                raise FreesoundNetworkError(f"response exceeds {limit} byte cap")
+            return bytes(raw)
         if not self.live:
             return b"{}"
-        with urlopen(req, timeout=30) as resp:  # noqa: S310 — fixed https host
-            return resp.read()
+        try:
+            with urlopen(req, timeout=REQUEST_TIMEOUT_S) as resp:  # noqa: S310 — host asserted by caller
+                raw = resp.read(limit + 1)
+        except Exception as exc:  # noqa: BLE001 — sanitized: no token/env secret may escape
+            # `from None`: the original exception (whose repr/args can embed
+            # header dicts or URLs) must not ride along into tracebacks/logs.
+            raise FreesoundNetworkError(
+                f"{type(exc).__name__}: {redact_secrets(str(exc), extra=(self.api_key,))}"
+            ) from None
+        if len(raw) > limit:
+            raise FreesoundNetworkError(f"response exceeds {limit} byte cap")
+        return raw
 
     def search(self, query: str, tags: Sequence[str] = (), page_size: int = FREESOUND_PAGE_SIZE) -> list[SfxCandidate]:
         if not self.api_key and not self.opener:
@@ -142,13 +195,17 @@ class FreesoundClient:
             "query": query,
             "fields": FREESOUND_SEARCH_FIELDS,
             "page_size": page_size,
-            "token": self.api_key,
         }
         if tags:
             params["filter"] = " ".join(f"tag:{t}" for t in tags)
         url = f"{self.base_url}{FREESOUND_SEARCH_PATH}?{urlencode(params)}"
+        assert_freesound_url(url, allow_subdomains=False)
         req = Request(url, method="GET")
-        raw = self._get(req)
+        if self.api_key:
+            # Documented API-key scheme. Never `?token=` — query strings end up
+            # in access logs, proxies, and URLError text.
+            req.add_header("Authorization", f"Token {self.api_key}")
+        raw = self._get(req, limit=MAX_SEARCH_RESPONSE_BYTES)
         try:
             payload = json.loads(raw.decode("utf-8")) if raw else {}
         except (ValueError, UnicodeDecodeError):
@@ -161,9 +218,12 @@ class FreesoundClient:
         return candidates
 
     def fetch_preview(self, preview_url: str) -> bytes:
-        # Preview URLs are pre-signed by Freesound and need no Authorization header.
+        # Preview URLs are pre-signed by Freesound and need no Authorization
+        # header — and must not get one: only freesound.org itself may ever
+        # see the token, and previews live on Freesound-controlled CDN hosts.
+        assert_freesound_url(preview_url, allow_subdomains=True)
         req = Request(preview_url, method="GET")
-        return self._get(req)
+        return self._get(req, limit=MAX_PREVIEW_BYTES)
 
 
 def _is_pcm_wav(data: bytes) -> bool:
@@ -209,9 +269,15 @@ def normalize_to_pcm_wav(
         try:
             result = runner(args)
         except (OSError, subprocess.SubprocessError) as exc:
-            raise MalformedAudioError(f"ffmpeg normalize failed to start: {exc}") from exc
+            raise MalformedAudioError(
+                f"ffmpeg normalize failed to start: {redact_secrets(str(exc))}"
+            ) from None
         if getattr(result, "returncode", 1) != 0 or not dst.is_file():
-            raise MalformedAudioError("ffmpeg normalize did not produce a WAV")
+            stderr = getattr(result, "stderr", b"") or b""
+            tail = stderr[-300:].decode("utf-8", "replace") if isinstance(stderr, (bytes, bytearray)) else str(stderr)[-300:]
+            raise MalformedAudioError(
+                f"ffmpeg normalize did not produce a WAV: {redact_secrets(tail)}"
+            )
         return dst.read_bytes()
 
 
@@ -233,11 +299,12 @@ def resolve_via_freesound(
 ) -> SfxResult:
     """Freesound search -> license filter -> score -> download -> normalize -> QC.
 
-    A cache hit for `cue.cue_key` returns immediately without calling
-    `client.search` or `client.fetch_preview` at all.
+    A cache hit for the cue's full contract (see `sfx_common.cue_contract_hash`)
+    returns immediately without calling `client.search` or
+    `client.fetch_preview` at all.
     """
     cache_root = cache_dir_for(root, cue)
-    cached = cache_lookup(cache_root, cue.cue_key)
+    cached = cache_lookup(cache_root, cue)
     if cached is not None:
         return cached
 
@@ -253,6 +320,9 @@ def resolve_via_freesound(
     last_error: Exception | None = None
     for candidate in ranked:
         try:
+            # A fetch error/timeout, an off-policy preview host, an oversized
+            # download, a malformed blob, or a QC failure on one candidate all
+            # mean the same thing: move on to the next ranked candidate.
             raw = client.fetch_preview(candidate.preview_url)
             wav = normalize(raw)
             assert_audio_qc(
@@ -261,7 +331,7 @@ def resolve_via_freesound(
                 target_duration=cue.duration_target,
                 duration_tolerance=cue.duration_tolerance,
             )
-        except (SfxQCError, MalformedAudioError) as exc:
+        except (SfxQCError, MalformedAudioError, FreesoundNetworkError, FreesoundHostPolicyError) as exc:
             log.warning("freesound candidate rejected cue=%s fs_id=%s reason=%s", cue.cue_key, candidate.freesound_id, exc)
             last_error = exc
             continue
@@ -282,7 +352,7 @@ def resolve_via_freesound(
             score=score_candidate(candidate, cue),
             cached=False,
         )
-        cache_record(cache_root, cue.cue_key, local_path, provenance)
+        cache_record(cache_root, cue, local_path, provenance)
         return SfxResult(cue_key=cue.cue_key, status="resolved", local_path=str(local_path), provenance=provenance)
     raise FreesoundNoCandidateError(
         f"{cue.cue_key}: all {len(ranked)} candidate(s) failed QC/decode; last error: {last_error}"

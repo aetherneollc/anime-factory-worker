@@ -117,16 +117,22 @@ def duck_under_dialogue(
 
 
 def mix_add(*tracks: Sequence[int]) -> list[int]:
+    """Wide (unclamped) sample-wise sum. Python ints never overflow, so the
+    true mixed waveform survives intact; the ONE place amplitude is reduced is
+    the final `safe_gain_stage` before encode. Clamping each intermediate sum
+    used to bake hard-clip distortion into the mix before the "safe" gain ran.
+    """
     n = max((len(t) for t in tracks), default=0)
     out = [0] * n
     for t in tracks:
         for i, v in enumerate(t):
             out[i] += v
-    return [max(-32768, min(32767, v)) for v in out]
+    return out
 
 
 def safe_gain_stage(samples: list[int], limit: int = PEAK_LIMIT) -> list[int]:
-    """Scale down (never up) so the mixed peak stays at or under `limit`."""
+    """The single final gain/limit: scale down (never up) so the mixed peak
+    stays at or under `limit`. Deterministic — same input, same output."""
     if not samples:
         return list(samples)
     peak = max((abs(s) for s in samples), default=0)
@@ -158,6 +164,9 @@ def build_shared_bed(
     across zh/en/ja masters.
     """
     n = max(int(duration_s * sample_rate), 1)
+    # Accumulate with unbounded Python ints — overlapping clips must sum
+    # exactly, not clip sample-by-sample. One safe gain stage at the end is
+    # the only level reduction, so no distortion is baked into the stem.
     sfx_bed = [0] * n
     amb_bed = [0] * n
     for start_s, blob in sfx_clips:
@@ -169,7 +178,7 @@ def build_shared_bed(
         for i, v in enumerate(samples):
             j = offset + i
             if 0 <= j < n:
-                sfx_bed[j] = max(-32768, min(32767, sfx_bed[j] + v))
+                sfx_bed[j] += v
     for start_s, blob in ambience_clips:
         rate, samples = decode_pcm16_mono(blob)
         if not samples:
@@ -179,8 +188,8 @@ def build_shared_bed(
         for i, v in enumerate(samples):
             j = offset + i
             if 0 <= j < n:
-                amb_bed[j] = max(-32768, min(32767, amb_bed[j] + v))
-    bed = mix_add(sfx_bed, amb_bed)
+                amb_bed[j] += v
+    bed = safe_gain_stage(mix_add(sfx_bed, amb_bed))
     return encode_pcm16_mono(bed, sample_rate)
 
 

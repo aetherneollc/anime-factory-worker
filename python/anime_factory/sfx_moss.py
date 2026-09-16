@@ -29,7 +29,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from anime_factory.r2_paths import safe_cue_slug
 from anime_factory.sfx_common import (
+    MOSS_MODEL_REPO,
+    MOSS_SOURCE_COMMIT,
     SfxCue,
     SfxProvenance,
     SfxResult,
@@ -40,13 +43,12 @@ from anime_factory.sfx_common import (
     cache_write,
     content_hash,
     deterministic_seed,
+    redact_secrets,
 )
 from anime_factory.tts import decode_pcm16_mono
 
 log = logging.getLogger("anime_factory.sfx.moss")
 
-MOSS_MODEL_REPO = "OpenMOSS-Team/MOSS-SoundEffect-v2.0"
-MOSS_SOURCE_COMMIT = "934d6826b084c46a0d033402174d5f8ac4ed2519"
 MOSS_PIPELINE_MODULE = "OpenMOSS/MOSS-TTS/moss_soundeffect_v2"
 MOSS_REQUIRED_PYTHON = "3.12"
 MOSS_REQUIRED_TORCH = "2.9"
@@ -161,7 +163,11 @@ class MossSoundEffectClient:
         if returncode != 0:
             stderr = getattr(result, "stderr", b"") or b""
             tail = stderr[-400:].decode("utf-8", "replace") if isinstance(stderr, bytes) else str(stderr)[-400:]
-            raise MossGenerationError(f"{cue.cue_key}: MOSS subprocess exit {returncode}: {tail}")
+            # The isolated runner inherits env (HF_TOKEN etc.); its stderr must
+            # be scrubbed before entering an exception message / DB reason.
+            raise MossGenerationError(
+                f"{cue.cue_key}: MOSS subprocess exit {returncode}: {redact_secrets(tail)}"
+            )
         if not out_path.is_file() or out_path.stat().st_size <= 44:
             raise MossGenerationError(f"{cue.cue_key}: MOSS subprocess wrote no audio at {out_path}")
         return out_path.read_bytes()
@@ -174,13 +180,13 @@ def resolve_via_moss(client: MossSoundEffectClient, cue: SfxCue, root: Path) -> 
     (by the isolated subprocess) the first time a given cue actually falls back.
     """
     cache_root = cache_dir_for(root, cue)
-    cached = cache_lookup(cache_root, cue.cue_key)
+    cached = cache_lookup(cache_root, cue)
     if cached is not None:
         return cached
 
     seed = cue.seed if cue.seed is not None else deterministic_seed(cue.cue_key, salt=MOSS_SOURCE_COMMIT)
     duration = float(cue.duration_target or 2.0)
-    tmp_out = cache_root / f"_gen_{cue.cue_key}.wav"
+    tmp_out = cache_root / f"_gen_{safe_cue_slug(cue.cue_key)}.wav"
     wav = client.generate(cue, tmp_out)
     assert_audio_qc(wav, label=f"{cue.cue_key}:moss", target_duration=cue.duration_target, duration_tolerance=cue.duration_tolerance)
     digest = content_hash(wav)
@@ -203,5 +209,5 @@ def resolve_via_moss(client: MossSoundEffectClient, cue: SfxCue, root: Path) -> 
         prompt=cue.query,
         cached=False,
     )
-    cache_record(cache_root, cue.cue_key, local_path, provenance)
+    cache_record(cache_root, cue, local_path, provenance)
     return SfxResult(cue_key=cue.cue_key, status="resolved", local_path=str(local_path), provenance=provenance)

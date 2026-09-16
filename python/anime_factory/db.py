@@ -56,6 +56,7 @@ _ADDITIVE_COLUMNS = (
     ("characters", "gender", "TEXT"),
     ("character_voice", "lock_version", "INTEGER NOT NULL DEFAULT 1"),
     ("character_voice", "profile_fingerprint", "TEXT"),
+    ("line_audio", "hosted_fingerprint", "TEXT"),
 )
 
 # Canon graph — first-class tables, not factions.__meta_* rows.

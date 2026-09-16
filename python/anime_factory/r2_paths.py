@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import posixpath
+import re
 from typing import Iterable
 
 SHARED_PREFIXES = ("shared/sfx/", "shared/fonts/", "archives/")
@@ -48,15 +50,32 @@ def scene_asset_rel(lid: str, filename: str = SCENE_PLATE) -> str:
     return f"assets/scenes/{lid}/{name}"
 
 
+# Cue keys are author-controlled text. They are never trusted as a path
+# component: a key that is not already a plain [a-z0-9_-] slug is rewritten to
+# a sanitized prefix plus a stable sha256 suffix, so `../../x`, `a/b`, unicode
+# and empty keys can never traverse a local cache dir or an R2 prefix, and the
+# same cue_key always maps to the same object name.
+_SLUG_SAFE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+def safe_cue_slug(cue_key: str) -> str:
+    """Stable filesystem/R2-safe name for a cue key. Pure keys pass through."""
+    raw = str(cue_key or "")
+    if _SLUG_SAFE_RE.match(raw):
+        return raw
+    cleaned = re.sub(r"[^a-z0-9_-]+", "_", raw.lower()).strip("_-")[:40]
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+    return f"{cleaned}-{digest}" if cleaned else f"cue-{digest}"
+
+
 def episode_sfx_key(story_id: str, episode_code: str, cue_key: str) -> str:
     """Episode-local SFX cue, isolated under the owning story: stories/<id>/episodes/<EP>/audio/sfx/."""
     ep = str(episode_code or "").strip()
     if not ep or "/" in ep or ".." in ep:
         raise PathIsolationError(f"invalid episode_code: {episode_code!r}")
-    name = str(cue_key or "").replace("\\", "/").split("/")[-1].strip()
-    if not name:
+    if not str(cue_key or "").strip():
         raise PathIsolationError(f"invalid cue_key: {cue_key!r}")
-    return join_story(story_id, "episodes", ep, "audio", "sfx", f"{name}.wav")
+    return join_story(story_id, "episodes", ep, "audio", "sfx", f"{safe_cue_slug(cue_key)}.wav")
 
 
 def shared_sfx_key(cue_key: str) -> str:
@@ -65,10 +84,9 @@ def shared_sfx_key(cue_key: str) -> str:
     Lives directly under the top-level `shared/sfx/` prefix (see SHARED_PREFIXES),
     outside any `stories/<id>/` tree — it is not story-isolated by design.
     """
-    name = str(cue_key or "").replace("\\", "/").split("/")[-1].strip()
-    if not name or ".." in name:
+    if not str(cue_key or "").strip():
         raise PathIsolationError(f"invalid cue_key: {cue_key!r}")
-    return f"{SHARED_PREFIXES[0]}{name}.wav"
+    return f"{SHARED_PREFIXES[0]}{safe_cue_slug(cue_key)}.wav"
 
 
 def is_final_key(key: str) -> bool:

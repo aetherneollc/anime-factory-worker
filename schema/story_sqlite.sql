@@ -149,11 +149,16 @@ CREATE TABLE IF NOT EXISTS character_voice (
 -- over (character_id, gender, voice_uri, model, speed, lang, cleaned_text, lock_version).
 -- compose/produce only reuse an on-disk wav when its stored fingerprint still matches;
 -- any drift (voice migration, text edit, speed change) invalidates the cached take.
+-- hosted_fingerprint is the control plane's 16-hex tts_manifest fingerprint
+-- (sha256("v1|model|voice_uri|text")[:16]) recorded when a hosted pre-GPU wav is
+-- bridged into this table (anime_factory.tts_hosted) — both fingerprints are kept;
+-- the worker's richer local fingerprint always remains the reuse gate.
 CREATE TABLE IF NOT EXISTS line_audio (
     segment_id TEXT NOT NULL,
     lang TEXT NOT NULL,
     character_id TEXT,
     fingerprint TEXT NOT NULL,
+    hosted_fingerprint TEXT,
     wav_path TEXT,
     duration REAL,
     sample_rate INTEGER,

@@ -12,12 +12,27 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Sequence
 
+from anime_factory.r2_paths import safe_cue_slug
 from anime_factory.tts import decode_pcm16_mono, encode_pcm16_mono, resample_pcm16_mono
 
 log = logging.getLogger("anime_factory.sfx")
+
+# Pinned MOSS-SoundEffect v2 identity. Lives here (not in sfx_moss) because it
+# is part of the cue *cache contract*: a model/source policy change must
+# invalidate cached renders, and sfx_common owns cache identity.
+MOSS_MODEL_REPO = "OpenMOSS-Team/MOSS-SoundEffect-v2.0"
+MOSS_SOURCE_COMMIT = "934d6826b084c46a0d033402174d5f8ac4ed2519"
+
+# Source/model policy string baked into every cue's cache identity. Bumping
+# the Freesound asset tier or the MOSS pin re-resolves every cue instead of
+# silently reusing renders produced under the old policy.
+SFX_SOURCE_POLICY = f"freesound-preview-hq+{MOSS_MODEL_REPO}@{MOSS_SOURCE_COMMIT}"
 
 # Deterministic QC defaults. Freesound previews and MOSS renders are judged
 # the same way — a source must not get a QC pass it would not earn elsewhere.
@@ -238,6 +253,33 @@ def content_hash(wav_bytes: bytes) -> str:
     return hashlib.sha256(wav_bytes).hexdigest()
 
 
+CUE_CONTRACT_VERSION = "cue:v2"
+
+
+def cue_contract_hash(cue: SfxCue, source_policy: str = SFX_SOURCE_POLICY) -> str:
+    """Cache identity over the full cue contract, not `cue_key` alone.
+
+    A changed query/tags/duration/tolerance/bus/license-policy/shared flag or a
+    model/source policy bump must miss the cache and re-resolve — reusing an
+    old render for an edited prompt is a silent wrong-sound bug.
+    """
+    payload = "|".join(
+        (
+            CUE_CONTRACT_VERSION,
+            str(cue.cue_key or ""),
+            str(cue.query or ""),
+            ",".join(cue.tags),
+            f"{float(cue.duration_target or 0.0):.3f}",
+            f"{float(cue.duration_tolerance or 0.0):.3f}",
+            str(cue.bus or "sfx"),
+            "cc0+ccby" if cue.allow_cc_by else "cc0-only",
+            "shared" if cue.shared else "episode",
+            str(source_policy or ""),
+        )
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def deterministic_seed(cue_key: str, salt: str = "") -> int:
     """Stable, reproducible seed derived from a cue key. No RNG, no clock."""
     digest = hashlib.sha256(f"{cue_key}:{salt}".encode("utf-8")).hexdigest()
@@ -257,18 +299,27 @@ def cache_dir_for(root: Path, cue: SfxCue) -> Path:
     return Path(root) / "episodes" / ep / "audio" / "sfx" / "cache"
 
 
-def cache_manifest_path(cache_root: Path, cue_key: str) -> Path:
-    return Path(cache_root) / f"{cue_key}.json"
+def cache_manifest_path(cache_root: Path, cue: SfxCue) -> Path:
+    """Manifest name = safe slug + 16-hex contract hash.
+
+    The slug keeps the file greppable; the contract hash is the actual cache
+    key, so a raw `cue_key` (which may contain `/`, `..`, unicode…) is never a
+    path component and an edited cue contract never matches an old manifest.
+    """
+    slug = safe_cue_slug(cue.cue_key)
+    return Path(cache_root) / f"{slug}.{cue_contract_hash(cue)[:16]}.json"
 
 
-def cache_lookup(cache_root: Path, cue_key: str) -> SfxResult | None:
+def cache_lookup(cache_root: Path, cue: SfxCue) -> SfxResult | None:
     """A cache hit must skip both the Freesound search and any MOSS generation."""
-    manifest = cache_manifest_path(cache_root, cue_key)
+    manifest = cache_manifest_path(cache_root, cue)
     if not manifest.is_file():
         return None
     try:
         payload = json.loads(manifest.read_text(encoding="utf-8"))
     except (OSError, ValueError):
+        return None
+    if payload.get("contract") != cue_contract_hash(cue):
         return None
     local_path = payload.get("local_path")
     if not local_path or not Path(local_path).is_file():
@@ -277,7 +328,7 @@ def cache_lookup(cache_root: Path, cue_key: str) -> SfxResult | None:
     prov["tags"] = tuple(prov.get("tags") or ())
     prov["cached"] = True
     return SfxResult(
-        cue_key=cue_key,
+        cue_key=cue.cue_key,
         status="resolved",
         local_path=local_path,
         provenance=SfxProvenance(**prov),
@@ -293,14 +344,55 @@ def cache_write(cache_root: Path, digest: str, wav_bytes: bytes) -> Path:
     return path
 
 
-def cache_record(cache_root: Path, cue_key: str, local_path: Path, provenance: SfxProvenance) -> None:
+def cache_record(cache_root: Path, cue: SfxCue, local_path: Path, provenance: SfxProvenance) -> None:
     root = Path(cache_root)
     root.mkdir(parents=True, exist_ok=True)
-    manifest = cache_manifest_path(root, cue_key)
-    payload = {"cue_key": cue_key, "local_path": str(local_path), "provenance": asdict(provenance)}
+    manifest = cache_manifest_path(root, cue)
+    payload = {
+        "cue_key": cue.cue_key,
+        "contract": cue_contract_hash(cue),
+        "query": cue.query,
+        "tags": list(cue.tags),
+        "duration_target": cue.duration_target,
+        "duration_tolerance": cue.duration_tolerance,
+        "bus": cue.bus,
+        "allow_cc_by": cue.allow_cc_by,
+        "shared": cue.shared,
+        "local_path": str(local_path),
+        "provenance": asdict(provenance),
+    }
     manifest.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def redact(value: str | None) -> str:
     """For log lines that must name a secret's presence without its value."""
     return "<redacted>" if value else "<empty>"
+
+
+# Env var names whose values are treated as secrets for redaction. Length >= 6
+# avoids nuking every "1"/"true" flag value out of error text.
+_SECRET_ENV_NAME_RE = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL)", re.I)
+_MIN_SECRET_LEN = 6
+
+
+def _secret_env_values() -> list[str]:
+    values = []
+    for name, value in os.environ.items():
+        if value and len(value) >= _MIN_SECRET_LEN and _SECRET_ENV_NAME_RE.search(name):
+            values.append(value)
+    return values
+
+
+def redact_secrets(text: str | None, extra: Sequence[str] = ()) -> str:
+    """Strip every secret-looking env value (and `extra` values) out of `text`.
+
+    Applied to network exception text, subprocess stderr tails, and DB failure
+    reasons so an API token or secret env value can never reach a log line, a
+    cache manifest, an `sfx_cues.provenance_json` row, or raised error text.
+    """
+    out = str(text or "")
+    candidates = {str(v) for v in extra if v and len(str(v)) >= _MIN_SECRET_LEN}
+    candidates.update(_secret_env_values())
+    for value in sorted(candidates, key=len, reverse=True):
+        out = out.replace(value, "<redacted>")
+    return out

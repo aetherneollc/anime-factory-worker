@@ -86,6 +86,12 @@ from anime_factory.tts import (
     synthesize_line,
     wav_sha256,
 )
+from anime_factory.tts_hosted import (
+    hosted_voice_for,
+    import_hosted_line_audio,
+    load_hosted_tts_manifest,
+    seed_hosted_voice_lock,
+)
 from anime_factory.world import init_fiction_world, write_bible
 
 DEFAULT_EPISODE = "EP001"
@@ -943,6 +949,81 @@ def _shot_line_text(line: dict, lang: str, primary: str) -> str:
     return str(line.get(lang) or line.get(primary) or line.get("text") or "").strip()
 
 
+def ensure_line_wavs(
+    conn: sqlite3.Connection,
+    tts: "CosyVoiceClient",
+    audio_root: Path,
+    shots: Sequence[dict],
+    langs: Sequence[str],
+    primary: str,
+    resolved_gender: dict[str, str],
+) -> dict[str, list[str]]:
+    """Synthesize every board line that is not already reusable on disk.
+
+    Reuse is gated on `line_wav_reusable`: the on-disk wav's recorded
+    fingerprint must exactly match the expected rich local fingerprint
+    (character, gender, locked voice, model, speed, lang, exact cleaned text,
+    lock_version). Hosted pre-GPU wavs qualify only after
+    `tts_hosted.import_hosted_line_audio` verified and recorded them —
+    everything else is (re-)synthesized.
+    """
+    reused: list[str] = []
+    synthesized: list[str] = []
+    for shot in shots:
+        line = shot.get("line")
+        if not line:
+            continue
+        sid = str(shot.get("id") or "")
+        cid = str(shot.get("character_id") or KEEPER)
+        gender = resolved_gender.get(cid) or ""
+        for lang in langs:
+            dest = audio_root / f"{shot['id']}.{lang}.wav"
+            text = _shot_line_text(line, lang, primary)
+            stripped = strip_stage_directions(text)
+            if stripped != text:
+                line[lang] = stripped
+                shot["line"] = line
+            if not stripped:
+                continue
+            lock = existing_voice_lock(conn, cid, lang)
+            voice_uri = str(lock["voice_uri"]) if lock and lock["voice_uri"] else ""
+            speed = float(lock["speed"] or 1.0) if lock else 1.0
+            lock_version = int(lock["lock_version"] or 1) if lock else 1
+            expected_fp = line_fingerprint(
+                cid, gender, voice_uri, TTS_MODEL, speed, lang, stripped, lock_version
+            )
+            if sid and line_wav_reusable(conn, sid, lang, expected_fp, dest):
+                reused.append(f"{sid}.{lang}")
+                continue
+            if dest.is_file() and dest.stat().st_size > 100 and not sid:
+                # No segment id to fingerprint against (legacy caller path);
+                # fall back to the old "file already exists" skip.
+                continue
+            audio, duration = synthesize_line(
+                tts,
+                conn,
+                cid,
+                lang,
+                stripped,
+                target_seconds=float(shot.get("duration") or 0) or None,
+            )
+            dest.write_bytes(audio)
+            if sid:
+                record_line_audio(
+                    conn,
+                    sid,
+                    lang,
+                    cid,
+                    expected_fp,
+                    str(dest),
+                    duration or pcm_duration_seconds(audio),
+                    24000,
+                    wav_sha256(audio),
+                )
+                synthesized.append(f"{sid}.{lang}")
+    return {"reused": reused, "synthesized": synthesized}
+
+
 def produce_episode(
     story_id: str,
     root: Path,
@@ -1056,6 +1137,11 @@ def produce_episode(
         "on",
     }
     resolved_gender: dict[str, str] = {}
+    # Hosted pre-GPU TTS (control-plane preprod) may already have written
+    # line wavs + tts_manifest.json under this episode. Bridge them in instead
+    # of re-synthesizing: seed voice locks first (an established lock always
+    # wins), then verify + import line rows after locks are final.
+    hosted_manifest = load_hosted_tts_manifest(root, ep)
     try:
         for cid in speakers:
             char = cast_by_id.get(cid) or {}
@@ -1069,6 +1155,10 @@ def produce_episode(
             gender = resolve_gender(cid, gender=cast_or_db_gender, identity=identity, name=nm)
             resolved_gender[cid] = gender
             conn.execute("UPDATE characters SET gender = ? WHERE id = ?", (gender, cid))
+            if hosted_manifest is not None:
+                hosted_voice = hosted_voice_for(hosted_manifest, cid, shots, spec.langs)
+                if hosted_voice:
+                    seed_hosted_voice_lock(conn, cid, hosted_voice, spec.langs, gender=gender)
             uris = {
                 lang: stock_voice_uri(
                     cid,
@@ -1093,56 +1183,18 @@ def produce_episode(
         mark("tts", "blocked", f"voice:{exc}")
         return {"story_id": story_id, "episode_code": ep, "status": status, "blocked": True, "error": str(exc)}
     try:
-        for shot in shots:
-            line = shot.get("line")
-            if not line:
-                continue
-            sid = str(shot.get("id") or "")
-            cid = str(shot.get("character_id") or KEEPER)
-            gender = resolved_gender.get(cid) or ""
-            for lang in spec.langs:
-                dest = audio_root / f"{shot['id']}.{lang}.wav"
-                text = _shot_line_text(line, lang, primary)
-                stripped = strip_stage_directions(text)
-                if stripped != text:
-                    line[lang] = stripped
-                    shot["line"] = line
-                if not stripped:
-                    continue
-                lock = existing_voice_lock(conn, cid, lang)
-                voice_uri = str(lock["voice_uri"]) if lock and lock["voice_uri"] else ""
-                speed = float(lock["speed"] or 1.0) if lock else 1.0
-                lock_version = int(lock["lock_version"] or 1) if lock else 1
-                expected_fp = line_fingerprint(
-                    cid, gender, voice_uri, TTS_MODEL, speed, lang, stripped, lock_version
-                )
-                if sid and line_wav_reusable(conn, sid, lang, expected_fp, dest):
-                    continue
-                if dest.is_file() and dest.stat().st_size > 100 and not sid:
-                    # No segment id to fingerprint against (legacy caller path);
-                    # fall back to the old "file already exists" skip.
-                    continue
-                audio, duration = synthesize_line(
-                    tts,
-                    conn,
-                    cid,
-                    lang,
-                    stripped,
-                    target_seconds=float(shot.get("duration") or 0) or None,
-                )
-                dest.write_bytes(audio)
-                if sid:
-                    record_line_audio(
-                        conn,
-                        sid,
-                        lang,
-                        cid,
-                        expected_fp,
-                        str(dest),
-                        duration or pcm_duration_seconds(audio),
-                        24000,
-                        wav_sha256(audio),
-                    )
+        if hosted_manifest is not None:
+            import_hosted_line_audio(
+                conn,
+                root,
+                ep,
+                shots,
+                spec.langs,
+                resolved_gender=resolved_gender,
+                manifest=hosted_manifest,
+                primary=primary,
+            )
+        ensure_line_wavs(conn, tts, audio_root, shots, spec.langs, primary, resolved_gender)
     except (SpeechTextError, LineDurationError) as exc:
         mark("tts", "blocked", f"speech:{exc}")
         return {"story_id": story_id, "status": status, "blocked": True, "error": str(exc)}

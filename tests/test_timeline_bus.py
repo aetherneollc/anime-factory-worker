@@ -89,7 +89,8 @@ def test_no_lipsync_only_boolean_hint_exposed():
 
 def test_sfx_events_from_cues_convert_seconds_to_frames():
     cues = [{"cue_key": "door_creak", "bus": "sfx", "onset_s": 2.0, "duration_s": 1.5, "shared": False}]
-    timeline = build_episode_timeline("EP001", [], sfx_cues=cues)
+    shots = [{"id": "s001", "duration": 8.0}]
+    timeline = build_episode_timeline("EP001", shots, sfx_cues=cues)
     assert len(timeline.sfx) == 1
     ev = timeline.sfx[0]
     assert ev.start_frame == seconds_to_frames(2.0)
@@ -119,19 +120,63 @@ def test_measured_line_wav_durations_reads_disk_not_estimate(tmp_path):
 
 
 def test_dialogue_frame_span_aligns_with_shot_boundary_when_clip_fits_speech():
-    """When the picture is fitted exactly to the measured speech (the common
-    case after `fit_clip_durations_to_speech`), the spoken-audio frame span —
-    excluding the fixed lead-in — must land within ±1 frame of the shot's own
-    frame-grid duration."""
+    """With the compose-fitted picture duration (wav + lead-in/tail headroom,
+    what `fit_clip_durations_to_speech` produces), the dialogue event must end
+    at or before the fitted shot boundary — the timeline builder now enforces
+    this fail-closed instead of merely documenting it."""
     shots = [{"id": "s001", "duration": 4.0, "character_id": "ke"}]
     wav_durations = {("s001", "zh"): 4.0}
+    # fit_clip_durations_to_speech would stretch a 4.0s clip to 4.5s for a
+    # 4.0s wav (SPEECH_PAD_TAIL); the 0.35s lead-in then still fits inside.
     timeline = build_episode_timeline(
-        "EP001", shots, wav_durations=wav_durations, langs=("zh",), clip_durations={"s001": 4.0}
+        "EP001", shots, wav_durations=wav_durations, langs=("zh",), clip_durations={"s001": 4.5}
     )
     shot = timeline.shots[0]
     dialogue = timeline.dialogue[0]
+    assert dialogue.end_frame <= shot.end_frame + 1
     lead_in_frames = seconds_to_frames(0.35)
-    assert_frame_aligned(dialogue.end_frame - lead_in_frames, shot.end_frame)
+    assert_frame_aligned(dialogue.end_frame - lead_in_frames - seconds_to_frames(4.0), 0)
+
+
+def test_dialogue_past_fitted_shot_boundary_fails_closed():
+    """A wav that genuinely overruns its fitted picture must raise, not ship a
+    manifest whose 'single source of truth' contradicts the picture."""
+    shots = [{"id": "s001", "duration": 4.0, "character_id": "ke"}]
+    with pytest.raises(FrameAlignmentError):
+        build_episode_timeline(
+            "EP001",
+            shots,
+            wav_durations={("s001", "zh"): 4.0},  # 0.35 lead-in + 4.0s > 4.0s shot
+            langs=("zh",),
+            clip_durations={"s001": 4.0},
+        )
+
+
+def test_sfx_event_past_episode_end_fails_closed():
+    shots = [{"id": "s001", "duration": 3.0}]
+    cues = [{"cue_key": "boom", "bus": "sfx", "onset_s": 2.5, "duration_s": 2.0, "shared": False}]
+    with pytest.raises(FrameAlignmentError):
+        build_episode_timeline("EP001", shots, sfx_cues=cues)
+
+
+def test_sfx_event_negative_onset_fails_closed():
+    shots = [{"id": "s001", "duration": 3.0}]
+    cues = [{"cue_key": "boom", "bus": "sfx", "onset_s": -1.0, "duration_s": 0.5, "shared": False}]
+    with pytest.raises(FrameAlignmentError):
+        build_episode_timeline("EP001", shots, sfx_cues=cues)
+
+
+def test_mouth_motion_is_metadata_only_no_lipsync_fields():
+    """`mouth_motion` stays a boolean hint; validation adds no lip-sync data."""
+    shots = [{"id": "s001", "duration": 8.0, "character_id": "ke"}]
+    timeline = build_episode_timeline("EP001", shots, wav_durations={("s001", "zh"): 4.0}, langs=("zh",))
+    assert timeline.dialogue[0].mouth_motion is True
+    from anime_factory.timeline import timeline_to_manifest
+
+    manifest = timeline_to_manifest(timeline)
+    assert set(manifest["dialogue"][0]) == {
+        "shot_id", "character_id", "lang", "start_frame", "end_frame", "on_camera", "mouth_motion"
+    }
 
 
 def test_build_episode_frame_timeline_uses_fitted_clip_durations(tmp_path):
@@ -197,6 +242,46 @@ def test_safe_gain_stage_only_scales_down():
     assert max(abs(v) for v in scaled) <= 32000
     quiet = [10, -10, 5]
     assert safe_gain_stage(quiet, limit=32000) == quiet
+
+
+def test_mix_add_accumulates_wide_without_intermediate_clamp():
+    """Intermediate sums must survive intact; only the single final
+    safe_gain_stage may reduce level. Clamping inside mix_add baked hard-clip
+    distortion into the mix before the 'safe' gain ever ran."""
+    from anime_factory.audio_bus import mix_add
+
+    wide = mix_add([30000, -30000], [30000, -30000])
+    assert wide == [60000, -60000]  # true sum, not [32767, -32768]
+    limited = safe_gain_stage(wide, limit=32000)
+    assert max(abs(v) for v in limited) <= 32000
+    # Waveform shape preserved: symmetric input stays symmetric after gain.
+    assert limited[0] == -limited[1]
+
+
+def test_shared_bed_hot_overlaps_scale_instead_of_flat_topping():
+    """Three overlapping identical hot clips (sum >> int16 ceiling): the bed
+    must be one uniformly scaled copy of the sum (single final gain), not a
+    flat-topped clip-by-clip accumulation."""
+    import math
+
+    from anime_factory.tts import encode_pcm16_mono
+
+    rate = BUS_SAMPLE_RATE
+    n = rate // 2
+    # 30000-amp sine; at the -6 dB SFX bus gain each clip lands ~15k, so three
+    # overlapped copies sum to ~45k — far past int16 without wide accumulation.
+    loud = encode_pcm16_mono(
+        [int(30000 * math.sin(2 * math.pi * 200.0 * i / rate)) for i in range(n)], rate
+    )
+    single = build_shared_bed(0.6, sfx_clips=[(0.0, loud)])
+    triple = build_shared_bed(0.6, sfx_clips=[(0.0, loud), (0.0, loud), (0.0, loud)])
+    _, s1 = decode_pcm16_mono(single)
+    _, s3 = decode_pcm16_mono(triple)
+    assert max(abs(v) for v in s3) <= 32000
+    ratios = [s3[i] / s1[i] for i in range(len(s1)) if abs(s1[i]) > 4000]
+    assert ratios
+    # One uniform gain factor across loud samples — no per-sample flattening.
+    assert max(ratios) - min(ratios) < 0.05
 
 
 def test_shared_sfx_stem_reused_across_language_masters(tmp_path):
