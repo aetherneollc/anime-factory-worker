@@ -37,8 +37,18 @@ from gpu_worker.vast_client import VastClient, VastSafetyError
 CANARY_MAX_DPH_USD = 1.0
 CANARY_EPISODE_COUNT = 1
 CANARY_GPU_MODEL_POLICY = "5090"
-CANARY_GPU_PROFILE = "h3-comfy-cu128-sm120"
+CANARY_BACKENDS = ("h3", "longlive")
+CANARY_H3_PROFILE = "h3-comfy-cu128-sm120"
+CANARY_LONGLIVE_PROFILE = "longlive-nvfp4-sm120"
+CANARY_GPU_PROFILE = CANARY_H3_PROFILE
+CANARY_PROFILE_BY_BACKEND = {
+    "h3": CANARY_H3_PROFILE,
+    "longlive": CANARY_LONGLIVE_PROFILE,
+}
+CANARY_PUBLIC_H3_IMAGE = "ghcr.io/aetherneollc/anime-factory-gpu"
+CANARY_PUBLIC_LONGLIVE_IMAGE = "ghcr.io/aetherneollc/anime-factory-gpu-longlive"
 DEFAULT_STORY_ID = "story-canary-7516b66"
+DEFAULT_CANARY_SHOT_ID = "s001"
 DEFAULT_EPISODE = "EP001"
 LIVE_CONFIRM_PHRASE = "I-UNDERSTAND-GPU-CANARY-SPEND"
 
@@ -81,10 +91,18 @@ ISOLATED_ENV_FORBIDDEN_KEYS = frozenset(
 DELETE_MAX_RETRIES = 5
 DELETE_RETRY_BACKOFF_S = 2.0
 
-IMAGE_REF_RE = re.compile(
-    r"^docker\.io/aetherneo/anime-factory-gpu@sha256:([0-9a-f]{64})$",
-    re.IGNORECASE,
-)
+_DIGEST_SUFFIX_RE = r"@sha256:([0-9a-f]{64})$"
+CANARY_IMAGE_REPOS: dict[str, tuple[str, ...]] = {
+    "h3": (CANARY_PUBLIC_H3_IMAGE, AGENT_IMAGE),
+    "longlive": (CANARY_PUBLIC_LONGLIVE_IMAGE,),
+}
+CANARY_IMAGE_REF_RES: dict[str, tuple[re.Pattern[str], ...]] = {
+    backend: tuple(
+        re.compile(rf"^{re.escape(repo)}{_DIGEST_SUFFIX_RE}$", re.IGNORECASE)
+        for repo in repos
+    )
+    for backend, repos in CANARY_IMAGE_REPOS.items()
+}
 
 SECRET_ENV_KEYS = frozenset(
     {
@@ -116,21 +134,52 @@ class CanaryImageError(CanaryConfigError):
     pass
 
 
-def validate_lease_image_ref(image_ref: str) -> tuple[str, str]:
-    """Require ``docker.io/aetherneo/anime-factory-gpu@sha256:<64hex>``. Reject tags."""
+def normalize_canary_backend(backend: str | None) -> str:
+    raw = str(backend or "h3").strip().lower()
+    if raw not in CANARY_BACKENDS:
+        raise CanaryConfigError(f"backend must be one of {CANARY_BACKENDS}; got {backend!r}")
+    return raw
+
+
+def _image_repo_for_ref(image_ref: str) -> str | None:
+    raw = (image_ref or "").strip()
+    at = raw.rfind("@sha256:")
+    if at < 0:
+        return None
+    return raw[:at]
+
+
+def validate_lease_image_ref(image_ref: str, backend: str = "h3") -> tuple[str, str]:
+    """Require digest-pinned image for the selected backend. Reject tags and mismatches."""
+    wanted = normalize_canary_backend(backend)
     raw = (image_ref or "").strip()
     if not raw:
         raise CanaryImageError("image ref required (digest pin, no tag)")
     if ":" in raw.rsplit("/", 1)[-1] and "@sha256:" not in raw.lower():
         raise CanaryImageError(f"refuses floating tag image: {raw!r}")
-    match = IMAGE_REF_RE.match(raw)
-    if not match:
+    for other_backend, patterns in CANARY_IMAGE_REF_RES.items():
+        if other_backend == wanted:
+            continue
+        for pattern in patterns:
+            if pattern.match(raw):
+                raise CanaryImageError(
+                    f"image/backend mismatch: {raw!r} is for {other_backend!r}, not {wanted!r}"
+                )
+    matched_repo: str | None = None
+    hexpart: str | None = None
+    for pattern in CANARY_IMAGE_REF_RES[wanted]:
+        match = pattern.match(raw)
+        if match:
+            matched_repo = _image_repo_for_ref(raw)
+            hexpart = match.group(1).lower()
+            break
+    if not hexpart or not matched_repo:
+        allowed = ", ".join(CANARY_IMAGE_REPOS[wanted])
         raise CanaryImageError(
-            f"image must be {AGENT_IMAGE}@sha256:<64 hex>; got {raw!r}"
+            f"image must be one of {allowed}@sha256:<64 hex> for backend {wanted!r}; got {raw!r}"
         )
-    hexpart = match.group(1).lower()
     digest = f"sha256:{hexpart}"
-    return f"{AGENT_IMAGE}@sha256:{hexpart}", digest
+    return f"{matched_repo}@sha256:{hexpart}", digest
 
 
 def clamp_canary_max_dph(requested: float | None = None) -> float:
@@ -200,18 +249,21 @@ def redact_for_log(obj: Any) -> Any:
     return obj
 
 
-def build_canary_env(*, image_digest: str, story_id: str) -> dict[str, str]:
+def build_canary_env(*, image_digest: str, story_id: str, backend: str = "h3") -> dict[str, str]:
     """Isolated canary env: R2 + AF_ONCE only — never production control-plane keys."""
+    video_backend = normalize_canary_backend(backend)
+    profile = CANARY_PROFILE_BY_BACKEND[video_backend]
     env: dict[str, str] = {
         "AF_STORY_ID": story_id,
         "AF_EPISODE": DEFAULT_EPISODE,
         "AF_ONCE": "1",
-        "AF_VIDEO_BACKEND": "h3",
+        "AF_VIDEO_BACKEND": video_backend,
+        "AF_IMAGE_CAPABILITY": video_backend,
         "VAST_ALLOW_REPLACE": "0",
         "VAST_DRY_RUN": "0",
         "AF_EXPECTED_IMAGE_DIGEST": image_digest,
         "AF_REPORTED_IMAGE_DIGEST": image_digest,
-        "AF_GPU_PROFILE": CANARY_GPU_PROFILE,
+        "AF_GPU_PROFILE": profile,
         "AF_START_COMFY": "1",
         "ANIME_FACTORY_GPU_STILLS": "1",
         "COMFYUI_BASE_URL": "http://127.0.0.1:8199",
@@ -220,6 +272,8 @@ def build_canary_env(*, image_digest: str, story_id: str) -> dict[str, str]:
         "R2_ACCESS_KEY_ID": os.environ.get("R2_ACCESS_KEY_ID") or "",
         "R2_SECRET_ACCESS_KEY": os.environ.get("R2_SECRET_ACCESS_KEY") or "",
     }
+    if video_backend == "longlive":
+        env["AF_VIDEO_BACKEND_LOCKED"] = "longlive"
     hf = (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or "").strip()
     if hf:
         env["HF_TOKEN"] = hf
@@ -248,9 +302,13 @@ def inject_lease_watchdog_env(
     return merged
 
 
-def r2_canary_input_keys(story_id: str, episode: str = DEFAULT_EPISODE) -> tuple[str, ...]:
-    """Seven R2 text/plan inputs required before a live canary lease."""
-    return (
+def r2_canary_input_keys(
+    story_id: str,
+    episode: str = DEFAULT_EPISODE,
+    backend: str = "h3",
+) -> tuple[str, ...]:
+    """R2 text/plan inputs required before a live canary lease."""
+    keys = [
         join_story(story_id, "bible/period.md"),
         join_story(story_id, "bible/world.md"),
         join_story(story_id, "canon/wiki/characters/hero.md"),
@@ -258,7 +316,10 @@ def r2_canary_input_keys(story_id: str, episode: str = DEFAULT_EPISODE) -> tuple
         join_story(story_id, f"episodes/{episode}/audio/tts_manifest.json"),
         join_story(story_id, f"episodes/{episode}/board.json"),
         join_story(story_id, f"episodes/{episode}/script.json"),
-    )
+    ]
+    if normalize_canary_backend(backend) == "longlive":
+        keys.append(join_story(story_id, "factory.json"))
+    return tuple(keys)
 
 
 def r2_canary_output_keys(story_id: str, episode: str = DEFAULT_EPISODE) -> tuple[str, ...]:
@@ -278,6 +339,7 @@ def r2_canary_output_keys(story_id: str, episode: str = DEFAULT_EPISODE) -> tupl
 
 
 GENERATION_MP4_RE = re.compile(r"generation-\d+\.mp4$")
+LEGACY_SHOT_MP4_RE = re.compile(r"v\d+\.mp4$")
 
 
 def _r2_key_nonempty(key: str) -> bool:
@@ -296,8 +358,19 @@ def r2_generation_shot_prefix(story_id: str, shot_id: str = "s001") -> str:
     return join_story(story_id, f"shots/{shot_id}/")
 
 
-def _r2_has_generation_mp4(story_id: str, episode: str = DEFAULT_EPISODE, shot_id: str = "s001") -> bool:
-    del episode  # H3 generation keys are story-scoped, not under episodes/
+def _r2_shot_video_matches(key: str, backend: str) -> bool:
+    if normalize_canary_backend(backend) == "longlive":
+        return bool(GENERATION_MP4_RE.search(key) or LEGACY_SHOT_MP4_RE.search(key))
+    return bool(GENERATION_MP4_RE.search(key))
+
+
+def _r2_has_shot_video_mp4(
+    story_id: str,
+    episode: str = DEFAULT_EPISODE,
+    shot_id: str = DEFAULT_CANARY_SHOT_ID,
+    backend: str = "h3",
+) -> bool:
+    del episode  # generation keys are story-scoped, not under episodes/
     try:
         from anime_factory.r2_client import list_prefix
     except ImportError:
@@ -305,17 +378,21 @@ def _r2_has_generation_mp4(story_id: str, episode: str = DEFAULT_EPISODE, shot_i
     prefix = r2_generation_shot_prefix(story_id, shot_id)
     for item in list_prefix(prefix, max_keys=50):
         key = str(item.get("key") or "")
-        if GENERATION_MP4_RE.search(key) and int(item.get("size") or 0) > 0:
+        if _r2_shot_video_matches(key, backend) and int(item.get("size") or 0) > 0:
             return True
     return False
 
 
-def r2_canary_complete(story_id: str, episode: str = DEFAULT_EPISODE) -> bool:
+def r2_canary_complete(
+    story_id: str,
+    episode: str = DEFAULT_EPISODE,
+    backend: str = "h3",
+) -> bool:
     if not all(_r2_key_nonempty(key) for key in r2_canary_output_keys(story_id, episode)):
         return False
-    if not _r2_has_generation_mp4(story_id, episode):
+    if not _r2_has_shot_video_mp4(story_id, episode, backend=backend):
         return False
-    return all(_r2_key_nonempty(key) for key in r2_canary_input_keys(story_id, episode))
+    return all(_r2_key_nonempty(key) for key in r2_canary_input_keys(story_id, episode, backend))
 
 
 def _r2_list_keys(prefix: str, max_keys: int = 200) -> list[str]:
@@ -343,15 +420,22 @@ def _r2_probe_boto3() -> str | None:
     return None
 
 
-def r2_output_artifacts_present(story_id: str, episode: str = DEFAULT_EPISODE) -> list[str]:
+def r2_output_artifacts_present(
+    story_id: str,
+    episode: str = DEFAULT_EPISODE,
+    backend: str = "h3",
+) -> list[str]:
     """Return generated output keys/prefixes that forbid a fresh canary lease."""
     found: list[str] = []
     found.extend(_r2_list_keys(join_story(story_id, "assets/"), max_keys=500))
     sqlite_key = join_story(story_id, "story.sqlite")
     if _r2_key_nonempty(sqlite_key):
         found.append(sqlite_key)
-    if _r2_has_generation_mp4(story_id, episode):
-        found.append(r2_generation_shot_prefix(story_id, "s001") + "generation-*.mp4")
+    if _r2_has_shot_video_mp4(story_id, episode, backend=backend):
+        if normalize_canary_backend(backend) == "longlive":
+            found.append(r2_generation_shot_prefix(story_id, DEFAULT_CANARY_SHOT_ID) + "{generation-*,v*.mp4}")
+        else:
+            found.append(r2_generation_shot_prefix(story_id, DEFAULT_CANARY_SHOT_ID) + "generation-*.mp4")
     keyframes_prefix = join_story(story_id, f"episodes/{episode}/keyframes/s001/")
     found.extend(_r2_list_keys(keyframes_prefix, max_keys=50))
     final_prefix = join_story(story_id, f"episodes/{episode}/final/")
@@ -359,7 +443,11 @@ def r2_output_artifacts_present(story_id: str, episode: str = DEFAULT_EPISODE) -
     return found
 
 
-def r2_live_preflight(story_id: str, episode: str = DEFAULT_EPISODE) -> dict[str, Any]:
+def r2_live_preflight(
+    story_id: str,
+    episode: str = DEFAULT_EPISODE,
+    backend: str = "h3",
+) -> dict[str, Any]:
     endpoint = (os.environ.get("R2_ENDPOINT") or "").strip()
     access_key = (os.environ.get("R2_ACCESS_KEY_ID") or "").strip()
     secret_key = (os.environ.get("R2_SECRET_ACCESS_KEY") or "").strip()
@@ -380,13 +468,19 @@ def r2_live_preflight(story_id: str, episode: str = DEFAULT_EPISODE) -> dict[str
     probe_err = _r2_probe_boto3()
     if probe_err:
         return {"ok": False, "reason": probe_err}
-    missing_inputs = [key for key in r2_canary_input_keys(story_id, episode) if not _r2_key_nonempty(key)]
+    missing_inputs = [
+        key for key in r2_canary_input_keys(story_id, episode, backend) if not _r2_key_nonempty(key)
+    ]
     if missing_inputs:
         return {"ok": False, "reason": "r2_inputs_missing", "missing": missing_inputs}
-    outputs = r2_output_artifacts_present(story_id, episode)
+    outputs = r2_output_artifacts_present(story_id, episode, backend)
     if outputs:
         return {"ok": False, "reason": "r2_outputs_present", "artifacts": outputs}
-    return {"ok": True, "reason": "ready", "input_keys": list(r2_canary_input_keys(story_id, episode))}
+    return {
+        "ok": True,
+        "reason": "ready",
+        "input_keys": list(r2_canary_input_keys(story_id, episode, backend)),
+    }
 
 
 def make_canary_lease_label() -> str:
@@ -530,6 +624,7 @@ class CanaryConfig:
     confirm: str = ""
     api_key: str = ""
     image_ref: str = ""
+    backend: str = "h3"
     story_id: str = DEFAULT_STORY_ID
     max_wall_s: float = DEFAULT_MAX_WALL_S
     max_spend_usd: float = DEFAULT_MAX_SPEND_USD
@@ -545,7 +640,7 @@ class CanaryWatchdog:
     client: VastClient | None = None
     sleep: Callable[[float], None] = time.sleep
     clock: Callable[[], float] = time.monotonic
-    r2_checker: Callable[[str, str], bool] = r2_canary_complete
+    r2_checker: Callable[[str, str], bool] | None = None
     progress_stream: TextIO | None = None
     _allowlist: set[str] = field(default_factory=set, init=False)
     _instance_id: str | None = field(default=None, init=False)
@@ -563,6 +658,9 @@ class CanaryWatchdog:
     _pull_msg_changed_at: float | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
+        if self.r2_checker is None:
+            backend = normalize_canary_backend(self.config.backend)
+            self.r2_checker = lambda sid, ep, bk=backend: r2_canary_complete(sid, ep, bk)
         if self.client is None:
             key = self.config.api_key or os.environ.get("VAST_API_KEY") or ""
             # Real POST /bundles/ search even in CLI dry-run; run() never PUTs unless --live.
@@ -582,7 +680,8 @@ class CanaryWatchdog:
                 raise CanaryConfigError("live mode forbids --no-r2-completion")
             if os.environ.get("VAST_ALLOW_REPLACE", "0") not in ("0", "false", "False"):
                 raise CanaryConfigError("VAST_ALLOW_REPLACE must be 0 for canary")
-        image_ref, digest = validate_lease_image_ref(self.config.image_ref)
+        normalize_canary_backend(self.config.backend)
+        image_ref, digest = validate_lease_image_ref(self.config.image_ref, self.config.backend)
         self.config.max_dph = clamp_canary_max_dph(self.config.max_dph)
         self.config.max_spend_usd = clamp_canary_max_spend(self.config.max_spend_usd)
         self.config.max_wall_s = clamp_canary_max_wall_s(self.config.max_wall_s)
@@ -992,7 +1091,11 @@ class CanaryWatchdog:
         outcome: dict[str, Any] = {"live": self.config.live, "dry_run": not self.config.live}
         try:
             image_ref, digest = self.validate_config()
-            lease_env = build_canary_env(image_digest=digest, story_id=self.config.story_id)
+            lease_env = build_canary_env(
+                image_digest=digest,
+                story_id=self.config.story_id,
+                backend=self.config.backend,
+            )
             offers = self._offer_list()
             chosen = self.select_offer(offers)
             if not chosen:
@@ -1029,7 +1132,7 @@ class CanaryWatchdog:
                 max_wall_s=self.config.max_wall_s,
             )
             outcome["lease_env"] = redact_mapping(lease_env)
-            preflight = r2_live_preflight(self.config.story_id, DEFAULT_EPISODE)
+            preflight = r2_live_preflight(self.config.story_id, DEFAULT_EPISODE, self.config.backend)
             outcome["preflight"] = {
                 "ok": preflight.get("ok"),
                 "reason": preflight.get("reason"),
@@ -1188,7 +1291,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="GPU canary watchdog (default dry-run)")
     p.add_argument("--live", action="store_true", help="Actually PUT /asks/ (requires confirm + API key)")
     p.add_argument("--confirm", default="", help=f"Required with --live: {LIVE_CONFIRM_PHRASE!r}")
-    p.add_argument("--image", required=True, help=f"{AGENT_IMAGE}@sha256:<64hex>")
+    p.add_argument(
+        "--image",
+        required=True,
+        help=(
+            f"Digest pin: {CANARY_PUBLIC_H3_IMAGE}@sha256:<64hex>, "
+            f"{CANARY_PUBLIC_LONGLIVE_IMAGE}@sha256:<64hex>, "
+            f"or legacy {AGENT_IMAGE}@sha256:<64hex> (h3 only)"
+        ),
+    )
+    p.add_argument(
+        "--backend",
+        choices=list(CANARY_BACKENDS),
+        default="h3",
+        help="Video line: h3 (MiniMax) or longlive (NVFP4)",
+    )
     p.add_argument("--story-id", default=DEFAULT_STORY_ID)
     p.add_argument(
         "--max-wall-minutes",
@@ -1217,6 +1334,7 @@ def main(argv: list[str] | None = None) -> int:
         confirm=args.confirm or "",
         api_key=os.environ.get("VAST_API_KEY") or "",
         image_ref=args.image,
+        backend=args.backend,
         story_id=args.story_id,
         max_wall_s=clamp_canary_max_wall_s(max(60.0, float(args.max_wall_minutes) * 60.0)),
         max_spend_usd=clamp_canary_max_spend(float(args.max_spend_usd)),

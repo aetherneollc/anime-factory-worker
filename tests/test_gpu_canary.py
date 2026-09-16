@@ -19,8 +19,11 @@ import gpu_canary as gc
 from gpu_worker.vast_client import VastClient, VastSafetyError
 
 DIGEST = "sha256:" + ("c" * 64)
+HEX64 = "c" * 64
 IMAGE_REF = f"docker.io/aetherneo/anime-factory-gpu@{DIGEST.split(':', 1)[1]}"
-IMAGE_AT = f"docker.io/aetherneo/anime-factory-gpu@sha256:{'c' * 64}"
+IMAGE_AT = f"docker.io/aetherneo/anime-factory-gpu@sha256:{HEX64}"
+GHCR_H3_AT = f"ghcr.io/aetherneollc/anime-factory-gpu@sha256:{HEX64}"
+GHCR_LONGLIVE_AT = f"ghcr.io/aetherneollc/anime-factory-gpu-longlive@sha256:{HEX64}"
 
 
 def _eligible(**partial):
@@ -60,6 +63,32 @@ def test_validate_image_accepts_digest_pin():
     ref, digest = gc.validate_lease_image_ref(IMAGE_AT)
     assert digest == DIGEST
     assert "@sha256:" in ref
+
+
+def test_validate_image_accepts_ghcr_h3_digest():
+    ref, digest = gc.validate_lease_image_ref(GHCR_H3_AT, backend="h3")
+    assert digest == DIGEST
+    assert ref == GHCR_H3_AT
+
+
+def test_validate_image_accepts_ghcr_longlive_digest():
+    ref, digest = gc.validate_lease_image_ref(GHCR_LONGLIVE_AT, backend="longlive")
+    assert digest == DIGEST
+    assert ref == GHCR_LONGLIVE_AT
+
+
+def test_validate_image_rejects_backend_mismatch():
+    with pytest.raises(gc.CanaryImageError, match="mismatch"):
+        gc.validate_lease_image_ref(GHCR_LONGLIVE_AT, backend="h3")
+    with pytest.raises(gc.CanaryImageError, match="mismatch"):
+        gc.validate_lease_image_ref(GHCR_H3_AT, backend="longlive")
+    with pytest.raises(gc.CanaryImageError, match="mismatch"):
+        gc.validate_lease_image_ref(IMAGE_AT, backend="longlive")
+
+
+def test_validate_image_rejects_longlive_tag():
+    with pytest.raises(gc.CanaryImageError, match="tag"):
+        gc.validate_lease_image_ref("ghcr.io/aetherneollc/anime-factory-gpu-longlive:main", backend="longlive")
 
 
 def test_clamp_max_dph_never_above_one(monkeypatch):
@@ -215,9 +244,20 @@ def test_canary_env_sets_required_keys():
     assert env["AF_EPISODE"] == "EP001"
     assert env["AF_ONCE"] == "1"
     assert env["AF_VIDEO_BACKEND"] == "h3"
+    assert env["AF_IMAGE_CAPABILITY"] == "h3"
+    assert env["AF_GPU_PROFILE"] == gc.CANARY_H3_PROFILE
+    assert "AF_VIDEO_BACKEND_LOCKED" not in env
     assert env["VAST_ALLOW_REPLACE"] == "0"
     assert env["AF_EXPECTED_IMAGE_DIGEST"] == DIGEST
     assert env["AF_REPORTED_IMAGE_DIGEST"] == DIGEST
+
+
+def test_canary_env_longlive_sets_profile_and_lock():
+    env = gc.build_canary_env(image_digest=DIGEST, story_id=gc.DEFAULT_STORY_ID, backend="longlive")
+    assert env["AF_VIDEO_BACKEND"] == "longlive"
+    assert env["AF_VIDEO_BACKEND_LOCKED"] == "longlive"
+    assert env["AF_IMAGE_CAPABILITY"] == "longlive"
+    assert env["AF_GPU_PROFILE"] == gc.CANARY_LONGLIVE_PROFILE
 
 
 def test_canary_env_omits_production_keys_even_when_parent_set(monkeypatch):
@@ -407,12 +447,17 @@ def test_main_calls_load_dotenv(monkeypatch, capsys):
     capsys.readouterr()
 
 
-def _input_inventory(sid: str, episode: str = "EP001") -> dict[str, int]:
-    return {key: 100 for key in gc.r2_canary_input_keys(sid, episode)}
+def _input_inventory(sid: str, episode: str = "EP001", backend: str = "h3") -> dict[str, int]:
+    return {key: 100 for key in gc.r2_canary_input_keys(sid, episode, backend)}
 
 
-def _completion_inventory(sid: str, episode: str, gen_key: str) -> dict[str, int]:
-    inventory = _input_inventory(sid, episode)
+def _completion_inventory(
+    sid: str,
+    episode: str,
+    gen_key: str,
+    backend: str = "h3",
+) -> dict[str, int]:
+    inventory = _input_inventory(sid, episode, backend)
     inventory.update({key: 100 for key in gc.r2_canary_output_keys(sid, episode)})
     inventory[gen_key] = 5000
     return inventory
@@ -431,6 +476,61 @@ def test_r2_canary_input_keys_exact_set():
     }
     assert set(gc.r2_canary_input_keys(sid, "EP001")) == expected
     assert len(gc.r2_canary_input_keys(sid, "EP001")) == 7
+
+
+def test_r2_canary_input_keys_longlive_includes_factory_json():
+    sid = gc.DEFAULT_STORY_ID
+    keys = gc.r2_canary_input_keys(sid, "EP001", backend="longlive")
+    assert f"stories/{sid}/factory.json" in keys
+    assert len(keys) == 8
+
+
+def test_r2_canary_complete_longlive_accepts_legacy_v_mp4(monkeypatch):
+    sid = gc.DEFAULT_STORY_ID
+    episode = "EP001"
+    gen_key = f"stories/{sid}/shots/s001/v001.mp4"
+    inventory = _completion_inventory(sid, episode, gen_key, backend="longlive")
+    monkeypatch.setattr(
+        "anime_factory.r2_client.list_prefix",
+        _mock_r2_inventory(inventory),
+    )
+    assert gc.r2_canary_complete(sid, episode, backend="longlive") is True
+
+
+def test_r2_canary_complete_longlive_rejects_h3_only_generation_without_factory(monkeypatch):
+    sid = gc.DEFAULT_STORY_ID
+    episode = "EP001"
+    gen_key = f"stories/{sid}/shots/s001/generation-001.mp4"
+    inventory = _completion_inventory(sid, episode, gen_key, backend="longlive")
+    inventory.pop(f"stories/{sid}/factory.json", None)
+    monkeypatch.setattr(
+        "anime_factory.r2_client.list_prefix",
+        _mock_r2_inventory(inventory),
+    )
+    assert gc.r2_canary_complete(sid, episode, backend="longlive") is False
+
+
+def test_dry_run_longlive_backend_never_puts(monkeypatch):
+    puts: list[str] = []
+
+    def opener(req):
+        if req.get_method() == "PUT" and "/asks/" in req.full_url:
+            puts.append(req.full_url)
+        if req.get_method() == "POST" and "/bundles/" in req.full_url:
+            return {"offers": [_eligible()]}
+        return {}
+
+    client = VastClient("fake", opener=opener, dry_run=False)
+    wd = gc.CanaryWatchdog(
+        _cfg(image_ref=GHCR_LONGLIVE_AT, backend="longlive"),
+        client=client,
+    )
+    out = wd.run()
+    assert out["action"] == "dry_run_would_lease"
+    assert out["put_asks"] is False
+    assert puts == []
+    assert out["lease_env"]["AF_VIDEO_BACKEND"] == "longlive"
+    assert out["lease_env"]["AF_GPU_PROFILE"] == gc.CANARY_LONGLIVE_PROFILE
 
 
 def test_r2_canary_output_keys_exact_set():
@@ -505,7 +605,10 @@ def test_live_preflight_blocks_put(monkeypatch):
     monkeypatch.setattr(
         gc,
         "r2_live_preflight",
-        lambda story_id, episode=gc.DEFAULT_EPISODE: {"ok": False, "reason": "r2_outputs_present"},
+        lambda story_id, episode=gc.DEFAULT_EPISODE, backend="h3": {
+            "ok": False,
+            "reason": "r2_outputs_present",
+        },
     )
     client = VastClient("fake", opener=opener, dry_run=False)
     wd = gc.CanaryWatchdog(
