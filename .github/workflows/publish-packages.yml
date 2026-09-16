@@ -1,0 +1,47 @@
+name: Publish GHCR packages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/publish-packages.yml"
+  workflow_run:
+    workflows: ["Docker image"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  public:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - anime-factory-worker-h3
+          - anime-factory-worker-longlive
+    steps:
+      - name: Set package visibility to public
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PACKAGE: ${{ matrix.package }}
+        run: |
+          endpoint="/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/${PACKAGE}"
+          if gh api --method PATCH "${endpoint}" -f visibility=public; then
+            visibility="$(gh api "${endpoint}" --jq .visibility)"
+            test "${visibility}" = "public"
+            exit 0
+          fi
+
+          # The initial push can happen before the LongLive package exists.
+          # A successful Docker workflow_run retries both packages strictly.
+          if [[ "${EVENT_NAME}" = "push" && "${PACKAGE}" = "anime-factory-worker-longlive" ]]; then
+            echo "LongLive package is not published yet; workflow_run will retry it."
+            exit 0
+          fi
+          exit 1
