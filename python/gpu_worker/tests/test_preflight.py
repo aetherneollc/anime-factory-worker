@@ -67,12 +67,53 @@ def test_capability_profiles_default_5090_and_longlive():
     assert h3.supported_sm == ("sm_120",)
     assert h3.min_disk_gb == 200
     assert h3.require_flash_attn is False
+    assert h3.expected_torch == "2.8.0+cu128"
+    assert h3.expected_torchvision == "0.23.0+cu128"
+    assert h3.expected_torchaudio == "2.8.0+cu128"
     ll = resolve_capability_profile("longlive-nvfp4-sm120")
     assert ll.require_flash_attn is True
     assert ll.require_fouroversix is True
+    assert ll.expected_torch == "2.10.0+cu128"
+    assert ll.expected_torchvision == "0.25.0+cu128"
+    assert ll.expected_torchaudio == "2.10.0+cu128"
+    assert ll.expected_flash_attn == "2.8.3"
     assert MIN_DISK_GB == 200
     assert "h3-comfy-cu128-sm89" not in CAPABILITY_PROFILES
     assert "4090_48" not in CAPABILITY_PROFILES
+
+
+def test_validate_profile_longlive_stack_versions(monkeypatch):
+    monkeypatch.setattr("gpu_worker.preflight._fouroversix_ok", lambda: True)
+    stack = {
+        "torch": "2.10.0+cu128",
+        "torchvision": "0.25.0+cu128",
+        "torchaudio": "2.10.0+cu128",
+        "flash_attn": "2.8.3",
+    }
+    validate_profile("longlive-nvfp4-sm120", _host(), stack)
+
+
+def test_validate_profile_longlive_rejects_stale_torch():
+    with pytest.raises(PreflightFailure) as exc:
+        validate_profile(
+            "longlive-nvfp4-sm120",
+            _host(),
+            _stack(flash_attn="2.8.3"),
+        )
+    assert exc.value.code == "torch_version"
+
+
+def test_validate_profile_longlive_rejects_wrong_flash_attn(monkeypatch):
+    monkeypatch.setattr("gpu_worker.preflight._fouroversix_ok", lambda: True)
+    stack = {
+        "torch": "2.10.0+cu128",
+        "torchvision": "0.25.0+cu128",
+        "torchaudio": "2.10.0+cu128",
+        "flash_attn": "2.7.4.post1",
+    }
+    with pytest.raises(PreflightFailure) as exc:
+        validate_profile("longlive-nvfp4-sm120", _host(), stack)
+    assert exc.value.code == "flash_attn_missing"
 
 
 def test_select_profile_id_respects_video_backend(monkeypatch):
@@ -423,6 +464,19 @@ def test_ensure_torchaudio_accepts_baked_28(monkeypatch):
     fake = types.ModuleType("torchaudio")
     fake.__version__ = "2.8.0+cu128"
     monkeypatch.setitem(sys.modules, "torchaudio", fake)
+    stack_mod.ensure_torchaudio()
+
+
+def test_ensure_torchaudio_accepts_longlive_210(monkeypatch):
+    import sys
+    import types
+
+    from gpu_worker import stack as stack_mod
+
+    fake = types.ModuleType("torchaudio")
+    fake.__version__ = "2.10.0+cu128"
+    monkeypatch.setitem(sys.modules, "torchaudio", fake)
+    monkeypatch.setenv("AF_GPU_PROFILE", "longlive-nvfp4-sm120")
     stack_mod.ensure_torchaudio()
 
 

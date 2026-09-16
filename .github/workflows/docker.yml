@@ -59,6 +59,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      actions: write
     steps:
       - uses: actions/checkout@v4
 
@@ -116,5 +117,5 @@ jobs:
           platforms: ${{ join(matrix.target.platforms, ',') }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
-          cache-from: type=gha,scope=anime-factory-gpu-${{ matrix.target.id }}
-          cache-to: type=gha,mode=max,scope=anime-factory-gpu-${{ matrix.target.id }},ignore-error=true
+          cache-from: type=gha,scope=anime-factory-gpu-${{ matrix.target.id }},ignore-error=true
+          cache-to: type=gha,mode=min,scope=anime-factory-gpu-${{ matrix.target.id }},ignore-error=true

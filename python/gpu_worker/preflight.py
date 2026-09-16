@@ -475,10 +475,11 @@ def _version_matches(actual: str | None, expected: str) -> bool:
     return actual.startswith(expected.split("+")[0])
 
 
-def _flash_attn_ok(version: str | None) -> bool:
+def _flash_attn_ok(version: str | None, expected_prefix: str | None = None) -> bool:
     if not version:
         return False
-    return version.startswith(EXPECTED_FLASH_ATTN_PREFIX)
+    prefix = expected_prefix or EXPECTED_FLASH_ATTN_PREFIX
+    return version.startswith(prefix)
 
 
 def _fouroversix_ok() -> bool:
@@ -591,13 +592,15 @@ def validate_profile(profile_id: str, host: dict[str, Any], stack: dict[str, Any
                     f"expected {key} {expected}, got {stack.get(key)}",
                     {"profile_id": profile_id, key: stack.get(key)},
                 )
-    if profile.require_flash_attn and not _flash_attn_ok(stack.get("flash_attn")):
-        raise PreflightFailure(
-            "capability_mismatch",
-            "flash_attn_missing",
-            f"flash-attn {EXPECTED_FLASH_ATTN_PREFIX}+ required, got {stack.get('flash_attn')}",
-            {"profile_id": profile_id},
-        )
+    if profile.require_flash_attn:
+        flash_expected = profile.expected_flash_attn or EXPECTED_FLASH_ATTN_PREFIX
+        if not _flash_attn_ok(stack.get("flash_attn"), flash_expected):
+            raise PreflightFailure(
+                "capability_mismatch",
+                "flash_attn_missing",
+                f"flash-attn {flash_expected}+ required, got {stack.get('flash_attn')}",
+                {"profile_id": profile_id, "expected_flash_attn": flash_expected},
+            )
     if profile.require_fouroversix and not _fouroversix_ok():
         raise PreflightFailure(
             "capability_mismatch",

@@ -16,6 +16,8 @@ import os
 import re
 from dataclasses import dataclass
 
+from gpu_worker.stack_contracts import H3_STACK, LONGLIVE_STACK
+
 
 # Content-digest pin fields. Leave unset until a real sha256 is known — never invent one,
 # and never treat floating tags (:main, :latest, :sha-<git>) as a digest.
@@ -279,6 +281,7 @@ class CapabilityProfile:
     expected_torch: str | None = None
     expected_torchvision: str | None = None
     expected_torchaudio: str | None = None
+    expected_flash_attn: str | None = None
     note: str = ""
 
 
@@ -289,6 +292,9 @@ CAPABILITY_PROFILES: dict[str, CapabilityProfile] = {
         require_torch=True,
         require_flash_attn=False,
         require_fouroversix=False,
+        expected_torch=H3_STACK.torch,
+        expected_torchvision=H3_STACK.torchvision,
+        expected_torchaudio=H3_STACK.torchaudio,
         note="Default RTX 5090 Comfy+H3+SDXL stills (CUDA 12.8, sm_120).",
     ),
     "longlive-nvfp4-sm120": CapabilityProfile(
@@ -297,9 +303,10 @@ CAPABILITY_PROFILES: dict[str, CapabilityProfile] = {
         require_torch=True,
         require_flash_attn=True,
         require_fouroversix=True,
-        expected_torch="2.7.0+cu128",
-        expected_torchvision="0.22.0+cu128",
-        expected_torchaudio="2.7.0+cu128",
+        expected_torch=LONGLIVE_STACK.torch,
+        expected_torchvision=LONGLIVE_STACK.torchvision,
+        expected_torchaudio=LONGLIVE_STACK.torchaudio,
+        expected_flash_attn=LONGLIVE_STACK.flash_attn,
         note="LongLive NVFP4 on Blackwell sm_120; wheels must be baked.",
     ),
     # 4090 sm_89 is intentionally absent until a validated sm_89 image exists.

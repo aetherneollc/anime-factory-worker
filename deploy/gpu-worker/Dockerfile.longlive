@@ -94,11 +94,23 @@ RUN git init /opt/LongLive \
     && grep -q "class ImagePromptDataset" /opt/LongLive/utils/dataset.py
 
 WORKDIR /opt/LongLive/fouroversix
+# FORCE_BUILD=1: never download a release wheel — always compile from the pinned source tree.
 RUN mkdir -p /opt/longlive-wheels \
-    && pip wheel --no-cache-dir --no-build-isolation --no-deps -w /opt/longlive-wheels . \
+    && FORCE_BUILD=1 pip wheel --no-cache-dir --no-build-isolation --no-deps -w /opt/longlive-wheels . \
     && pip install --no-cache-dir --no-deps --no-build-isolation /opt/longlive-wheels/fouroversix*.whl \
-    && python -c "import fouroversix; from fouroversix import _C; print('fouroversix ok')" \
+    && python - <<'PY' \
     && rm -rf build /root/.cache /tmp/* /var/tmp/*
+import importlib.metadata as im
+
+version = im.version("fouroversix")
+if version != "1.1.0":
+    raise SystemExit(f"fouroversix {version} != 1.1.0")
+dist = im.distribution("fouroversix")
+so_files = [f for f in (dist.files or []) if str(f).endswith(".so")]
+if not so_files:
+    raise SystemExit("fouroversix wheel missing CUDA extension .so")
+print("fouroversix", version, "so", len(so_files))
+PY
 
 # FlashAttention 2.8.3 from source, per docs/getting_started.md. Restricted to
 # SM 12.0 so the 72 CUDA translation units stay inside the CI build budget.
@@ -112,18 +124,41 @@ RUN git init /tmp/flash-attention \
     && pip install --no-cache-dir --no-deps --no-build-isolation /opt/longlive-wheels/flash_attn-*.whl \
     && FLASH_ATTN_VERSION="${FLASH_ATTN_VERSION}" python - <<'PY' \
     && rm -rf /tmp/flash-attention /root/.cache /tmp/* /var/tmp/*
+import importlib.metadata as im
 import os
-import flash_attn
 
 want = os.environ["FLASH_ATTN_VERSION"]
-if not flash_attn.__version__.startswith(want):
-    raise SystemExit(f"flash_attn {flash_attn.__version__} != {want}")
-print("flash_attn", flash_attn.__version__)
+version = im.version("flash_attn")
+if not version.startswith(want):
+    raise SystemExit(f"flash_attn {version} != {want}")
+dist = im.distribution("flash_attn")
+so_files = [f for f in (dist.files or []) if str(f).endswith(".so")]
+if not so_files:
+    raise SystemExit("flash_attn wheel missing CUDA extension .so")
+print("flash_attn", version, "so", len(so_files))
 PY
 
+COPY deploy/gpu-worker/patches/kv_dequant_sm120a.patch /tmp/kv_dequant_sm120a.patch
 WORKDIR /opt/LongLive/utils/kernel
-RUN python setup.py build_ext --inplace \
+# Upstream LongLive@6b36d20 hardcodes sm_100a; RTX 5090 + CUDA 12.8 needs sm_120a for kv_quant.
+RUN grep -q 'compute_100a,code=sm_100a' setup.py \
+    && patch -p1 --forward --batch < /tmp/kv_dequant_sm120a.patch \
+    && grep -q 'compute_120a,code=sm_120a' setup.py \
+    && ! grep -q 'compute_100a,code=sm_100a' setup.py \
+    || (echo "kv_dequant_sm120a patch failed closed" >&2; exit 1) \
+    && python setup.py build_ext --inplace \
+    && python - <<'PY' \
     && rm -rf /root/.cache /tmp/* /var/tmp/*
+from pathlib import Path
+
+so_files = list(Path(".").glob("*.so"))
+if not so_files:
+    raise SystemExit("kv_dequant build_ext produced no .so")
+text = Path("setup.py").read_text(encoding="utf-8")
+if "compute_100a,code=sm_100a" in text or "compute_120a,code=sm_120a" not in text:
+    raise SystemExit("kv_dequant gencode contract violated")
+print("kv_dequant ok", so_files[0].name)
+PY
 
 # Runtime has CUDA libs (not nvcc). First boot imports fouroversix; it does not compile it.
 FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04
@@ -133,6 +168,7 @@ ARG COMFYUI_REF=7ba217d6b5ac7ef984b157f7e5dfc93465b9937d
 ARG LONGLIVE_REF=6b36d20ec6f7958d29d11a704dfa64611a9f2572
 ARG LONGLIVE_TORCH=2.10.0
 ARG LONGLIVE_TORCHVISION=0.25.0
+ARG LONGLIVE_TORCHAUDIO=2.10.0
 
 ENV DEBIAN_FRONTEND=noninteractive \
     VIRTUAL_ENV=/opt/venv \
@@ -264,36 +300,63 @@ if kept:
 PY
 
 # Nothing above may have pulled a different torch in as a transitive dependency,
-# and the runtime stage must stay free of nvcc.
-RUN LONGLIVE_TORCH="${LONGLIVE_TORCH}" LONGLIVE_TORCHVISION="${LONGLIVE_TORCHVISION}" python - <<'PY'
+# and the runtime stage must stay free of nvcc. GitHub-hosted runners lack
+# libcuda.so.1 — verify wheel metadata and .so presence only; CUDA import/load
+# is deferred to GPU preflight on the leased card.
+RUN LONGLIVE_TORCH="${LONGLIVE_TORCH}" LONGLIVE_TORCHVISION="${LONGLIVE_TORCHVISION}" \
+    LONGLIVE_TORCHAUDIO="${LONGLIVE_TORCHAUDIO:-2.10.0}" python - <<'PY'
+import importlib.metadata as im
 import os
 import shutil
 import sys
 
-import flash_attn
-import fouroversix  # noqa: F401
 import torch
+import torchaudio
 import torchvision
-from fouroversix import _C  # noqa: F401
 
 want_torch = os.environ["LONGLIVE_TORCH"] + "+cu128"
 want_tv = os.environ["LONGLIVE_TORCHVISION"] + "+cu128"
+want_ta = os.environ["LONGLIVE_TORCHAUDIO"] + "+cu128"
 problems = []
+
+
+def dist_has_so(dist_name: str) -> bool:
+    dist = im.distribution(dist_name)
+    return any(str(f).endswith(".so") for f in (dist.files or []))
+
+
 if (sys.version_info.major, sys.version_info.minor) != (3, 12):
     problems.append(f"python {sys.version}")
 if torch.__version__ != want_torch:
     problems.append(f"torch {torch.__version__} != {want_torch}")
 if torchvision.__version__ != want_tv:
     problems.append(f"torchvision {torchvision.__version__} != {want_tv}")
+if torchaudio.__version__ != want_ta:
+    problems.append(f"torchaudio {torchaudio.__version__} != {want_ta}")
 if torch.version.cuda != "12.8":
     problems.append(f"torch cuda {torch.version.cuda} != 12.8")
-if not flash_attn.__version__.startswith("2.8.3"):
-    problems.append(f"flash_attn {flash_attn.__version__} != 2.8.3")
+flash_version = im.version("flash_attn")
+if not flash_version.startswith("2.8.3"):
+    problems.append(f"flash_attn {flash_version} != 2.8.3")
+elif not dist_has_so("flash_attn"):
+    problems.append("flash_attn missing CUDA extension .so")
+fouro_version = im.version("fouroversix")
+if fouro_version != "1.1.0":
+    problems.append(f"fouroversix {fouro_version} != 1.1.0")
+elif not dist_has_so("fouroversix"):
+    problems.append("fouroversix missing CUDA extension .so")
 if shutil.which("nvcc"):
     problems.append("nvcc present in the runtime stage")
 if problems:
     raise SystemExit("longlive_fail_closed: " + "; ".join(problems))
-print("runtime stack ok:", torch.__version__, torchvision.__version__, flash_attn.__version__)
+print(
+    "runtime stack ok:",
+    torch.__version__,
+    torchvision.__version__,
+    torchaudio.__version__,
+    flash_version,
+    fouro_version,
+)
 PY
 
 ENV PYTHONPATH=/app/python \

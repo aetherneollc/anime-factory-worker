@@ -1,0 +1,9 @@
+--- a/setup.py
++++ b/setup.py
+@@ -33,7 +33,7 @@ setup(
+                     # cvt.rn.f16x2.e2m1x2 instruction. Plain sm_100 lacks it.
+-                    "-gencode=arch=compute_100a,code=sm_100a",
++                    "-gencode=arch=compute_120a,code=sm_120a",
+                 ],
+             },
+         ),

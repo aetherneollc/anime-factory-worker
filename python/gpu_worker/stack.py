@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from gpu_worker.boot import health_wait_loop, probe_comfy_system_stats
-from gpu_worker.images import default_register_capabilities
+from gpu_worker.images import default_register_capabilities, resolve_capability_profile
 from gpu_worker.preflight import (
     COMFY_STARTUP_TIMEOUT_S,
     EXPECTED_ONSTART,
@@ -359,12 +359,14 @@ def ensure_torchaudio() -> None:
             "baked torchaudio ABI mismatch; live pip upgrade is not on the adapt whitelist",
             {"error": str(exc)},
         ) from exc
-    if not str(getattr(ta, "__version__", "") or "").startswith(EXPECTED_TORCHAUDIO.split("+")[0]):
+    profile = resolve_capability_profile(select_profile_id())
+    expected_audio = profile.expected_torchaudio or EXPECTED_TORCHAUDIO
+    if not str(getattr(ta, "__version__", "") or "").startswith(expected_audio.split("+")[0]):
         raise PreflightFailure(
             "capability_mismatch",
             "torchaudio_missing",
             "baked torchaudio missing or wrong ABI; live pip upgrade is not on the adapt whitelist",
-            {"version": getattr(ta, "__version__", None), "expected": EXPECTED_TORCHAUDIO},
+            {"version": getattr(ta, "__version__", None), "expected": expected_audio},
         )
 
 

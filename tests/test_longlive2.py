@@ -8,6 +8,8 @@ from pathlib import Path
 import pytest
 
 from tests.dockerfile_parse import parse_dockerfile
+from gpu_worker.images import resolve_capability_profile
+from gpu_worker.stack_contracts import LONGLIVE_STACK, parse_pins_env
 from anime_factory.compose import SCALE_PAD_FILTER
 from anime_factory.models import VIDEO_HEIGHT, VIDEO_WIDTH
 from anime_factory.longlive_workflow import (
@@ -381,6 +383,66 @@ def test_dockerfile_longlive_contract():
     assert "longlive" in ll["capabilities"]
     h3 = next(t for t in targets["targets"] if t["id"] == "h3")
     assert "longlive" not in h3["capabilities"]
+
+
+def test_longlive_profile_matches_pins_and_dockerfile():
+    root = Path(__file__).resolve().parents[1]
+    deploy = root / "deploy" / "gpu-worker"
+    pins = parse_pins_env(deploy / "pins.env")
+    profile = resolve_capability_profile("longlive-nvfp4-sm120")
+    assert profile.expected_torch == pins["LONGLIVE_TORCH"]
+    assert profile.expected_torchvision == pins["LONGLIVE_TORCHVISION"]
+    assert profile.expected_torchaudio == pins["LONGLIVE_TORCHAUDIO"]
+    assert profile.expected_flash_attn == pins["FLASH_ATTN_VERSION"]
+    assert profile.expected_torch == LONGLIVE_STACK.torch
+    text = (deploy / "Dockerfile.longlive").read_text(encoding="utf-8")
+    assert f"ARG LONGLIVE_TORCH={pins['LONGLIVE_TORCH'].split('+')[0]}" in text
+    assert f"ARG LONGLIVE_TORCHVISION={pins['LONGLIVE_TORCHVISION'].split('+')[0]}" in text
+    assert f"ARG LONGLIVE_TORCHAUDIO={pins['LONGLIVE_TORCHAUDIO'].split('+')[0]}" in text
+
+
+def test_dockerfile_longlive_kv_dequant_sm120a_patch_contract():
+    root = Path(__file__).resolve().parents[1]
+    deploy = root / "deploy" / "gpu-worker"
+    patch = (deploy / "patches" / "kv_dequant_sm120a.patch").read_text(encoding="utf-8")
+    assert "compute_100a,code=sm_100a" in patch
+    assert "compute_120a,code=sm_120a" in patch
+    text = (deploy / "Dockerfile.longlive").read_text(encoding="utf-8")
+    assert "kv_dequant_sm120a.patch" in text
+    assert "patch failed closed" in text
+    assert "compute_120a,code=sm_120a" in text
+    assert "kv_dequant gencode contract violated" in text
+
+
+def test_dockerfile_longlive_fouroversix_force_build_only():
+    text = (
+        Path(__file__).resolve().parents[1]
+        / "deploy"
+        / "gpu-worker"
+        / "Dockerfile.longlive"
+    ).read_text(encoding="utf-8")
+    fouro_block = text.split("WORKDIR /opt/LongLive/fouroversix", 1)[1].split(
+        "# FlashAttention", 1
+    )[0]
+    assert "FORCE_BUILD=1 pip wheel" in fouro_block
+    assert "import fouroversix" not in fouro_block
+    assert "from fouroversix import _C" not in fouro_block
+    assert "importlib.metadata" in fouro_block
+
+
+def test_dockerfile_longlive_runtime_skips_cuda_extension_import():
+    text = (
+        Path(__file__).resolve().parents[1]
+        / "deploy"
+        / "gpu-worker"
+        / "Dockerfile.longlive"
+    ).read_text(encoding="utf-8")
+    runtime = text.rsplit("FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04", 1)[1]
+    fail_closed = runtime.split("longlive_fail_closed", 1)[0]
+    assert "import flash_attn" not in fail_closed
+    assert "from fouroversix import _C" not in fail_closed
+    assert "importlib.metadata" in fail_closed
+    assert "dist_has_so" in fail_closed
 
 
 def test_dockerfile_longlive_matches_official_nvfp4_stack():
