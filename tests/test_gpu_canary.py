@@ -22,8 +22,8 @@ DIGEST = "sha256:" + ("c" * 64)
 HEX64 = "c" * 64
 IMAGE_REF = f"docker.io/aetherneo/anime-factory-gpu@{DIGEST.split(':', 1)[1]}"
 IMAGE_AT = f"docker.io/aetherneo/anime-factory-gpu@sha256:{HEX64}"
-GHCR_H3_AT = f"ghcr.io/aetherneollc/anime-factory-gpu@sha256:{HEX64}"
-GHCR_LONGLIVE_AT = f"ghcr.io/aetherneollc/anime-factory-gpu-longlive@sha256:{HEX64}"
+GHCR_H3_AT = f"ghcr.io/aetherneollc/anime-factory-worker-h3@sha256:{HEX64}"
+GHCR_LONGLIVE_AT = f"ghcr.io/aetherneollc/anime-factory-worker-longlive@sha256:{HEX64}"
 
 
 def _eligible(**partial):
@@ -88,7 +88,10 @@ def test_validate_image_rejects_backend_mismatch():
 
 def test_validate_image_rejects_longlive_tag():
     with pytest.raises(gc.CanaryImageError, match="tag"):
-        gc.validate_lease_image_ref("ghcr.io/aetherneollc/anime-factory-gpu-longlive:main", backend="longlive")
+        gc.validate_lease_image_ref(
+            "ghcr.io/aetherneollc/anime-factory-worker-longlive:main",
+            backend="longlive",
+        )
 
 
 def test_clamp_max_dph_never_above_one(monkeypatch):

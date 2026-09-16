@@ -6,7 +6,7 @@
       "id": "h3",
       "enabled": true,
       "dockerfile": "deploy/gpu-worker/Dockerfile",
-      "image_name": "anime-factory-gpu",
+      "image_name": "anime-factory-worker-h3",
       "platforms": ["linux/amd64"],
       "capabilities": ["comfy", "h3", "kolors", "image-gen", "agent"]
     },
@@ -14,7 +14,7 @@
       "id": "longlive",
       "enabled": true,
       "dockerfile": "deploy/gpu-worker/Dockerfile.longlive",
-      "image_name": "anime-factory-gpu-longlive",
+      "image_name": "anime-factory-worker-longlive",
       "platforms": ["linux/amd64"],
       "capabilities": ["longlive", "comfy", "kolors", "image-gen", "agent"]
     }

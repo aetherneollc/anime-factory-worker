@@ -45,8 +45,8 @@ CANARY_PROFILE_BY_BACKEND = {
     "h3": CANARY_H3_PROFILE,
     "longlive": CANARY_LONGLIVE_PROFILE,
 }
-CANARY_PUBLIC_H3_IMAGE = "ghcr.io/aetherneollc/anime-factory-gpu"
-CANARY_PUBLIC_LONGLIVE_IMAGE = "ghcr.io/aetherneollc/anime-factory-gpu-longlive"
+CANARY_PUBLIC_H3_IMAGE = "ghcr.io/aetherneollc/anime-factory-worker-h3"
+CANARY_PUBLIC_LONGLIVE_IMAGE = "ghcr.io/aetherneollc/anime-factory-worker-longlive"
 DEFAULT_STORY_ID = "story-canary-7516b66"
 DEFAULT_CANARY_SHOT_ID = "s001"
 DEFAULT_EPISODE = "EP001"
