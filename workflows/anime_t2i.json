@@ -1,0 +1,79 @@
+{
+  "prompt": {
+    "1": {
+      "class_type": "CheckpointLoaderSimple",
+      "_meta": { "role": "still_ckpt" },
+      "inputs": { "ckpt_name": "animagine-xl-4.0.safetensors" }
+    },
+    "2": {
+      "class_type": "CLIPTextEncode",
+      "_meta": { "role": "positive" },
+      "inputs": { "clip": ["1", 1], "text": "PROMPT" }
+    },
+    "3": {
+      "class_type": "CLIPTextEncode",
+      "_meta": { "role": "negative" },
+      "inputs": { "clip": ["1", 1], "text": "NEGATIVE" }
+    },
+    "4": {
+      "class_type": "EmptyLatentImage",
+      "_meta": { "role": "latent" },
+      "inputs": { "width": 1344, "height": 768, "batch_size": 1 }
+    },
+    "8": {
+      "class_type": "LoadImage",
+      "_meta": { "role": "reference_image" },
+      "inputs": { "image": "", "upload": "image" }
+    },
+    "9": {
+      "class_type": "IPAdapterModelLoader",
+      "_meta": { "role": "ipadapter_model" },
+      "inputs": { "ipadapter_file": "ip-adapter-plus_sdxl_vit-h.safetensors" }
+    },
+    "10": {
+      "class_type": "CLIPVisionLoader",
+      "_meta": { "role": "ipadapter_clip_vision" },
+      "inputs": { "clip_name": "CLIP-ViT-H-14-laion2B-s32B-b79K.safetensors" }
+    },
+    "11": {
+      "class_type": "IPAdapterAdvanced",
+      "_meta": { "role": "ipadapter" },
+      "inputs": {
+        "model": ["1", 0],
+        "ipadapter": ["9", 0],
+        "image": ["8", 0],
+        "clip_vision": ["10", 0],
+        "weight": 0.6,
+        "weight_type": "linear",
+        "combine_embeds": "concat",
+        "start_at": 0,
+        "end_at": 0.7,
+        "embeds_scaling": "V only"
+      }
+    },
+    "5": {
+      "class_type": "KSampler",
+      "_meta": { "role": "sampler" },
+      "inputs": {
+        "model": ["11", 0],
+        "seed": 42,
+        "steps": 28,
+        "cfg": 5,
+        "sampler_name": "euler_ancestral",
+        "scheduler": "normal",
+        "positive": ["2", 0],
+        "negative": ["3", 0],
+        "latent_image": ["4", 0],
+        "denoise": 1
+      }
+    },
+    "6": {
+      "class_type": "VAEDecode",
+      "inputs": { "samples": ["5", 0], "vae": ["1", 2] }
+    },
+    "7": {
+      "class_type": "SaveImage",
+      "inputs": { "images": ["6", 0], "filename_prefix": "anime_still" }
+    }
+  }
+}

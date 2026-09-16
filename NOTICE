@@ -1,0 +1,16 @@
+Anime Factory GPU Worker
+Copyright 2026 AetherNeo LLC
+
+This product includes software developed by AetherNeo LLC and distributed
+under the Apache License 2.0 (see LICENSE).
+
+Third-party components bundled at image build time or downloaded at runtime
+are listed in THIRD_PARTY_LICENSES. Their licenses apply to those components
+separately from the Apache-licensed project source in this repository.
+
+Runtime model weights (checkpoints, CLIP, IP-Adapter, Hugging Face artifacts,
+and similar files) are not shipped in this repository. They are fetched on
+first boot subject to each upstream model's license terms.
+
+Trademarks, service marks, and product names mentioned in configuration or
+code comments are the property of their respective owners.

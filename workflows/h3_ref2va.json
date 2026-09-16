@@ -1,0 +1,28 @@
+{
+  "prompt": {
+        "r1": {
+          "class_type": "LoadImage",
+          "_meta": { "role": "ref_images.ref_image_0" },
+          "inputs": { "image": "assets/characters/hero/sheet_front.png" }
+        },
+        "r2": {
+          "class_type": "LoadImage",
+          "_meta": { "role": "ref_images.ref_image_1" },
+          "inputs": { "image": "assets/scenes/store/plate_base.png" }
+        },
+        "2": {
+          "class_type": "MiniMaxH3ReferenceToVideo",
+          "inputs": {
+            "clip": ["clip", 0],
+            "vae": ["vvae", 0],
+            "ref_images.ref_image_0": ["r1", 0],
+            "ref_images.ref_image_1": ["r2", 0],
+            "ref_image_size": "match",
+            "prompt": "<Picture 1> character sheet and <Picture 2> scene plate. @hero 站在 @store 中.",
+            "width": 864,
+            "height": 480,
+            "length": 192
+          }
+        }
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "zh": {"name": "简体中文", "tts_voice_key": "zh", "subtitle_font": "NotoSansSC", "rtl": false, "platform_tag_style": "cn"},
+  "en": {"name": "English", "tts_voice_key": "en", "subtitle_font": "NotoSans", "rtl": false, "platform_tag_style": "intl"},
+  "ja": {"name": "日本語", "tts_voice_key": "ja", "subtitle_font": "NotoSansJP", "rtl": false, "platform_tag_style": "jp"}
+}

@@ -1,0 +1,75 @@
+# Secrets and local env
+.env
+.env.*
+!.env.*.example
+.dev.vars
+.secret
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+.python-version
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+
+# Node (not used in this repo; block accidental commits)
+node_modules/
+.wrangler/
+.vite/
+
+# Runtime artifacts
+work/
+var/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# Media and generated assets
+*.mp4
+*.mkv
+*.webm
+*.wav
+*.flac
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.safetensors
+*.ckpt
+*.pt
+*.bin
+
+# ComfyUI / model caches (runtime download only)
+models/
+ComfyUI/
+checkpoints/
+loras/
+vae/
+clip/
+unet/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+
+# Documentation (explicitly excluded from this public worker repo)
+*.md
+!LICENSE

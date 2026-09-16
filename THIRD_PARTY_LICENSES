@@ -1,0 +1,102 @@
+THIRD-PARTY LICENSES
+====================
+
+This file summarizes licenses for components referenced by the Anime Factory
+GPU worker. It is not legal advice. Upstream repositories and model cards
+remain the authoritative source for license text and attribution.
+
+------------------------------------------------------------------------------
+1. Project source (this repository)
+------------------------------------------------------------------------------
+
+Copyright 2026 AetherNeo LLC
+SPDX-License-Identifier: Apache-2.0
+
+Original Python packages (`anime_factory`, `gpu_worker`), SQL schema, ComfyUI
+workflow JSON, deployment scripts, and tests in this repository are licensed
+under Apache License 2.0 unless a file header states otherwise.
+
+------------------------------------------------------------------------------
+2. ComfyUI (baked into the GPU worker container at build time)
+------------------------------------------------------------------------------
+
+Project: ComfyUI
+Upstream: https://github.com/comfyanonymous/ComfyUI
+License: GNU General Public License v3.0 (GPL-3.0)
+
+The Dockerfile pins a specific ComfyUI git revision. ComfyUI is cloned during
+image build and is not vendored as source in this repository. If you
+redistribute a built container image, GPL-3.0 obligations for ComfyUI apply
+to that distribution.
+
+------------------------------------------------------------------------------
+3. ComfyUI IPAdapter plus (baked into the GPU worker container at build time)
+------------------------------------------------------------------------------
+
+Project: ComfyUI_IPAdapter_plus
+Upstream: https://github.com/cubiq/ComfyUI_IPAdapter_plus
+License: GNU General Public License v3.0 (GPL-3.0)
+
+This custom node is cloned during image build for IP-Adapter advanced nodes used
+in character-consistency still workflows.
+
+------------------------------------------------------------------------------
+4. PyTorch / torchvision / torchaudio (container Python wheels)
+------------------------------------------------------------------------------
+
+Upstream: https://pytorch.org/
+License: BSD-style license (see PyTorch LICENSE file at time of install)
+
+Installed from the official PyTorch CUDA 12.8 wheel index during image build.
+
+------------------------------------------------------------------------------
+5. Python dependencies installed via pip in the container / dev environment
+------------------------------------------------------------------------------
+
+Representative packages include Pillow, huggingface_hub, boto3, open_clip_torch,
+and ComfyUI requirements filtered at build time. Each package is governed by
+its own upstream license (typically permissive OSS licenses). Refer to the
+installed package metadata in a built environment for exact versions and texts.
+
+------------------------------------------------------------------------------
+6. cloudflared (container binary)
+------------------------------------------------------------------------------
+
+Upstream: https://github.com/cloudflare/cloudflared
+License: Apache License 2.0 (see upstream repository)
+
+Downloaded as a release binary during image build when tunnel egress is used.
+
+------------------------------------------------------------------------------
+7. ffmpeg and Ubuntu base packages
+------------------------------------------------------------------------------
+
+Installed from Ubuntu 24.04 repositories in the CUDA runtime base image.
+Licenses vary by package (GPL/LGPL/Apache/etc.). See Debian/Ubuntu copyright
+files in a built image for details.
+
+------------------------------------------------------------------------------
+8. Runtime-downloaded model weights (NOT in git; fetched on instance boot)
+------------------------------------------------------------------------------
+
+The worker intentionally does not commit model checkpoints. At runtime, weights
+are pulled from Hugging Face and similar hosts into instance-local disk. Common
+artifacts referenced by the worker include, without limitation:
+
+- MiniMax H3 video model weights (MiniMax-H3 and related files)
+- Animagine XL 4.0 SDXL checkpoint (cagliostrolab/animagine-xl-4.0)
+- IP-Adapter and CLIP vision weights for still generation
+- OpenCLIP ViT-B-32 weights for visual QC (timm/vit_base_patch32_clip_224.openai)
+- Additional ComfyUI model files declared in gpu_worker.weights
+
+Each model repository publishes its own license (commercial, research, open,
+or custom). Operators must comply with upstream model license terms, including
+any attribution, usage restriction, or fee requirements. This repository does
+not grant rights to third-party model weights.
+
+------------------------------------------------------------------------------
+9. ComfyUI workflow JSON in /workflows
+------------------------------------------------------------------------------
+
+Workflow files in this repository are Apache-2.0 project assets describing node
+graphs. They assume the third-party nodes and models listed above.

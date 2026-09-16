@@ -1,0 +1,27 @@
+{
+  "prompt": {
+    "1": {
+      "class_type": "LoadImage",
+      "_meta": { "role": "first_frame" },
+      "inputs": { "image": "keyframes/E01-01/f1.png" }
+    },
+    "2": {
+      "class_type": "LoadImage",
+      "_meta": { "role": "last_frame" },
+      "inputs": { "image": "input/" }
+    },
+    "3": {
+      "class_type": "MiniMaxH3ImageToVideo",
+      "inputs": {
+        "clip": ["clip", 0],
+        "vae": ["vvae", 0],
+        "first_frame": ["1", 0],
+        "last_frame": ["2", 0],
+        "prompt": "",
+        "width": 864,
+        "height": 480,
+        "length": 192
+      }
+    }
+  }
+}

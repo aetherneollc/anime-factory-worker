@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "registry": "ghcr.io",
+  "targets": [
+    {
+      "id": "h3",
+      "enabled": true,
+      "dockerfile": "deploy/gpu-worker/Dockerfile",
+      "image_name": "anime-factory-gpu",
+      "platforms": ["linux/amd64"],
+      "capabilities": ["comfy", "h3", "kolors", "image-gen", "agent"]
+    },
+    {
+      "id": "longlive",
+      "enabled": false,
+      "dockerfile": "deploy/gpu-worker/Dockerfile.longlive",
+      "image_name": "anime-factory-gpu-longlive",
+      "platforms": ["linux/amd64"],
+      "capabilities": ["longlive", "comfy"],
+      "blocked_reason": "Dockerfile.longlive not present yet; enable after validated LongLive image lands."
+    }
+  ]
+}

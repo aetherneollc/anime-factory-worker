@@ -1,0 +1,33 @@
+# Vast GPU box compose. Default is dry-run: no lease, no public 8199.
+# Start the tunnel sidecar only with --profile tunnel and CLOUDFLARE_TUNNEL_TOKEN
+# (gitignored .env). cloudflared uses host network so it can reach comfy-router
+# on 127.0.0.1:8199 without publishing that port.
+#
+#   docker compose -f deploy/gpu-worker/docker-compose.yml up --build gpu-worker
+#   docker compose -f deploy/gpu-worker/docker-compose.yml --profile tunnel up cloudflared
+
+services:
+  gpu-worker:
+    build:
+      context: ../..
+      dockerfile: deploy/gpu-worker/Dockerfile
+    image: anime-factory-gpu:local
+    environment:
+      VAST_DRY_RUN: "1"
+      VAST_ALLOW_REPLACE: "0"
+      ANIME_FACTORY_LIVE_VAST: "0"
+      AF_ONCE: ${AF_ONCE:-1}
+      AF_START_COMFY: "0"
+      VAST_INSTANCE_ID: ${VAST_INSTANCE_ID:-compose-dry}
+      HEARTBEAT_SECONDS: "5"
+      CONTROL_PLANE_URL: ${CONTROL_PLANE_URL:-}
+    restart: "no"
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    profiles: ["tunnel"]
+    network_mode: host
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    restart: unless-stopped
