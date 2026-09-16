@@ -2,6 +2,7 @@ import pytest
 
 from anime_factory.board import PromptCollapseError, SpeakerFrameError, assert_shot_prompt_diversity, assert_speaker_matches_frame
 from anime_factory.design import (
+    build_scene_plate_payload,
     CharacterIdentityError,
     FRONT_LOOK,
     LocationPromptError,
@@ -16,9 +17,11 @@ from anime_factory.design import (
 )
 from anime_factory.models import (
     FIXED_NEGATIVE,
+    LUMINOUS_CINEMATIC_ANIME_PRESET,
     STYLE_PREFIX,
     STYLE_PREFIX_CHARACTER,
     STYLE_PREFIX_LOCATION,
+    STYLE_PREFIX_LOCATION_LUMINOUS,
     scrub_copycat,
     style_prefix_for_kind,
 )
@@ -117,6 +120,46 @@ def test_style_prefixes_split_by_asset_kind():
     assert style_prefix_for_kind("scene_plate") == STYLE_PREFIX_LOCATION
     assert "detailed background" in STYLE_PREFIX_LOCATION
     assert "detailed background" not in STYLE_PREFIX_CHARACTER
+
+
+def test_luminous_preset_is_location_keyframe_only(monkeypatch):
+    monkeypatch.setenv("STYLE_PRESET", LUMINOUS_CINEMATIC_ANIME_PRESET)
+    assert style_prefix_for_kind("scene_plate") == STYLE_PREFIX_LOCATION_LUMINOUS
+    assert style_prefix_for_kind("keyframe") == STYLE_PREFIX_LOCATION_LUMINOUS
+    assert style_prefix_for_kind("character_sheet") == STYLE_PREFIX_CHARACTER
+
+    payload = build_scene_plate_payload(
+        "rainy canal shopping street, old stone bridge, anime location background",
+        period_md="# Period\n\n## 正面清单\n- hand-painted wooden signs\n\n## 负面清单\n- modern neon signage\n",
+        world_mode="history",
+    )
+    prompt = payload["prompt"].lower()
+    for term in (
+        "clear luminous atmosphere",
+        "contextual layered clouds for open-sky scenes",
+        "volumetric light",
+        "rim light",
+        "wet-surface reflections",
+        "saturated blue and gold contrast",
+        "detailed everyday urban and natural backgrounds",
+        "atmospheric perspective",
+        "cinematic depth",
+        "hand-painted wooden signs",
+        "rainy canal shopping street",
+    ):
+        assert term in prompt
+    assert "sunset" not in prompt
+    for ban in BANNED:
+        assert ban not in prompt
+
+    char_prompt = style_prompt(
+        "1girl, young adult, short black hair, brown eyes, grey hoodie, lean build",
+        kind="character_sheet",
+        gender_tag="1girl",
+    ).lower()
+    assert "warm ivory studio background" in char_prompt
+    for scenic in ("layered clouds", "wet-surface reflections", "detailed background", "cinematic depth"):
+        assert scenic not in char_prompt
 
 
 def test_location_prompt_rejects_standalone_plate():
@@ -260,6 +303,55 @@ def test_keyframe_uses_board_prompt_and_unique_seed(tmp_path):
     # Stills are drawn at the 1.8 still aspect, not the old 1280x720.
     assert payloads[0]["image_size"] == "1344x768"
     assert (tmp_path / "episodes" / "EP001" / "keyframes" / "s001" / "f1.png").read_bytes() == art
+
+
+def test_luminous_preset_reaches_keyframe_payload_and_period_terms(tmp_path, monkeypatch):
+    from anime_factory.db import migrate, open_db
+    from anime_factory.design import KolorsClient
+    from anime_factory.keyframe import ensure_keyframe
+
+    monkeypatch.setenv("STYLE_PRESET", LUMINOUS_CINEMATIC_ANIME_PRESET)
+    (tmp_path / "bible").mkdir()
+    (tmp_path / "bible" / "style.md").write_text(
+        f"{STYLE_PREFIX}\n\nnegative: {FIXED_NEGATIVE}\n",
+        encoding="utf-8",
+    )
+    period_md = "# Period\n\n## 正面清单\n- 1890s brick storefronts\n\n## 负面清单\n- glass skyscrapers\n"
+    payloads = []
+    art = synthetic_still_png(1344, 768, tag="luminous-keyframe")
+
+    conn = open_db(tmp_path / "s.sqlite")
+    migrate(conn)
+    client = KolorsClient(["k"], live=True, gpu_generate=lambda p: payloads.append(p) or art)
+    from anime_factory.visual_qc import reset_clip_scorer, set_clip_scorer
+    from tests.clip_fakes import passing_scorer
+
+    token = set_clip_scorer(passing_scorer())
+    try:
+        ensure_keyframe(
+            conn,
+            "story-x",
+            "EP001",
+            {"id": "s101", "prompt": "wide view of a rainy train station plaza, living skin"},
+            {},
+            {"items": []},
+            {},
+            client,
+            period_md,
+            "history",
+            tmp_path,
+        )
+    finally:
+        reset_clip_scorer(token)
+
+    assert payloads
+    prompt = payloads[0]["prompt"].lower()
+    assert "clear luminous atmosphere" in prompt
+    assert "rainy train station plaza" in prompt
+    assert "1890s brick storefronts" in prompt
+    assert "makoto shinkai" not in prompt
+    assert "generic endless sunset" in payloads[0]["negative_prompt"]
+    assert "glass skyscrapers" in payloads[0]["negative_prompt"]
 
 
 def test_keyframe_refuses_to_draw_the_segment_id(tmp_path):

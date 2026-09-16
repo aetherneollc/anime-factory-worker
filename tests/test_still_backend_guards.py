@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from anime_factory.design import StillBlobError, assert_still_blob, synthetic_still_png
-from anime_factory.models import IMAGE_CKPT, MIN_STILL_BYTES, STYLE_PREFIX
+from anime_factory.models import IMAGE_CKPT, LUMINOUS_CINEMATIC_ANIME_PRESET, MIN_STILL_BYTES, STYLE_PREFIX
 from gpu_worker.h3 import load_workflow
 from gpu_worker.stills import (
     STILL_WORKFLOW,
@@ -188,6 +188,21 @@ def test_styled_marker_stops_double_prefixing():
     assert not bible["prompt"].startswith(STYLE_PREFIX)
     unstyled = still_payload_to_prompt({"prompt": "a night counter"})
     assert unstyled["prompt"].startswith(STYLE_PREFIX)
+
+
+def test_luminous_preset_reaches_unstyled_gpu_location_and_keyframe_payloads(monkeypatch):
+    monkeypatch.setenv("STYLE_PRESET", LUMINOUS_CINEMATIC_ANIME_PRESET)
+    scene = still_payload_to_prompt({"prompt": "rainy alley", "_kind": "scene_plate"})
+    keyframe = still_payload_to_prompt({"prompt": "rainy alley first frame", "_kind": "keyframe"})
+    character = still_payload_to_prompt(
+        {"prompt": "1boy, navy jacket, from side", "_kind": "character_view_derive", "image_size": "832x1216"}
+    )
+    assert "clear luminous atmosphere" in scene["prompt"]
+    assert "clear luminous atmosphere" in keyframe["prompt"]
+    assert "rainy alley" in scene["prompt"]
+    assert "rainy alley first frame" in keyframe["prompt"]
+    assert "warm ivory studio background" in character["prompt"]
+    assert "clear luminous atmosphere" not in character["prompt"]
 
 
 def test_still_master_uses_animagine_sdxl_bucket():

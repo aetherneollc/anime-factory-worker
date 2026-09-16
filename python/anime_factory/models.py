@@ -1,5 +1,6 @@
 """Locked model names from ANIME_FACTORY.md chapter 2. Roles must not be swapped."""
 
+import os
 import re
 
 DEEPSEEK_MODEL_FLASH = "deepseek-v4-flash"
@@ -42,6 +43,13 @@ ROLE_MODELS = {
 }
 
 DEFAULT_STYLE_PRESET = "cinematic"
+LUMINOUS_CINEMATIC_ANIME_PRESET = "luminous-cinematic-anime"
+STYLE_PRESET_ALIASES = {
+    DEFAULT_STYLE_PRESET: DEFAULT_STYLE_PRESET,
+    "default": DEFAULT_STYLE_PRESET,
+    LUMINOUS_CINEMATIC_ANIME_PRESET: LUMINOUS_CINEMATIC_ANIME_PRESET,
+    "luminous": LUMINOUS_CINEMATIC_ANIME_PRESET,
+}
 STYLE_PRESET_VERSION = "cinematic-v3"
 PROMPT_TEMPLATE_VERSION = "v4"
 SCHEMA_VERSION = "v1"
@@ -56,6 +64,14 @@ STYLE_PREFIX_LOCATION = (
     "clean lineart, flat shading, 2d anime illustration, detailed background, "
     "cinematic composition, story-specific props and locations from the bible, "
     "readable everyday lighting, natural living skin tone"
+)
+STYLE_PREFIX_LOCATION_LUMINOUS = (
+    "original anime production still for this story, anime production still, cel shaded, "
+    "clean lineart, flat shading, 2d anime illustration, clear luminous atmosphere, "
+    "location-specific weather and time of day, contextual layered clouds for open-sky scenes, "
+    "volumetric light, rim light, rain or water wet-surface reflections, saturated blue and gold contrast, "
+    "detailed everyday urban and natural backgrounds, atmospheric perspective, cinematic depth, "
+    "story-specific props and locations from the bible, natural living skin tone"
 )
 STYLE_PREFIX_CHARACTER = (
     "original anime character design, solo, cel shaded, clean lineart, "
@@ -82,11 +98,18 @@ FIXED_NEGATIVE = (
 )
 
 
-def style_prefix_for_kind(kind: str | None) -> str:
+def normalize_style_preset(preset: str | None = None) -> str:
+    raw = str(preset if preset is not None else os.environ.get("STYLE_PRESET", DEFAULT_STYLE_PRESET)).strip().lower()
+    return STYLE_PRESET_ALIASES.get(raw, DEFAULT_STYLE_PRESET)
+
+
+def style_prefix_for_kind(kind: str | None, preset: str | None = None) -> str:
     """Return the style prefix appropriate for a still asset kind."""
     k = str(kind or "").strip().lower()
     if k in {"character_sheet", "character_view_derive", "costume_derive"}:
         return STYLE_PREFIX_CHARACTER
+    if k in {"scene_plate", "scene_derive", "keyframe"} and normalize_style_preset(preset) == LUMINOUS_CINEMATIC_ANIME_PRESET:
+        return STYLE_PREFIX_LOCATION_LUMINOUS
     return STYLE_PREFIX_LOCATION
 
 

@@ -50,6 +50,7 @@ from anime_factory.config import load_settings
 from anime_factory.db import utcnow
 from anime_factory.instrument import Counters
 from anime_factory.models import (
+    DEFAULT_STYLE_PRESET,
     FIXED_NEGATIVE,
     IMAGE_MODEL,
     IMAGE_STEPS,
@@ -62,6 +63,7 @@ from anime_factory.models import (
     STILL_WIDTH,
     STYLE_PREFIX,
     animagine_quality_suffix,
+    normalize_style_preset,
     scrub_copycat,
     style_prefix_for_kind,
 )
@@ -1037,7 +1039,8 @@ def _store_qc_outcome(
 
 def style_md_prefix(story_root: Path | None) -> tuple[str, str]:
     """bible/style.md prefix + fixed negative on every call."""
-    prefix, negative = scrub_copycat(STYLE_PREFIX), FIXED_NEGATIVE
+    selected_prefix = scrub_copycat(style_prefix_for_kind("scene_plate"))
+    prefix, negative = selected_prefix, FIXED_NEGATIVE
     if story_root is None:
         return prefix, negative
     style_path = story_root / "bible" / "style.md"
@@ -1053,7 +1056,11 @@ def style_md_prefix(story_root: Path | None) -> tuple[str, str]:
             neg_line = line.split(":", 1)[1].strip()
         else:
             pos_lines.append(line)
-    prefix = scrub_copycat(" ".join(p.strip() for p in pos_lines if p.strip()) or prefix)
+    bible_prefix = scrub_copycat(" ".join(p.strip() for p in pos_lines if p.strip()) or prefix)
+    if normalize_style_preset() == DEFAULT_STYLE_PRESET:
+        prefix = bible_prefix
+    elif bible_prefix and bible_prefix not in {STYLE_PREFIX, selected_prefix}:
+        prefix = f"{selected_prefix}, {bible_prefix}"
     if neg_line:
         negative = scrub_copycat(neg_line)
     return prefix, negative
@@ -1307,7 +1314,7 @@ def write_assets_index(story_root: Path, story_id: str, specs: dict[str, dict], 
                 rec["history"].append(filename)
     extra = {
         "story_id": story_id,
-        "style_prefix": STYLE_PREFIX,
+        "style_prefix": style_prefix_for_kind("scene_plate"),
         "negative": FIXED_NEGATIVE,
         "vast_for_stills": bool(os.environ.get("ANIME_FACTORY_GPU_STILLS", "").strip().lower() in {"1", "true", "yes", "on"}),
         "model": IMAGE_MODEL,
