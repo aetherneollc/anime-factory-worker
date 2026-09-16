@@ -1,22 +1,40 @@
 # Anime Factory GPU worker — dedicated LongLive 2.0 NVFP4 image.
 # ComfyUI + Animagine stills (IP-Adapter) for missing keyframes; never H3 weights.
 # Weights are NOT baked — first boot pulls HuggingFace onto instance-local disk (never R2).
-# FourOverSix / flash-attn / LongLive KV-dequant ARE baked for Blackwell SM 12.0
-# (recovered from SoundStoryWriter2 git history before 2e90b9b).
-# Final stage is CUDA runtime-only (no nvcc). Python 3.12. Do not pip install -e fouroversix.
+#
+# The NVFP4 stack matches the validated baseline in NVlabs/LongLive
+# docs/getting_started.md ("NVFP4 Environment") and the
+# Efficient-Large-Model/LongLive-2.0-5B-NVFP4-S2 model card:
+#   Python 3.12 / PyTorch 2.10.0+cu128 / TorchVision 0.25.0+cu128 / CUDA 12.8 /
+#   TorchAO 0.16.0 / FlashAttention 2.8.3 built from source.
+# Dao-AILab publishes no cu12+torch2.10 release wheel for 2.8.3 (only cu13torch2.10),
+# so flash-attn is compiled here for SM 12.0 and shipped as a wheel. FourOverSix and
+# the LongLive KV-dequant extension are built the same way.
+# Final stage is CUDA runtime-only (no nvcc). Do not pip install -e fouroversix there.
 
 FROM nvidia/cuda:12.8.1-devel-ubuntu24.04 AS nvfp4
 
 ARG LONGLIVE_REF=6b36d20ec6f7958d29d11a704dfa64611a9f2572
-ARG FLASH_ATTN_WHEEL_URL=https://github.com/Zarrac/my-pytorch-builds/releases/download/flash-attn-2.7.4.post1-cuda12.8/flash_attn-2.7.4.post1%2Bpt270cu128cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+# NVIDIA/cutlass revision pinned by mit-han-lab/fouroversix@FOUROVERSIX_REF.
+# LongLive vendors fouroversix as plain files, so third_party/cutlass must be
+# supplied explicitly; taking whatever is at a branch tip is not reproducible.
+ARG FOUROVERSIX_REF=dadfad6901d473a734fe71e0b082e70ee993e23a
+ARG CUTLASS_REF=ec8daf642d69fc31352ac6fa6e14a0de9019604b
+ARG FLASH_ATTN_REF=060c9188beec3a8b62b33a3bfa6d5d2d44975fab
+ARG FLASH_ATTN_VERSION=2.8.3
+ARG LONGLIVE_TORCH=2.10.0
+ARG LONGLIVE_TORCHVISION=0.25.0
+ARG LONGLIVE_TORCHAUDIO=2.10.0
+ARG LONGLIVE_TORCHAO=0.16.0
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     CUDA_ARCHS=120 \
+    FLASH_ATTN_CUDA_ARCHS=120 \
     TORCH_CUDA_ARCH_LIST=12.0 \
-    MAX_JOBS=1 \
-    NVCC_THREADS=1 \
-    CMAKE_BUILD_PARALLEL_LEVEL=1 \
+    MAX_JOBS=2 \
+    NVCC_THREADS=2 \
+    CMAKE_BUILD_PARALLEL_LEVEL=2 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
     VIRTUAL_ENV=/opt/venv \
@@ -28,41 +46,80 @@ RUN apt-get update \
     && python3 -m venv /opt/venv \
     && rm -rf /var/lib/apt/lists/*
 
-# Known-working Blackwell stack: torch 2.7.0+cu128 matches the sm_120 flash-attn wheel.
+# cp312 ABI is what the whole stack is pinned against; anything else fails closed.
+RUN python -c "import sys; v=sys.version_info; \
+assert (v.major, v.minor) == (3, 12), f'need Python 3.12.x, got {sys.version}'; \
+print('python', sys.version)"
+
 RUN pip install --no-cache-dir --upgrade pip wheel \
     && pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 \
-         torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0+cu128 \
+         "torch==${LONGLIVE_TORCH}+cu128" \
+         "torchvision==${LONGLIVE_TORCHVISION}+cu128" \
+         "torchaudio==${LONGLIVE_TORCHAUDIO}+cu128" \
+    && pip install --no-cache-dir "torchao==${LONGLIVE_TORCHAO}" \
     && pip install --no-cache-dir ninja packaging psutil "setuptools>=77.0.3" \
+    && LONGLIVE_TORCH="${LONGLIVE_TORCH}" LONGLIVE_TORCHVISION="${LONGLIVE_TORCHVISION}" python - <<'PY' \
     && rm -rf /root/.cache /tmp/* /var/tmp/*
+import os
+import torch
+import torchvision
 
-# Pin NVlabs/LongLive. Vendored fouroversix has no .git / third_party; CUTLASS
-# must be copied from mit-han-lab/fouroversix before `pip wheel`.
+want_torch = os.environ["LONGLIVE_TORCH"] + "+cu128"
+want_tv = os.environ["LONGLIVE_TORCHVISION"] + "+cu128"
+if torch.__version__ != want_torch:
+    raise SystemExit(f"torch {torch.__version__} != {want_torch}")
+if torchvision.__version__ != want_tv:
+    raise SystemExit(f"torchvision {torchvision.__version__} != {want_tv}")
+if torch.version.cuda != "12.8":
+    raise SystemExit(f"torch CUDA {torch.version.cuda} != 12.8")
+print("torch", torch.__version__, "cuda", torch.version.cuda, "tv", torchvision.__version__)
+PY
+
+# Pin NVlabs/LongLive plus the CUTLASS revision its vendored fouroversix expects.
 RUN git init /opt/LongLive \
     && git -C /opt/LongLive remote add origin https://github.com/NVlabs/LongLive.git \
     && git -C /opt/LongLive fetch --depth 1 origin "${LONGLIVE_REF}" \
     && git -C /opt/LongLive checkout --detach FETCH_HEAD \
-    && git clone --depth 1 https://github.com/mit-han-lab/fouroversix.git /tmp/fouroversix-src \
-    && git -C /tmp/fouroversix-src submodule update --init third_party/cutlass \
-    && mkdir -p /opt/LongLive/fouroversix/third_party \
-    && mv /tmp/fouroversix-src/third_party/cutlass /opt/LongLive/fouroversix/third_party/cutlass \
-    && rm -rf /tmp/fouroversix-src \
+    && mkdir -p /opt/LongLive/fouroversix/third_party/cutlass \
+    && git init /opt/LongLive/fouroversix/third_party/cutlass \
+    && git -C /opt/LongLive/fouroversix/third_party/cutlass remote add origin \
+         https://github.com/NVIDIA/cutlass.git \
+    && git -C /opt/LongLive/fouroversix/third_party/cutlass fetch --depth 1 origin "${CUTLASS_REF}" \
+    && git -C /opt/LongLive/fouroversix/third_party/cutlass checkout --detach FETCH_HEAD \
+    && rm -rf /opt/LongLive/fouroversix/third_party/cutlass/.git \
     && test -d /opt/LongLive/fouroversix/third_party/cutlass/include \
-    && test -f /opt/LongLive/inference.py
+    && test -f /opt/LongLive/inference.py \
+    && test -f /opt/LongLive/utils/inference_utils.py \
+    && grep -q "def setup_nvfp4_pipeline" /opt/LongLive/utils/inference_utils.py \
+    && grep -q "class ImagePromptDataset" /opt/LongLive/utils/dataset.py
 
 WORKDIR /opt/LongLive/fouroversix
 RUN mkdir -p /opt/longlive-wheels \
     && pip wheel --no-cache-dir --no-build-isolation --no-deps -w /opt/longlive-wheels . \
     && pip install --no-cache-dir --no-deps --no-build-isolation /opt/longlive-wheels/fouroversix*.whl \
+    && python -c "import fouroversix; from fouroversix import _C; print('fouroversix ok')" \
     && rm -rf build /root/.cache /tmp/* /var/tmp/*
 
-# flash-attn: prebuilt Blackwell wheel (Zarrac/my-pytorch-builds v2.7.4.post1, pt270cu128, sm_80/90/100/120).
-# PyPI / official Dao-AILab wheels lack sm_120; source compile was ~6h on GHA.
-RUN curl -fsSL -o /opt/longlive-wheels/flash_attn-2.7.4.post1+pt270cu128cxx11abiTRUE-cp312-cp312-linux_x86_64.whl \
-         "${FLASH_ATTN_WHEEL_URL}" \
-    && pip install --no-cache-dir --no-deps --no-build-isolation \
-         /opt/longlive-wheels/flash_attn-2.7.4.post1+pt270cu128cxx11abiTRUE-cp312-cp312-linux_x86_64.whl \
-    && python -c "import flash_attn; print('flash_attn', flash_attn.__version__)" \
-    && rm -rf /root/.cache /tmp/* /var/tmp/*
+# FlashAttention 2.8.3 from source, per docs/getting_started.md. Restricted to
+# SM 12.0 so the 72 CUDA translation units stay inside the CI build budget.
+RUN git init /tmp/flash-attention \
+    && git -C /tmp/flash-attention remote add origin https://github.com/Dao-AILab/flash-attention.git \
+    && git -C /tmp/flash-attention fetch --depth 1 origin "${FLASH_ATTN_REF}" \
+    && git -C /tmp/flash-attention checkout --detach FETCH_HEAD \
+    && FLASH_ATTENTION_FORCE_BUILD=TRUE FLASH_ATTN_CUDA_ARCHS=120 \
+       pip wheel --no-cache-dir --no-build-isolation --no-deps \
+         -w /opt/longlive-wheels /tmp/flash-attention \
+    && pip install --no-cache-dir --no-deps --no-build-isolation /opt/longlive-wheels/flash_attn-*.whl \
+    && FLASH_ATTN_VERSION="${FLASH_ATTN_VERSION}" python - <<'PY' \
+    && rm -rf /tmp/flash-attention /root/.cache /tmp/* /var/tmp/*
+import os
+import flash_attn
+
+want = os.environ["FLASH_ATTN_VERSION"]
+if not flash_attn.__version__.startswith(want):
+    raise SystemExit(f"flash_attn {flash_attn.__version__} != {want}")
+print("flash_attn", flash_attn.__version__)
+PY
 
 WORKDIR /opt/LongLive/utils/kernel
 RUN python setup.py build_ext --inplace \
@@ -74,6 +131,8 @@ FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04
 ARG TARGETARCH=amd64
 ARG COMFYUI_REF=7ba217d6b5ac7ef984b157f7e5dfc93465b9937d
 ARG LONGLIVE_REF=6b36d20ec6f7958d29d11a704dfa64611a9f2572
+ARG LONGLIVE_TORCH=2.10.0
+ARG LONGLIVE_TORCHVISION=0.25.0
 
 ENV DEBIAN_FRONTEND=noninteractive \
     VIRTUAL_ENV=/opt/venv \
@@ -97,7 +156,8 @@ RUN apt-get update \
     && git -C /opt/ComfyUI remote add origin https://github.com/comfyanonymous/ComfyUI.git \
     && git -C /opt/ComfyUI fetch --depth 1 origin "${COMFYUI_REF}" \
     && git -C /opt/ComfyUI checkout --detach FETCH_HEAD \
-    && COMFYUI_REF="${COMFYUI_REF}" LONGLIVE_REF="${LONGLIVE_REF}" python3 - <<'PY'
+    && COMFYUI_REF="${COMFYUI_REF}" LONGLIVE_REF="${LONGLIVE_REF}" python3 - <<'PY' \
+    && rm -rf /var/lib/apt/lists/*
 import json
 import os
 import subprocess
@@ -121,7 +181,6 @@ manifest = {
 }
 (comfy / ".af-source-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 PY
-    && rm -rf /var/lib/apt/lists/*
 
 # Character consistency needs IPAdapterAdvanced, which core ComfyUI does not ship.
 # Baked into the image so first boot does not clone on the leased card; the weights
@@ -132,7 +191,8 @@ RUN git init /opt/ComfyUI/custom_nodes/ComfyUI_IPAdapter_plus \
          https://github.com/cubiq/ComfyUI_IPAdapter_plus.git \
     && git -C /opt/ComfyUI/custom_nodes/ComfyUI_IPAdapter_plus fetch --depth 1 origin "${IPADAPTER_PLUS_REF}" \
     && git -C /opt/ComfyUI/custom_nodes/ComfyUI_IPAdapter_plus checkout --detach FETCH_HEAD \
-    && IPADAPTER_PLUS_REF="${IPADAPTER_PLUS_REF}" python3 - <<'PY'
+    && IPADAPTER_PLUS_REF="${IPADAPTER_PLUS_REF}" python3 - <<'PY' \
+    && mkdir -p /opt/ComfyUI/models/ipadapter /opt/ComfyUI/models/clip_vision /opt/ComfyUI/models/visual_qc
 import json
 import os
 import subprocess
@@ -153,7 +213,6 @@ except Exception:
     manifest["ipadapter_sha"] = ""
 manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 PY
-    && mkdir -p /opt/ComfyUI/models/ipadapter /opt/ComfyUI/models/clip_vision /opt/ComfyUI/models/visual_qc
 
 COPY --from=nvfp4 /opt/venv /opt/venv
 COPY --from=nvfp4 /opt/LongLive /opt/LongLive
@@ -172,14 +231,14 @@ RUN chmod +x /usr/local/bin/af-start \
          "Pillow>=10,<12" huggingface_hub boto3 "open_clip_torch==2.32.0" \
          omegaconf einops easydict imageio imageio-ffmpeg av opencv-python-headless \
          ftfy sentencepiece peft "transformers>=4.49.0,<5" "accelerate>=1.1.1" \
-         "diffusers==0.31.0" tqdm "torchao==0.16.0" \
+         "diffusers==0.31.0" tqdm \
     && python3 - <<'PY'
 from pathlib import Path
 import subprocess
 import sys
 
 req = Path("/opt/ComfyUI/requirements.txt")
-skip = {"torch", "torchvision", "torchaudio", "open_clip_torch", "open-clip-torch"}
+skip = {"torch", "torchvision", "torchaudio", "torchao", "open_clip_torch", "open-clip-torch"}
 kept: list[str] = []
 for line in req.read_text(encoding="utf-8").splitlines():
     pkg = line.strip().split("#", 1)[0].strip().split("[", 1)[0].split("==")[0].split(">=")[0].strip().lower()
@@ -204,6 +263,39 @@ if kept:
     )
 PY
 
+# Nothing above may have pulled a different torch in as a transitive dependency,
+# and the runtime stage must stay free of nvcc.
+RUN LONGLIVE_TORCH="${LONGLIVE_TORCH}" LONGLIVE_TORCHVISION="${LONGLIVE_TORCHVISION}" python - <<'PY'
+import os
+import shutil
+import sys
+
+import flash_attn
+import fouroversix  # noqa: F401
+import torch
+import torchvision
+from fouroversix import _C  # noqa: F401
+
+want_torch = os.environ["LONGLIVE_TORCH"] + "+cu128"
+want_tv = os.environ["LONGLIVE_TORCHVISION"] + "+cu128"
+problems = []
+if (sys.version_info.major, sys.version_info.minor) != (3, 12):
+    problems.append(f"python {sys.version}")
+if torch.__version__ != want_torch:
+    problems.append(f"torch {torch.__version__} != {want_torch}")
+if torchvision.__version__ != want_tv:
+    problems.append(f"torchvision {torchvision.__version__} != {want_tv}")
+if torch.version.cuda != "12.8":
+    problems.append(f"torch cuda {torch.version.cuda} != 12.8")
+if not flash_attn.__version__.startswith("2.8.3"):
+    problems.append(f"flash_attn {flash_attn.__version__} != 2.8.3")
+if shutil.which("nvcc"):
+    problems.append("nvcc present in the runtime stage")
+if problems:
+    raise SystemExit("longlive_fail_closed: " + "; ".join(problems))
+print("runtime stack ok:", torch.__version__, torchvision.__version__, flash_attn.__version__)
+PY
+
 ENV PYTHONPATH=/app/python \
     PYTHONUNBUFFERED=1 \
     VAST_DRY_RUN=1 \
@@ -223,6 +315,7 @@ ENV PYTHONPATH=/app/python \
     LONGLIVE_GENERATOR_CKPT=/opt/LongLive/checkpoints/longlive2_5b_nvfp4_s2/model_4o6.pt \
     LONGLIVE_WHEELS=/opt/longlive-wheels \
     LONGLIVE_REF=6b36d20ec6f7958d29d11a704dfa64611a9f2572 \
+    LONGLIVE_NVFP4_SAMPLING_STEPS=2 \
     CUDA_ARCHS=120 \
     OPEN_CLIP_TORCH_VERSION=2.32.0 \
     AF_VISUAL_QC_CLIP_DIR=/opt/ComfyUI/models/visual_qc \

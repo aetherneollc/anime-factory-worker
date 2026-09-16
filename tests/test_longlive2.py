@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.dockerfile_parse import parse_dockerfile
 from anime_factory.compose import SCALE_PAD_FILTER
 from anime_factory.models import VIDEO_HEIGHT, VIDEO_WIDTH
 from anime_factory.longlive_workflow import (
@@ -82,6 +83,10 @@ def test_longlive_short_workflow_schema_and_silent_native():
     validate_longlive_short_workflow(data)
     assert data["silent"] is True
     assert data["audio"] is False
+    # Continuation is i2v from the prior last frame; no KV/latent carry-over claimed.
+    assert data["continuation_mechanism"] == "i2v_first_frame"
+    with pytest.raises(LongLiveWorkflowError, match="continuation_mechanism"):
+        validate_longlive_short_workflow({**data, "continuation_mechanism": "kv_cache"})
     assert data["native_width"] == LONGLIVE_NATIVE_WIDTH == 1280
     assert data["native_height"] == LONGLIVE_NATIVE_HEIGHT == 704
     assert data["compose"]["scale_pad_only"] is True
@@ -135,25 +140,25 @@ def test_scene_change_must_hard_cut():
         )
 
 
-def test_one_model_load_maps_outputs_by_take_id(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        LongLiveBatchRunner,
-        "load_model",
-        lambda self: setattr(self, "pipeline", object())
-        or setattr(self, "model_load_count", 1 if self.model_load_count == 0 else self.model_load_count)
-        or self.pipeline,
-    )
+def _stub_loader(monkeypatch, mode: str = "i2v") -> dict[str, int]:
+    """Replace only the model build; staging, mapping and fail-closed stay real."""
     loads = {"n": 0}
 
-    def load(self):
-        if self.pipeline is not None:
-            return self.pipeline
-        loads["n"] += 1
-        self.pipeline = object()
-        self.model_load_count += 1
+    def load(self, *, takes, workdir):
+        if self.pipeline is None:
+            loads["n"] += 1
+            self.pipeline = object()
+            self.mode = mode
+            self.batch_dir = Path(workdir)
+            self.model_load_count += 1
         return self.pipeline
 
     monkeypatch.setattr(LongLiveBatchRunner, "load_model", load)
+    return loads
+
+
+def test_one_model_load_maps_outputs_by_take_id(tmp_path, monkeypatch):
+    loads = _stub_loader(monkeypatch)
 
     def infer(*, take, dest, **_):
         dest = Path(dest)
@@ -161,12 +166,12 @@ def test_one_model_load_maps_outputs_by_take_id(tmp_path, monkeypatch):
         dest.write_bytes(b"\x00" * 64 + b"ftyp")
         return dest
 
+    (tmp_path / "a.png").write_bytes(b"\x89PNG" + b"x" * 64)
+    (tmp_path / "b.png").write_bytes(b"\x89PNG" + b"x" * 64)
     takes = [
         {"take_id": "take-01", "duration": 8, "h3_prompt": "one", "first_frame_path": str(tmp_path / "a.png")},
         {"take_id": "take-02", "duration": 8, "h3_prompt": "two", "first_frame_path": str(tmp_path / "b.png")},
     ]
-    (tmp_path / "a.png").write_bytes(b"\x89PNG" + b"x" * 64)
-    (tmp_path / "b.png").write_bytes(b"\x89PNG" + b"x" * 64)
     dests = {
         "take-01": tmp_path / "take-01.mp4",
         "take-02": tmp_path / "take-02.mp4",
@@ -183,21 +188,22 @@ def test_one_model_load_maps_outputs_by_take_id(tmp_path, monkeypatch):
     assert marker["h3_downloads"] == 0
 
 
+def test_batch_rejects_ambiguous_dest_mapping(tmp_path, monkeypatch):
+    _stub_loader(monkeypatch)
+    shared = tmp_path / "same.mp4"
+    with pytest.raises(RuntimeError, match="ambiguous"):
+        submit_longlive_batch(
+            [
+                {"take_id": "take-01", "duration": 8, "h3_prompt": "a"},
+                {"take_id": "take-02", "duration": 8, "h3_prompt": "b"},
+            ],
+            {"take-01": shared, "take-02": shared},
+            infer=lambda **_: shared,
+        )
+
+
 def test_batch_fail_closed_without_placeholder(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        LongLiveBatchRunner,
-        "load_model",
-        lambda self: setattr(self, "pipeline", object())
-        or setattr(self, "model_load_count", (self.model_load_count or 0) + (0 if self.pipeline else 0)),
-    )
-
-    def load(self):
-        if self.pipeline is None:
-            self.pipeline = object()
-            self.model_load_count += 1
-        return self.pipeline
-
-    monkeypatch.setattr(LongLiveBatchRunner, "load_model", load)
+    _stub_loader(monkeypatch, mode="t2v")
 
     def infer(**_):
         return None
@@ -241,9 +247,11 @@ def test_run_anim_longlive_one_load_and_native_dims(tmp_path, monkeypatch):
     ]
     monkeypatch.setattr(session, "_board_shots", lambda _root: shots)
 
-    def load(self):
+    def load(self, *, takes, workdir):
         if self.pipeline is None:
             self.pipeline = object()
+            self.mode = "i2v"
+            self.batch_dir = Path(workdir)
             self.model_load_count += 1
         return self.pipeline
 
@@ -355,7 +363,6 @@ def test_dockerfile_longlive_contract():
     assert "12.8.1-devel-ubuntu24.04" in text
     assert "12.8.1-runtime-ubuntu24.04" in text
     assert text.count("FROM nvidia/cuda") == 2
-    assert "torch==2.7.0+cu128" in text
     assert "6b36d20ec6f7958d29d11a704dfa64611a9f2572" in text
     assert "AF_IMAGE_CAPABILITY=longlive" in text
     assert 'org.aetherneo.anime-factory.h3="false"' in text
@@ -374,6 +381,177 @@ def test_dockerfile_longlive_contract():
     assert "longlive" in ll["capabilities"]
     h3 = next(t for t in targets["targets"] if t["id"] == "h3")
     assert "longlive" not in h3["capabilities"]
+
+
+def test_dockerfile_longlive_matches_official_nvfp4_stack():
+    """docs/getting_started.md "NVFP4 Environment" + the NVFP4-S2 model card."""
+    root = Path(__file__).resolve().parents[1]
+    deploy = root / "deploy" / "gpu-worker"
+    text = (deploy / "Dockerfile.longlive").read_text(encoding="utf-8")
+    pins = dict(
+        line.split("=", 1)
+        for line in (deploy / "pins.env").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.startswith("#")
+    )
+    assert pins["LONGLIVE_TORCH"] == "2.10.0+cu128"
+    assert pins["LONGLIVE_TORCHVISION"] == "0.25.0+cu128"
+    assert pins["LONGLIVE_TORCHAO"] == "0.16.0"
+    assert pins["FLASH_ATTN_VERSION"] == "2.8.3"
+    for arg in (
+        "ARG LONGLIVE_TORCH=2.10.0",
+        "ARG LONGLIVE_TORCHVISION=0.25.0",
+        "ARG LONGLIVE_TORCHAO=0.16.0",
+        f"ARG FLASH_ATTN_REF={pins['FLASH_ATTN_REF']}",
+        f"ARG CUTLASS_REF={pins['CUTLASS_REF']}",
+        f"ARG FOUROVERSIX_REF={pins['FOUROVERSIX_REF']}",
+    ):
+        assert arg in text, arg
+    # flash-attn must be compiled, not pulled from a third-party release wheel.
+    assert "Dao-AILab/flash-attention.git" in text
+    assert "FLASH_ATTENTION_FORCE_BUILD=TRUE" in text
+    assert "my-pytorch-builds" not in text
+    assert "FLASH_ATTN_WHEEL_URL" not in text
+    # CUTLASS is pinned rather than taken from a branch tip.
+    assert "NVIDIA/cutlass.git" in text
+    assert "--depth 1 origin \"${CUTLASS_REF}\"" in text
+    # Runtime stage must stay build-tool free and version-locked.
+    assert 'shutil.which("nvcc")' in text
+    assert "longlive_fail_closed" in text
+    assert "LONGLIVE_NVFP4_SAMPLING_STEPS=2" in text
+
+
+def test_dockerfiles_parse_as_buildkit_instructions():
+    """Heredoc bodies must not leave a bare `&&` continuation as a new instruction."""
+    root = Path(__file__).resolve().parents[1]
+    for name in ("Dockerfile", "Dockerfile.longlive"):
+        path = root / "deploy" / "gpu-worker" / name
+        instructions, errors = parse_dockerfile(path)
+        assert not errors, f"{name}: {errors}"
+        assert instructions, name
+        assert instructions[0] == "FROM", name
+
+
+def test_dockerfile_longlive_has_no_trailing_whitespace():
+    root = Path(__file__).resolve().parents[1]
+    for name in ("Dockerfile", "Dockerfile.longlive"):
+        text = (root / "deploy" / "gpu-worker" / name).read_text(encoding="utf-8")
+        offenders = [i + 1 for i, line in enumerate(text.splitlines()) if line != line.rstrip()]
+        assert not offenders, f"{name} trailing whitespace on lines {offenders}"
+        assert text.endswith("\n")
+
+
+def test_inference_config_matches_official_nvfp4_s2_keys(tmp_path, monkeypatch):
+    from gpu_worker import longlive
+
+    monkeypatch.setenv("LONGLIVE_GENERATOR_CKPT", str(tmp_path / "model_4o6.pt"))
+    monkeypatch.delenv("LONGLIVE_LORA_CKPT", raising=False)
+    config = longlive.build_inference_config(
+        data_path=tmp_path / "data",
+        output_folder=tmp_path / "out",
+        seconds=8.0,
+        seed=11,
+        i2v=True,
+    )
+    # Every top-level key must be one normalize_config actually keeps.
+    assert set(config) <= longlive.OFFICIAL_TOP_LEVEL_KEYS
+    assert config["inference"]["sampling_steps"] == 2  # NVFP4-S2 model card
+    assert config["inference"]["independent_first_frame"] is True
+    assert config["i2v"] is True
+    assert config["model_quant"] is True
+    assert config["model_quant_use_transformer_engine"] is False
+    assert config["merge_lora"] is False
+    assert config["torch_compile"] is False
+    assert config["data"]["image_or_video_shape"] == [1, 48, 48, 44, 80]
+    assert config["num_output_frames"] == 48
+    assert "adapter" not in config
+    # T2V must not claim the i2v conditioning flags.
+    t2v = longlive.build_inference_config(
+        data_path=tmp_path / "data",
+        output_folder=tmp_path / "out",
+        seconds=8.0,
+        seed=11,
+        i2v=False,
+    )
+    assert "i2v" not in t2v
+    assert "independent_first_frame" not in t2v["inference"]
+
+
+def test_inference_config_rejects_unknown_keys(tmp_path, monkeypatch):
+    from gpu_worker import longlive
+
+    monkeypatch.setenv("LONGLIVE_GENERATOR_CKPT", str(tmp_path / "model_4o6.pt"))
+    config = longlive.build_inference_config(
+        data_path=tmp_path / "data",
+        output_folder=tmp_path / "out",
+        seconds=8.0,
+        seed=11,
+        i2v=True,
+    )
+    with pytest.raises(RuntimeError, match="official runtime ignores"):
+        longlive.validate_inference_config({**config, "algorithm_i2v": True})
+    with pytest.raises(RuntimeError, match="unknown inference keys"):
+        bad = {**config, "inference": {**config["inference"], "denoise_steps": 2}}
+        longlive.validate_inference_config(bad)
+
+
+def test_lora_on_materialized_nvfp4_fails_closed(tmp_path, monkeypatch):
+    from gpu_worker import longlive
+
+    monkeypatch.setenv("LONGLIVE_GENERATOR_CKPT", str(tmp_path / "model_4o6.pt"))
+    monkeypatch.setenv("LONGLIVE_LORA_CKPT", str(tmp_path / "lora.pt"))
+    with pytest.raises(RuntimeError, match="cannot be applied on top of"):
+        longlive.build_inference_config(
+            data_path=tmp_path / "data",
+            output_folder=tmp_path / "out",
+            seconds=8.0,
+            seed=11,
+            i2v=True,
+        )
+
+
+def test_i2v_staging_uses_official_split_layout(tmp_path):
+    from gpu_worker import longlive
+
+    frame = tmp_path / "kf.png"
+    frame.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 96)
+    data = longlive.write_prompt_job(
+        tmp_path / "data",
+        {"id": "take-01", "h3_prompt": "hero walks", "first_frame_path": str(frame)},
+        i2v=True,
+    )
+    assert (data / "images" / "0.png").is_file()
+    assert (data / "prompts" / "0.txt").read_text(encoding="utf-8").strip()
+    assert not (data / "video").exists()
+    assert longlive.assert_i2v_image_layout(data).name == "0.png"
+    # A video/ subdirectory would hand inference.py to MultiVideoConcatDataset,
+    # which needs 29 RGB frames for the first chunk on Wan 5B.
+    (data / "video").mkdir()
+    with pytest.raises(RuntimeError, match="MultiVideoConcatDataset"):
+        longlive.assert_i2v_image_layout(data)
+    assert longlive.i2v_first_chunk_video_frames() == 29
+
+
+def test_planned_mode_covers_continuation_before_its_frame_exists(tmp_path):
+    from gpu_worker import longlive
+
+    first = {"take_id": "take-01", "keyframe_source": "qc_keyframe"}
+    cont = {"take_id": "take-02", "keyframe_source": "prior_last_frame"}
+    assert longlive.select_longlive_mode(cont) == "t2v"
+    assert longlive.planned_longlive_mode(cont) == "i2v"
+    frame = tmp_path / "kf.png"
+    frame.write_bytes(b"\x89PNG" + b"x" * 64)
+    first["first_frame_path"] = str(frame)
+    assert longlive.batch_longlive_mode([first, cont]) == "i2v"
+    with pytest.raises(RuntimeError, match="mixes i2v and t2v"):
+        longlive.batch_longlive_mode([first, {"take_id": "take-03"}])
+
+
+def test_docker_workflow_budgets_source_cuda_builds():
+    root = Path(__file__).resolve().parents[1]
+    workflow = (root / ".github" / "workflows" / "docker.yml").read_text(encoding="utf-8")
+    # 360 minutes is the GitHub-hosted runner job maximum.
+    assert "timeout-minutes: 360" in workflow
+    assert "swapon" in workflow
 
 
 def test_incremental_r2_skips_existing(tmp_path, monkeypatch):

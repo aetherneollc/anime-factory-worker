@@ -1831,9 +1831,9 @@ def _ensure_last_frame(root: Path, shot: dict, video: Path) -> Path | None:
 
 def _longlive_infer_hook(**kwargs: Any) -> Path:
     """Seam for tests. Production samples with the one loaded NVFP4 pipeline."""
-    from gpu_worker.longlive_batch import infer_with_loaded_pipeline
+    from gpu_worker.longlive_batch import sample_with_loaded_pipeline
 
-    return infer_with_loaded_pipeline(**kwargs)
+    return sample_with_loaded_pipeline(**kwargs)
 
 
 def _run_anim_longlive(
@@ -1961,6 +1961,10 @@ def _run_anim_longlive(
         if int(batch.get("model_load_count") or 0) != 1:
             raise RuntimeError(
                 f"{FAIL_CLOSED}: expected model_load_count==1, got {batch.get('model_load_count')}"
+            )
+        if len(mapped) != len(pending):
+            raise RuntimeError(
+                f"{FAIL_CLOSED}: batch mapped {len(mapped)} of {len(pending)} takes"
             )
         if int(batch.get("h3_downloads") or 0) != 0:
             raise RuntimeError(f"{FAIL_CLOSED}: LongLive path downloaded H3 weights")

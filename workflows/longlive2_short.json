@@ -14,6 +14,7 @@
   "first_take": "qc_keyframe",
   "same_scene_continue": "prior_last_frame",
   "scene_change": "new_keyframe_hard_cut",
+  "continuation_mechanism": "i2v_first_frame",
   "compose": {
     "scale_pad_only": true,
     "delivery_width": 864,

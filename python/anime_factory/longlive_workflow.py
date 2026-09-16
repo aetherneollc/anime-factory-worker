@@ -26,6 +26,11 @@ WORKFLOW_NAME = "longlive2_short"
 SCHEMA_NAME = "longlive2_short"
 LONGLIVE_NATIVE_WIDTH = 1280
 LONGLIVE_NATIVE_HEIGHT = 704
+# A same-scene take continues by conditioning on the previous take's last frame
+# (upstream i2v: one clean first latent). Each take is an independent rollout —
+# CausalDiffusionInferencePipeline.inference resets its KV cache on every call, so
+# there is no latent or attention carry-over between takes to claim.
+CONTINUATION_MECHANISM = "i2v_first_frame"
 
 
 class LongLiveWorkflowError(ValueError):
@@ -50,6 +55,12 @@ def validate_longlive_short_workflow(data: dict[str, Any] | Mapping[str, Any]) -
         raise LongLiveWorkflowError(f"native_height must be {LONGLIVE_NATIVE_HEIGHT}")
     if data.get("audio") or data.get("silent") is False:
         raise LongLiveWorkflowError("longlive2_short output must be silent")
+    if data.get("continuation_mechanism") != CONTINUATION_MECHANISM:
+        raise LongLiveWorkflowError(
+            f"continuation_mechanism must be {CONTINUATION_MECHANISM!r}: takes are "
+            "independent rollouts conditioned on the prior last frame, not a shared "
+            "latent or KV context"
+        )
     if float(data.get("max_take_seconds") or 0) > LONGLIVE_SHORT_MAX_SECONDS + 1e-9:
         raise LongLiveWorkflowError("max_take_seconds must be <= 60")
     compose = data.get("compose") or {}

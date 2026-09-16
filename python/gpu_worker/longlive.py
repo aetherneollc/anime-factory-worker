@@ -34,6 +34,8 @@ LONGLIVE_REF = os.environ.get("LONGLIVE_REF") or "6b36d20ec6f7958d29d11a704dfa64
 LONGLIVE_CKPT_REPO = "Efficient-Large-Model/LongLive-2.0-5B-NVFP4-S2"
 LONGLIVE_CKPT_FILE = "model_4o6.pt"
 LONGLIVE_NVFP4_SAMPLING_STEPS = 2  # S2 distillation; S4 would use 4
+# docs/getting_started.md "NVFP4 Environment": built from source at this tag.
+FLASH_ATTN_VERSION = "2.8.3"
 # Sidecar-only Hub repo. Transformer weights come from LONGLIVE_CKPT_REPO.
 WAN_REPO = "Wan-AI/Wan2.2-TI2V-5B"
 # Files NVlabs inference actually opens. Not the 20GB diffusion_pytorch_model shards.
@@ -56,8 +58,12 @@ WAN_TRANSFORMER_SHARDS = (
 # Wan2.2-TI2V-5B native latent grid 80×44 @ 16× → 1280×704. Delivery scales to 864×480.
 LONGLIVE_NATIVE_WIDTH = 1280
 LONGLIVE_NATIVE_HEIGHT = 704
+# utils/config.py wan_default_config["Wan2.2-TI2V-5B"].
 TEMPORAL_COMPRESSION = 4
+WAN_SPATIAL_COMPRESSION = 16
 NUM_FRAME_PER_BLOCK = 8
+# configs/nvfp4/inference_nvfp4.yaml image_or_video_shape[2].
+LATENT_CHANNELS = 48
 # Official configs/inference.yaml: num_output_frames=384 latent frames ≈ 64s @ 24fps.
 LONGLIVE_DEFAULT_LATENT_FRAMES = 384
 # NVlabs ImagePromptDataset (inference.py i2v branch when data_path has no video/).
@@ -476,6 +482,7 @@ def _install_flash_attn(progress: ProgressCallback | None = None) -> None:
         raise RuntimeError(
             f"{FAIL_CLOSED}: flash-attn missing and nvcc is not on this image. {SETUP_HINT}"
         )
+    env.setdefault("FLASH_ATTN_CUDA_ARCHS", _nvfp4_cuda_archs())
     subprocess.run(
         [
             python_bin(),
@@ -483,7 +490,7 @@ def _install_flash_attn(progress: ProgressCallback | None = None) -> None:
             "pip",
             "install",
             "--no-build-isolation",
-            "flash-attn",
+            f"flash-attn=={FLASH_ATTN_VERSION}",
         ],
         check=True,
         timeout=1800,
@@ -599,6 +606,37 @@ def select_longlive_mode(segment: dict) -> str:
     return "t2v"
 
 
+def planned_longlive_mode(segment: dict) -> str:
+    """Mode a take will run in once its conditioning still has been produced.
+
+    ``independent_first_frame`` is read by ``CausalDiffusionInferencePipeline.__init__``,
+    so it is fixed for the life of the resident pipeline. A same-scene continuation take
+    has no first frame on disk until the preceding take renders, so file existence alone
+    cannot decide the batch mode.
+    """
+    if str(segment.get("keyframe_source") or "") == "prior_last_frame":
+        return "i2v"
+    return select_longlive_mode(segment)
+
+
+def batch_longlive_mode(segments: list[dict]) -> str:
+    """One resident pipeline can only serve one mode. Mixed batches fail closed."""
+    modes = {planned_longlive_mode(seg) for seg in segments}
+    if not modes:
+        raise RuntimeError(f"{FAIL_CLOSED}: longlive batch is empty")
+    if len(modes) > 1:
+        detail = ", ".join(
+            f"{seg.get('take_id') or seg.get('id')}={planned_longlive_mode(seg)}"
+            for seg in segments
+        )
+        raise RuntimeError(
+            f"{FAIL_CLOSED}: longlive batch mixes i2v and t2v ({detail}). "
+            "inference.independent_first_frame is fixed when the pipeline is built, so "
+            "every take in one load must share a mode."
+        )
+    return modes.pop()
+
+
 def i2v_first_chunk_video_frames(
     *,
     num_frame_per_block: int = NUM_FRAME_PER_BLOCK,
@@ -606,7 +644,7 @@ def i2v_first_chunk_video_frames(
 ) -> int:
     """RGB frames MultiVideoConcatDataset demands for the first chunk (Wan 5B: 29).
 
-    Official I2V does not need that source video: inference.py uses ImagePromptDataset
+    Official I2V does not need that source video: inference.py picks ImagePromptDataset
     when data_path has no ``video/`` subdirectory, conditioning on a single still.
     """
     first_chunk_latent_frames = max(1, int(num_frame_per_block))
@@ -824,7 +862,233 @@ def longlive_status() -> dict[str, Any]:
 
 def _latent_hw(width: int, height: int) -> tuple[int, int]:
     """Wan 2.2 TI2V-5B spatial compression is 16×."""
-    return max(1, height // 16), max(1, width // 16)
+    return max(1, height // WAN_SPATIAL_COMPRESSION), max(1, width // WAN_SPATIAL_COMPRESSION)
+
+
+# utils/config.py SECTION_KEYS — normalize_config flattens exactly these into the
+# runtime namespace. Emitting any other mapping as a top-level section would be
+# silently dropped instead of reaching the pipeline.
+OFFICIAL_SECTION_KEYS = (
+    "infra",
+    "algorithm",
+    "training",
+    "data",
+    "evaluation",
+    "inference",
+    "logging",
+    "checkpoints",
+)
+# Flat keys read by inference.py / CausalDiffusionInferencePipeline / setup_nvfp4_pipeline
+# at LONGLIVE_REF, restricted to what this worker actually sets.
+OFFICIAL_TOP_LEVEL_KEYS = frozenset(
+    {
+        "model_kwargs",
+        "use_ema",
+        "output_folder",
+        "num_samples",
+        "save_latents_only",
+        "save_with_index",
+        "inference_iter",
+        "num_output_frames",
+        "merge_lora",
+        "i2v",
+        "model_quant",
+        "model_quant_use_transformer_engine",
+        "model_quant_te_inference_only",
+        "model_quant_te_low_precision_weights",
+        "model_quant_te_fallback_to_fouroversix",
+        "model_quant_scale_rule",
+        "model_quant_activation_scale_rule",
+        "model_quant_weight_scale_rule",
+        "model_quant_gradient_scale_rule",
+        "torch_compile",
+        "adapter",
+        *OFFICIAL_SECTION_KEYS,
+    }
+)
+OFFICIAL_MODEL_KWARGS_KEYS = frozenset(
+    {"model_name", "timestep_shift", "num_frame_per_block", "local_attn_size", "sink_size"}
+)
+OFFICIAL_DATA_KEYS = frozenset({"data_path", "image_or_video_shape"})
+OFFICIAL_INFERENCE_KEYS = frozenset(
+    {
+        "sampling_steps",
+        "independent_first_frame",
+        "sink_size",
+        "guidance_scale",
+        "multi_shot_sink",
+        "multi_shot_rope_offset",
+        "kv_quant",
+        "kv_quant_scale_rule",
+        "kv_quant_backend",
+        "streaming_vae",
+        "async_vae",
+        "vae_type",
+    }
+)
+
+
+def build_inference_config(
+    *,
+    data_path: Path,
+    output_folder: Path,
+    seconds: float,
+    seed: int,
+    i2v: bool,
+) -> dict[str, Any]:
+    """Build the NVFP4 S2 inference config as a dict.
+
+    Mirrors configs/nvfp4/inference_i2v_nvfp4.yaml at LONGLIVE_REF with the
+    Efficient-Large-Model/LongLive-2.0-5B-NVFP4-S2 model-card overrides:
+    ``sampling_steps: 2`` and ``model_quant_use_transformer_engine: false``
+    (model_4o6.pt is a materialized FourOverSix checkpoint).
+    """
+    width, height = longlive_spatial_size()
+    latent_h, latent_w = _latent_hw(width, height)
+    frames = longlive_num_output_frames(seconds)
+    ckpt = _assert_nvfp4_generator()
+    lora = lora_ckpt()
+    config: dict[str, Any] = {
+        "model_kwargs": {
+            "model_name": WAN_ARCH_NAME,
+            "timestep_shift": 5.0,
+            "num_frame_per_block": NUM_FRAME_PER_BLOCK,
+            "local_attn_size": 32,
+            "sink_size": 8,
+        },
+        "use_ema": False,
+        "output_folder": str(output_folder),
+        "num_samples": 1,
+        "save_latents_only": False,
+        "save_with_index": True,
+        "inference_iter": -1,
+        "num_output_frames": frames,
+        "merge_lora": False,
+        "data": {
+            "data_path": str(data_path),
+            "image_or_video_shape": [1, frames, LATENT_CHANNELS, latent_h, latent_w],
+        },
+        "inference": {
+            "sampling_steps": nvfp4_sampling_steps(),
+            "sink_size": 8,
+            "guidance_scale": 1.0,
+            "multi_shot_sink": True,
+            "multi_shot_rope_offset": 8,
+            "kv_quant": True,
+            "kv_quant_scale_rule": "mse",
+            "kv_quant_backend": "cuda",
+            "streaming_vae": False,
+            "async_vae": False,
+            "vae_type": "wan",
+        },
+        "checkpoints": {"generator_ckpt": str(ckpt)},
+        "model_quant": True,
+        "model_quant_use_transformer_engine": False,
+        "model_quant_te_inference_only": True,
+        "model_quant_te_low_precision_weights": True,
+        "model_quant_te_fallback_to_fouroversix": False,
+        "model_quant_scale_rule": "mse",
+        "model_quant_activation_scale_rule": "mse",
+        "model_quant_weight_scale_rule": "mse",
+        "model_quant_gradient_scale_rule": "mse",
+        # max-autotune warm-up costs minutes and we sample few, long takes.
+        "torch_compile": False,
+        "logging": {"seed": int(seed)},
+    }
+    if i2v:
+        config["i2v"] = True
+        # Required so the clean conditioning latent can be clamped every step.
+        config["inference"]["independent_first_frame"] = True
+    if lora is not None:
+        # setup_nvfp4_pipeline ignores lora_ckpt/adapter for a materialized FourOverSix
+        # checkpoint because the master weights are already quantized away. Emitting the
+        # adapter section anyway would claim a LoRA that never gets applied.
+        raise RuntimeError(
+            f"{FAIL_CLOSED}: LONGLIVE_LORA_CKPT={lora} cannot be applied on top of "
+            f"{LONGLIVE_CKPT_FILE}; upstream drops LoRA for materialized NVFP4 weights. "
+            "Use a BF16 base checkpoint if a LoRA is required."
+        )
+    validate_inference_config(config)
+    return config
+
+
+def validate_inference_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Reject keys normalize_config would drop, and enforce the NVFP4 S2 contract."""
+    unknown = sorted(set(config) - OFFICIAL_TOP_LEVEL_KEYS)
+    if unknown:
+        raise RuntimeError(
+            f"{FAIL_CLOSED}: inference config has keys the official runtime ignores: {unknown}"
+        )
+    for section, allowed in (
+        ("model_kwargs", OFFICIAL_MODEL_KWARGS_KEYS),
+        ("data", OFFICIAL_DATA_KEYS),
+        ("inference", OFFICIAL_INFERENCE_KEYS),
+    ):
+        extra = sorted(set(config.get(section) or {}) - allowed)
+        if extra:
+            raise RuntimeError(f"{FAIL_CLOSED}: unknown {section} keys: {extra}")
+    steps = int(config["inference"]["sampling_steps"])
+    if steps != nvfp4_sampling_steps():
+        raise RuntimeError(
+            f"{FAIL_CLOSED}: NVFP4 S2 needs sampling_steps={nvfp4_sampling_steps()}, got {steps}"
+        )
+    if config.get("model_quant") is not True:
+        raise RuntimeError(f"{FAIL_CLOSED}: model_quant must be true for {LONGLIVE_CKPT_FILE}")
+    if config.get("model_quant_use_transformer_engine") is not False:
+        raise RuntimeError(
+            f"{FAIL_CLOSED}: {LONGLIVE_CKPT_FILE} is a FourOverSix checkpoint; "
+            "model_quant_use_transformer_engine must be false"
+        )
+    shape = list(config["data"]["image_or_video_shape"])
+    frames = int(config["num_output_frames"])
+    if len(shape) != 5 or shape[1] != frames or shape[2] != LATENT_CHANNELS:
+        raise RuntimeError(
+            f"{FAIL_CLOSED}: image_or_video_shape {shape} must be "
+            f"[1, {frames}, {LATENT_CHANNELS}, h, w]"
+        )
+    if frames % NUM_FRAME_PER_BLOCK != 0:
+        raise RuntimeError(
+            f"{FAIL_CLOSED}: num_output_frames={frames} must be a multiple of "
+            f"num_frame_per_block={NUM_FRAME_PER_BLOCK}"
+        )
+    if bool(config.get("i2v")) != bool(config["inference"].get("independent_first_frame")):
+        raise RuntimeError(
+            f"{FAIL_CLOSED}: i2v requires inference.independent_first_frame and vice versa"
+        )
+    return config
+
+
+def _yaml_scalar(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value) if isinstance(value, float) else str(value)
+    text = str(value)
+    needs_quotes = (
+        text == ""
+        or text != text.strip()
+        or text[0] in "&*!|>%@`'\"[{"
+        or ": " in text
+        or " #" in text
+    )
+    if needs_quotes:
+        return "'" + text.replace("'", "''") + "'"
+    return text
+
+
+def _yaml_lines(data: dict[str, Any], indent: int = 0) -> list[str]:
+    pad = " " * indent
+    lines: list[str] = []
+    for key, value in data.items():
+        if isinstance(value, dict):
+            lines.append(f"{pad}{key}:")
+            lines.extend(_yaml_lines(value, indent + 2))
+        elif isinstance(value, list):
+            lines.append(f"{pad}{key}:")
+            lines.extend(f"{pad}- {_yaml_scalar(item)}" for item in value)
+        else:
+            lines.append(f"{pad}{key}: {_yaml_scalar(value)}")
+    return lines
 
 
 def write_inference_yaml(
@@ -836,85 +1100,14 @@ def write_inference_yaml(
     seed: int,
     i2v: bool,
 ) -> Path:
-    width, height = longlive_spatial_size()
-    latent_h, latent_w = _latent_hw(width, height)
-    frames = longlive_num_output_frames(seconds)
-    ckpt = _assert_nvfp4_generator()
-    lora = lora_ckpt()
-    steps = nvfp4_sampling_steps()
-    lines = [
-        "model_kwargs:",
-        f"  model_name: {WAN_ARCH_NAME}",
-        "  timestep_shift: 5.0",
-        f"  num_frame_per_block: {NUM_FRAME_PER_BLOCK}",
-        "  local_attn_size: 32",
-        "  sink_size: 8",
-        "use_ema: false",
-        f"output_folder: {output_folder}",
-        "num_samples: 1",
-        "save_latents_only: false",
-        "save_with_index: true",
-        f"num_output_frames: {frames}",
-        "merge_lora: false",
-        f"data_path: {data_path}",
-        "data:",
-        f"  data_path: {data_path}",
-        "  image_or_video_shape:",
-        "  - 1",
-        f"  - {frames}",
-        "  - 48",
-        f"  - {latent_h}",
-        f"  - {latent_w}",
-        "inference:",
-        f"  sampling_steps: {steps}",
-        *(
-            ["  independent_first_frame: true"]
-            if i2v
-            else []
-        ),
-        "  sink_size: 8",
-        "  guidance_scale: 1.0",
-        "  multi_shot_sink: true",
-        "  multi_shot_rope_offset: 8",
-        "  kv_quant: true",
-        "  kv_quant_scale_rule: mse",
-        "  kv_quant_backend: cuda",
-        "  streaming_vae: false",
-        "  async_vae: false",
-        "  vae_type: wan",
-        "checkpoints:",
-        f"  generator_ckpt: {ckpt}",
-        "model_quant: true",
-        "model_quant_use_transformer_engine: false",
-        "model_quant_te_inference_only: true",
-        "model_quant_te_low_precision_weights: true",
-        "model_quant_te_fallback_to_fouroversix: false",
-        "model_quant_scale_rule: mse",
-        "model_quant_activation_scale_rule: mse",
-        "model_quant_weight_scale_rule: mse",
-        "model_quant_gradient_scale_rule: mse",
-        "torch_compile: false",
-        "i2v: " + ("true" if i2v else "false"),
-        "algorithm:",
-        "  i2v: " + ("true" if i2v else "false"),
-        "  independent_first_frame: " + ("true" if i2v else "false"),
-        "logging:",
-        f"  seed: {int(seed)}",
-    ]
-    if lora is not None and lora.is_file():
-        ckpt_idx = lines.index("checkpoints:")
-        lines.insert(ckpt_idx + 2, f"  lora_ckpt: {lora}")
-        lines.extend(
-            [
-                "adapter:",
-                "  type: lora",
-                "  rank: 128",
-                "  alpha: 128",
-                "  dropout: 0.0",
-                "  dtype: bfloat16",
-            ]
-        )
-    dest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    config = build_inference_config(
+        data_path=data_path,
+        output_folder=output_folder,
+        seconds=seconds,
+        seed=seed,
+        i2v=i2v,
+    )
+    dest.write_text("\n".join(_yaml_lines(config)) + "\n", encoding="utf-8")
     return dest
 
 
@@ -926,9 +1119,11 @@ def write_prompt_job(
 ) -> Path:
     """Official inference data_path: prompts.txt (T2V) or images/+prompts/ (I2V).
 
-    Do not write ``video/``. That selects MultiVideoConcatDataset, which samples
-    ``first_chunk_frames`` (29 RGB frames on Wan 5B) from source mp4s and raises
-    ``ValueError: no video can provide the first chunk`` for a still / 1-frame clip.
+    The I2V "split" layout (``images/<stem>.png`` + ``prompts/<stem>.txt``) is the
+    upstream ImagePromptDataset contract, documented in configs/inference_i2v.yaml and
+    docs/getting_started.md. Do not write ``video/``: that switches inference.py to
+    MultiVideoConcatDataset, which samples ``first_chunk_frames`` (29 RGB frames on
+    Wan 5B) out of source mp4s and cannot be fed by a single still.
     """
     workdir.mkdir(parents=True, exist_ok=True)
     leftover_video = workdir / "video"
@@ -942,11 +1137,17 @@ def write_prompt_job(
     first = Path(str(segment.get("first_frame_path") or ""))
     if not first.is_file() or first.stat().st_size < MIN_I2V_STILL_BYTES:
         raise RuntimeError(f"longlive i2v {segment.get('id') or '?'} missing first_frame_path")
+    suffix = first.suffix.lower()
+    if suffix not in I2V_IMAGE_EXTENSIONS:
+        raise RuntimeError(
+            f"longlive i2v {segment.get('id') or '?'} first frame {first.name} is not one of "
+            f"{', '.join(I2V_IMAGE_EXTENSIONS)}"
+        )
     images = workdir / "images"
     prompts_dir = workdir / "prompts"
     images.mkdir(parents=True, exist_ok=True)
     prompts_dir.mkdir(parents=True, exist_ok=True)
-    dest = images / "0.png"
+    dest = images / f"0{suffix}"
     shutil.copy2(first, dest)
     if dest.stat().st_size < MIN_I2V_STILL_BYTES:
         raise RuntimeError(f"longlive i2v {segment.get('id') or '?'} staged empty first frame")
@@ -954,13 +1155,6 @@ def write_prompt_job(
     (prompts_dir / "0.txt").write_text(text + "\n", encoding="utf-8")
     assert_i2v_image_layout(workdir)
     return workdir
-
-
-def _find_output_mp4(folder: Path) -> Path | None:
-    if not folder.is_dir():
-        return None
-    videos = sorted(folder.rglob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
-    return videos[0] if videos else None
 
 
 def submit_longlive(
@@ -971,73 +1165,33 @@ def submit_longlive(
     progress: ProgressCallback | None = None,
     run: bool = True,
 ) -> dict[str, Any]:
-    """Run official inference.py. Raises if weights/repo are missing — never fakes dest."""
-    _ = root  # callers stage first_frame onto the segment before submit
-    missing = missing_longlive_requirements()
-    if missing:
-        raise RuntimeError(f"{FAIL_CLOSED}: longlive not ready: " + "; ".join(missing) + ". " + SETUP_HINT)
-    _assert_nvfp4_generator()
-    _ensure_wan_layout()
-    dest = Path(dest)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    workdir = dest.parent / f".longlive-{segment.get('id') or 'shot'}"
-    if workdir.exists():
-        shutil.rmtree(workdir, ignore_errors=True)
-    workdir.mkdir(parents=True, exist_ok=True)
-    mode = select_longlive_mode(segment)
-    data_path = write_prompt_job(workdir / "data", segment, i2v=mode == "i2v")
-    out_dir = workdir / "out"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    yaml_path = write_inference_yaml(
-        workdir / "inference.yaml",
-        data_path=data_path,
-        output_folder=out_dir,
-        seconds=float(segment.get("duration") or 8.0),
-        seed=int(segment.get("seed") or 11),
-        i2v=mode == "i2v",
-    )
-    if not run:
-        return {"shot": segment.get("id"), "mode": mode, "yaml": str(yaml_path), "skipped": "dry_run"}
-    if progress:
-        progress(f"anim:{segment.get('id')}")
-    timeout = float(os.environ.get("LONGLIVE_SHOT_TIMEOUT_S") or 2400)
-    cmd = [python_bin(), str(longlive_root() / "inference.py"), "--config_path", str(yaml_path)]
-    from gpu_worker.stack import stop_comfy_for_longlive
+    """Sample one shot with a freshly loaded resident pipeline.
 
-    stop_comfy_for_longlive()
-    _install_torch_mmap_sitecustomize()
-    print(
-        {
-            "longlive_cmd": cmd,
-            "cwd": str(longlive_root()),
-            "mode": mode,
-            "seconds": float(segment.get("duration") or 8.0),
-            "frames": longlive_num_output_frames(float(segment.get("duration") or 8.0)),
-        },
-        flush=True,
-    )
-    try:
-        # Stream inference.py so the card logs prove this is LongLive, not H3.
-        subprocess.run(
-            cmd,
-            check=True,
-            cwd=str(longlive_root()),
-            timeout=timeout,
-            env=_longlive_inference_env(),
+    This is the single-shot entry point; episode production uses
+    ``submit_longlive_batch`` so one load covers every take. Either way the official
+    pipeline object does the sampling — nothing spawns ``inference.py``.
+    """
+    _ = root  # callers stage first_frame onto the segment before submit
+    from gpu_worker.longlive_batch import submit_longlive_batch
+
+    dest = Path(dest)
+    mode = select_longlive_mode(segment)
+    if not run:
+        workdir = dest.parent / f".longlive-{segment.get('id') or 'shot'}"
+        if workdir.exists():
+            shutil.rmtree(workdir, ignore_errors=True)
+        workdir.mkdir(parents=True, exist_ok=True)
+        yaml_path = write_inference_yaml(
+            workdir / "inference.yaml",
+            data_path=write_prompt_job(workdir / "data", segment, i2v=mode == "i2v"),
+            output_folder=workdir / "out",
+            seconds=float(segment.get("duration") or 8.0),
+            seed=int(segment.get("seed") or 11),
+            i2v=mode == "i2v",
         )
-    except subprocess.CalledProcessError as exc:
-        if is_longlive_fatal_error(exc) or exc.returncode in (-9, 9, 137):
-            raise RuntimeError(
-                f"{FAIL_CLOSED}: inference SIGKILL/exit {exc.returncode} for {segment.get('id')} "
-                f"(T5/VAE/generator exploded the cgroup, or fouroversix missing). {SETUP_HINT}"
-            ) from exc
-        raise RuntimeError(
-            f"{FAIL_CLOSED}: longlive inference failed {segment.get('id')}: exit {exc.returncode}. {SETUP_HINT}"
-        ) from exc
-    produced = _find_output_mp4(out_dir)
-    if produced is None or produced.stat().st_size < 32:
-        raise RuntimeError(f"longlive produced no video for {segment.get('id')}. {SETUP_HINT}")
-    shutil.copy2(produced, dest)
+        return {"shot": segment.get("id"), "mode": mode, "yaml": str(yaml_path), "skipped": "dry_run"}
+    take_id = str(segment.get("take_id") or segment.get("id") or "shot")
+    submit_longlive_batch([{**segment, "take_id": take_id}], {take_id: dest}, progress=progress)
     last_rel = dest.with_name("last.png")
     try:
         extract_last_frame(dest, last_rel)

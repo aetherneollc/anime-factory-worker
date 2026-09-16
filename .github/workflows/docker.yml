@@ -43,7 +43,10 @@ jobs:
   docker:
     needs: matrix
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # The longlive target compiles FlashAttention 2.8.3, FourOverSix and the
+    # LongLive KV-dequant extension from source for SM 12.0. 360 minutes is the
+    # GitHub-hosted runner maximum and the only budget that fits those builds.
+    timeout-minutes: 360
     if: needs.matrix.outputs.targets != '[]'
     strategy:
       fail-fast: false
@@ -65,6 +68,17 @@ jobs:
           sudo docker image prune --all --force || true
           echo "Disk after cleanup:"
           df -h
+
+      # nvcc peaks well above the 16 GB runner RAM with MAX_JOBS=2 x NVCC_THREADS=2.
+      # Swap keeps the CUDA extension builds from being OOM-killed mid-compile.
+      - name: Add build swap
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 16G /mnt/buildswap
+          sudo chmod 600 /mnt/buildswap
+          sudo mkswap /mnt/buildswap
+          sudo swapon /mnt/buildswap
+          free -h
 
       - uses: docker/setup-buildx-action@v3
 
