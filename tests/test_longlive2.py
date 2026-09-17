@@ -617,11 +617,16 @@ def test_planned_mode_covers_continuation_before_its_frame_exists(tmp_path):
 def test_docker_workflow_reuses_moss_and_pinned_wheels():
     root = Path(__file__).resolve().parents[1]
     workflow = (root / ".github" / "workflows" / "docker.yml").read_text(encoding="utf-8")
+    makefile = (root / "Makefile").read_text(encoding="utf-8")
     assert "deploy/gpu-worker/Dockerfile.moss" in workflow
     assert "MOSS_IMAGE=" in workflow
     assert "timeout-minutes: 90" in workflow
     assert "timeout-minutes: 360" not in workflow
     assert "needs: [matrix, moss]" in workflow
+    assert "Dockerfile.moss" in makefile
+    assert "MOSS_CHECK_IMAGE" in makefile
+    assert "--build-arg MOSS_IMAGE=" in makefile
+    assert "nvidia/cuda:12.8.1-runtime-ubuntu24.04" in makefile
 
 
 def test_incremental_r2_skips_existing(tmp_path, monkeypatch):
