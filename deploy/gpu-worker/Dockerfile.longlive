@@ -101,13 +101,12 @@ PY
 
 RUN mkdir -p /opt/longlive-wheels \
     && /tmp/fetch_pinned_wheel.sh "${FOUROVERSIX_WHEEL_URL}" \
-         /opt/longlive-wheels/fouroversix.whl "${FOUROVERSIX_WHEEL_SHA256}" \
+         /opt/longlive-wheels "${FOUROVERSIX_WHEEL_SHA256}" \
     && /tmp/fetch_pinned_wheel.sh "${FLASH_ATTN_WHEEL_URL}" \
-         /opt/longlive-wheels/flash_attn.whl "${FLASH_ATTN_WHEEL_SHA256}" \
-    && pip install --no-cache-dir --no-deps /opt/longlive-wheels/fouroversix.whl \
-         /opt/longlive-wheels/flash_attn.whl \
-    && FLASH_ATTN_VERSION="${FLASH_ATTN_VERSION}" python - <<'PY' \
-    && rm -rf /root/.cache /tmp/fetch_pinned_wheel.sh /tmp/* /var/tmp/*
+         /opt/longlive-wheels "${FLASH_ATTN_WHEEL_SHA256}" \
+    && pip install --no-cache-dir --no-deps /opt/longlive-wheels/*.whl
+
+RUN FLASH_ATTN_VERSION="${FLASH_ATTN_VERSION}" python - <<'PY'
 import importlib.metadata as im
 import os
 

@@ -431,6 +431,8 @@ def test_dockerfile_longlive_uses_pinned_release_wheels():
     )
     fetch = (deploy / "fetch_pinned_wheel.sh").read_text(encoding="utf-8")
     assert "sha256sum --check --strict" in fetch
+    assert "urllib.parse.unquote" in fetch
+    assert "not a valid wheel filename" in fetch
     assert "FORCE_BUILD=1" not in text
     assert "FLASH_ATTENTION_FORCE_BUILD" not in text
     assert "Dao-AILab/flash-attention.git" not in text
@@ -438,7 +440,10 @@ def test_dockerfile_longlive_uses_pinned_release_wheels():
     assert pins["FOUROVERSIX_WHEEL_SHA256"] in text
     assert pins["FLASH_ATTN_WHEEL_SHA256"] in text
     assert "fetch_pinned_wheel.sh" in text
-    assert "importlib.metadata" in text.split("fouroversix.whl", 1)[1]
+    assert "/opt/longlive-wheels/fouroversix.whl" not in text
+    assert "/opt/longlive-wheels/flash_attn.whl" not in text
+    assert "pip install --no-cache-dir --no-deps /opt/longlive-wheels/*.whl" in text
+    assert "importlib.metadata" in text
 
 
 def test_dockerfile_longlive_runtime_skips_cuda_extension_import():
