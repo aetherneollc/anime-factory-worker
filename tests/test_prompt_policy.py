@@ -2,6 +2,7 @@ import pytest
 
 from anime_factory.board import PromptCollapseError, SpeakerFrameError, assert_shot_prompt_diversity, assert_speaker_matches_frame
 from anime_factory.design import (
+    _extract_wiki_identity,
     build_scene_plate_payload,
     CharacterIdentityError,
     FRONT_LOOK,
@@ -11,6 +12,7 @@ from anime_factory.design import (
     identity_conditioned_negative,
     plan_library_specs,
     sanitize_location_prompt,
+    seed_cast_from_story_root,
     style_prompt,
     synthetic_still_png,
     validate_character_identity,
@@ -180,6 +182,120 @@ def test_plan_library_specs_uses_plate_prompt_when_name_is_cjk():
     scene = next(v for v in specs.values() if v["kind"] == "scene_plate")
     assert plate in scene["prompt"]
     assert "便利店" not in scene["prompt"]
+
+
+def test_extract_wiki_identity_from_chinese_markdown_labels():
+    identity = (
+        "1girl, young adult, 24 y/o, shoulder-length straight black hair, amber eyes, "
+        "navy coat over white shirt, slim build, silver portable field recorder"
+    )
+    wiki = f"""# 林澄
+
+- **编号**：`lin_cheng`
+- **身份**：{identity}
+"""
+    extracted = _extract_wiki_identity(wiki)
+    assert extracted == identity
+    assert "编号" not in extracted
+    assert "林澄" not in extracted
+    validated = validate_character_identity(extracted, character_id="lin_cheng", name="林澄")
+    assert validated.startswith("1girl")
+    assert "navy coat" in validated.lower()
+
+
+def test_extract_wiki_identity_strips_chinese_labels_from_r2_example():
+    """longlive-3-1b9bd1 wiki: labels are CJK but the 身份 value is English."""
+    wiki = """# 林澄
+
+- **编号**：`lin_cheng`
+- **身份**：1girl, young adult, 24 y/o, shoulder-length straight black hair, amber eyes, fixed ivory raincoat, navy scarf, slim build, silver portable field recorder
+"""
+    extracted = _extract_wiki_identity(wiki)
+    assert extracted.startswith("1girl")
+    assert "编号" not in extracted
+    assert "身份" not in extracted
+    assert "林澄" not in extracted
+    assert not any("\u4e00" <= ch <= "\u9fff" for ch in extracted)
+    validated = validate_character_identity(extracted, character_id="lin_cheng", name="林澄")
+    assert "ivory raincoat" in validated.lower()
+    assert "navy scarf" in validated.lower()
+
+
+def test_extract_wiki_identity_rejects_cjk_identity_value():
+    wiki = """# 周野
+
+- **编号**：`zhou_ye`
+- **身份**：年轻男性，黑色短发，琥珀色眼睛，象牙色雨衣
+"""
+    extracted = _extract_wiki_identity(wiki)
+    assert "年轻" in extracted
+    with pytest.raises(CharacterIdentityError, match="English-only"):
+        validate_character_identity(extracted, character_id="zhou_ye", name="周野")
+
+
+def test_seed_cast_from_story_root_accepts_chinese_wiki_labels(tmp_path):
+    from anime_factory.db import migrate, open_db
+
+    wiki_dir = tmp_path / "canon" / "wiki" / "characters"
+    wiki_dir.mkdir(parents=True)
+    wiki_dir.joinpath("lin_cheng.md").write_text(
+        """# 林澄
+
+- **编号**：`lin_cheng`
+- **身份**：1girl, young adult, 24 y/o, shoulder-length straight black hair, amber eyes, fixed ivory raincoat, navy scarf, slim build, silver portable field recorder
+""",
+        encoding="utf-8",
+    )
+    conn = open_db(tmp_path / "story.sqlite")
+    migrate(conn)
+    result = seed_cast_from_story_root(conn, tmp_path)
+    assert result["characters"] == 1
+    row = conn.execute(
+        "SELECT id, name, identity_prompt FROM characters WHERE id = ?",
+        ("lin_cheng",),
+    ).fetchone()
+    assert row is not None
+    assert row["name"] == "林澄"
+    assert row["identity_prompt"].startswith("1girl")
+
+
+def test_seed_cast_from_story_root_rejects_cjk_wiki_identity(tmp_path):
+    from anime_factory.db import migrate, open_db
+
+    wiki_dir = tmp_path / "canon" / "wiki" / "characters"
+    wiki_dir.mkdir(parents=True)
+    wiki_dir.joinpath("zhou_ye.md").write_text(
+        """# 周野
+
+- **编号**：`zhou_ye`
+- **身份**：年轻男性，黑色短发，琥珀色眼睛，象牙色雨衣
+""",
+        encoding="utf-8",
+    )
+    conn = open_db(tmp_path / "story.sqlite")
+    migrate(conn)
+    result = seed_cast_from_story_root(conn, tmp_path)
+    assert result["characters"] == 0
+    row = conn.execute("SELECT id FROM characters WHERE id = ?", ("zhou_ye",)).fetchone()
+    assert row is None
+
+
+def test_seed_cast_from_story_root_plain_english_wiki_fallback(tmp_path):
+    from anime_factory.db import migrate, open_db
+
+    wiki_dir = tmp_path / "canon" / "wiki" / "characters"
+    wiki_dir.mkdir(parents=True)
+    wiki_dir.joinpath("hero.md").write_text(
+        "# Hero\n\n1boy, young adult, short black hair, brown eyes, grey hoodie, lean build",
+        encoding="utf-8",
+    )
+    conn = open_db(tmp_path / "story.sqlite")
+    migrate(conn)
+    result = seed_cast_from_story_root(conn, tmp_path)
+    assert result["characters"] == 1
+    row = conn.execute("SELECT identity_prompt FROM characters WHERE id = ?", ("hero",)).fetchone()
+    assert row is not None
+    assert row["identity_prompt"].startswith("1boy")
 
 
 def test_character_identity_fails_closed_without_structure():

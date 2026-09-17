@@ -126,13 +126,13 @@ _HAIR_RE = re.compile(
 )
 _EYES_RE = re.compile(r"\b(eyes?|iris|heterochromia|eye color)\b", re.I)
 _CLOTHING_RE = re.compile(
-    r"\b(jacket|coat|uniform|dress|shirt|hoodie|skirt|armor|suit|clothes|clothing|robe|vest|sweater|blouse|trousers|pants)\b",
+    r"\b(raincoat|jacket|coat|uniform|dress|shirt|hoodie|skirt|armor|suit|clothes|clothing|robe|vest|sweater|blouse|trousers|pants|scarf|harness|boots|shoes|build|frame|physique|slim|athletic)\b",
     re.I,
 )
 _CLOTHING_COLOR_RE = re.compile(
-    r"\b(navy|black|white|grey|gray|brown|red|blue|green|pink|purple|gold|silver|tan|beige|khaki|dark|light)\s+"
-    r"(?:(?:hooded|wool|zip-up|zipped|denim|leather|canvas|straight-leg|cropped|oversized|padded|plain|quilted)\s+)*"
-    r"(jacket|coat|hoodie|shirt|dress|uniform|armor|suit|robe|pants|trousers|sweater|blouse|vest)\b",
+    r"\b(navy|black|white|ivory|charcoal|orange|grey|gray|brown|red|blue|green|pink|purple|gold|silver|tan|beige|khaki|dark|light)\s+"
+    r"(?:(?:rescue|safety|utility|hooded|wool|zip-up|zipped|denim|leather|canvas|straight-leg|cropped|oversized|padded|plain|quilted)\s+)*"
+    r"(raincoat|jacket|coat|hoodie|shirt|dress|uniform|armor|suit|robe|pants|trousers|sweater|blouse|vest|scarf|harness|boots|shoes)\b",
     re.I,
 )
 _JACKET_RE = re.compile(r"\b(jacket)\b", re.I)
@@ -154,7 +154,15 @@ DERIVE_SKIP_MARKERS = (
     "手背",
 )
 _COSTUME_PATTERNS = (
-    (re.compile(r"wet|soaked|雨|湿透|淋湿", re.I), "wet", "rain-soaked clothes, wet cloak and hair, same face"),
+    (
+        re.compile(
+            r"rain[- ]soaked|soaked\s+(?:clothes|coat|jacket|shirt|hair)|"
+            r"wet\s+(?:clothes|coat|jacket|shirt|hair)|湿透|淋湿",
+            re.I,
+        ),
+        "wet",
+        "rain-soaked clothes, wet cloak and hair, same face",
+    ),
     (re.compile(r"校服|制服|school uniform", re.I), "uniform", "school uniform, same face"),
     (re.compile(r"礼服|婚纱|formal dress|evening gown", re.I), "formal", "formal dress, same face"),
     (re.compile(r"战斗服|盔甲|armor|battle outfit", re.I), "battle", "battle outfit, same face"),
@@ -1820,6 +1828,72 @@ def generate_asset_library(
 
 _WIKI_ID_RE = re.compile(r"编号[`*：:\s]*`+([^`]+)`+", re.I)
 _AT_LOC_RE = re.compile(r"@([A-Za-z][A-Za-z0-9_]*)")
+_WIKI_IDENTITY_LABELS = (
+    "身份",
+    "identity_prompt",
+    "identity prompt",
+    "visual_lock_prompt",
+    "visual lock prompt",
+    "identity",
+    "visual_lock",
+    "visual lock",
+    "appearance",
+)
+_WIKI_ID_LABELS = ("编号", "character_id", "character id", "id")
+
+
+def _unwrap_wiki_inline(value: str) -> str:
+    out = str(value or "").strip()
+    if out.startswith("`") and out.endswith("`"):
+        return out.strip("`").strip()
+    return out
+
+
+def _normalize_wiki_bullet(line: str) -> str:
+    stripped = str(line or "").strip()
+    stripped = re.sub(r"^[-*]\s+", "", stripped)
+    stripped = re.sub(r"^\d+\.\s+", "", stripped)
+    return stripped.replace("**", "").strip()
+
+
+def _wiki_field_value(normalized: str) -> tuple[str, str] | None:
+    lowered = normalized.lower()
+    for label in _WIKI_IDENTITY_LABELS:
+        for sep in ("：", ":"):
+            prefix = f"{label}{sep}"
+            if lowered.startswith(prefix.lower()):
+                return ("identity", _unwrap_wiki_inline(normalized[len(prefix) :].strip()))
+    for label in _WIKI_ID_LABELS:
+        for sep in ("：", ":"):
+            prefix = f"{label}{sep}"
+            if lowered.startswith(prefix.lower()):
+                return ("id", "")
+    return None
+
+
+def _extract_wiki_identity(text: str) -> str:
+    """Pull English visual lock from labeled wiki bullets; legacy body fallback stays English-only."""
+    labeled = ""
+    for line in str(text or "").splitlines():
+        norm = _normalize_wiki_bullet(line)
+        if not norm or norm.startswith("#"):
+            continue
+        field = _wiki_field_value(norm)
+        if field and field[0] == "identity" and field[1]:
+            labeled = field[1]
+            break
+    if labeled:
+        return labeled
+    parts: list[str] = []
+    for line in str(text or "").splitlines():
+        norm = _normalize_wiki_bullet(line)
+        if not norm or norm.startswith("#"):
+            continue
+        field = _wiki_field_value(norm)
+        if field and field[0] == "id":
+            continue
+        parts.append(norm)
+    return " ".join(parts).strip()
 
 
 def _wiki_title(text: str, fallback: str) -> str:
@@ -1928,13 +2002,13 @@ def seed_cast_from_story_root(conn: sqlite3.Connection, story_root: Path | None)
             if not cid:
                 continue
             names[cid] = _wiki_title(text, cid)
-            body = " ".join(line.strip() for line in text.splitlines() if not line.strip().startswith("#"))
-            if body:
+            identity_raw = _extract_wiki_identity(text)
+            if identity_raw:
                 # 240 chars cut the wiki description off mid-sentence, so the sheet
                 # prompt lost hair/clothing detail. SDXL still reads ~1000.
                 try:
                     identities[cid] = validate_character_identity(
-                        body[:IDENTITY_PROMPT_MAX_CHARS],
+                        identity_raw[:IDENTITY_PROMPT_MAX_CHARS],
                         character_id=cid,
                         name=names[cid],
                     )

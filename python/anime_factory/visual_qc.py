@@ -44,13 +44,13 @@ NAVY_TORSO_LUMA_MAX = 150.0
 # Khaki/olive joggers on live 6454ab7 sheets sat at luma ~133–182 in this crop.
 BLACK_PANTS_LUMA_MAX = 110.0
 _GARMENT_MODIFIERS = (
-    r"(?:(?:hooded|wool|zip-up|zipped|denim|leather|canvas|straight-leg|"
+    r"(?:(?:rescue|safety|utility|hooded|wool|zip-up|zipped|denim|leather|canvas|straight-leg|"
     r"cropped|oversized|padded|plain|quilted)\s+)*"
 )
 _GARMENT_COLOR_RE = re.compile(
-    rf"\b(navy|black|white|grey|gray|brown|red|blue|green|pink|purple|gold|silver|tan|beige|khaki|dark|light)\s+"
+    rf"\b(navy|black|white|ivory|charcoal|orange|grey|gray|brown|red|blue|green|pink|purple|gold|silver|tan|beige|khaki|dark|light)\s+"
     rf"{_GARMENT_MODIFIERS}"
-    rf"(jacket|hoodie|coat|shirt|pants|trousers|sneakers|shoes)\b",
+    rf"(raincoat|jacket|hoodie|coat|shirt|pants|trousers|scarf|harness|boots|sneakers|shoes)\b",
     re.I,
 )
 CLASS_MARGIN_MIN = 0.04
@@ -603,6 +603,9 @@ def identity_attribute_probes(identity: str, *, view: str = "front") -> list[dic
     elif "coat" in garments:
         color = garments["coat"]
         probes.append({"id": "top", "pos": f"{color} coat", "neg": "white hoodie, grey hoodie"})
+    elif "raincoat" in garments:
+        color = garments["raincoat"]
+        probes.append({"id": "top", "pos": f"{color} raincoat", "neg": "dark jacket, grey hoodie"})
     pants_color = garments.get("pants") or garments.get("trousers")
     if pants_color:
         if pants_color == "black":
@@ -803,7 +806,7 @@ def score_still(
 
     if require_clip and semantic == "character":
         garments = parse_garment_colors(alignment_text or prompt_text)
-        jacket_color = garments.get("jacket") or garments.get("coat")
+        jacket_color = garments.get("jacket") or garments.get("coat") or garments.get("raincoat")
         if jacket_color in {"navy", "dark", "blue"}:
             red, green, blue = _torso_mean_rgb(image)
             luma = 0.299 * red + 0.587 * green + 0.114 * blue

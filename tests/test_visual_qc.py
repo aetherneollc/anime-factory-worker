@@ -450,6 +450,16 @@ def test_hooded_jacket_and_straight_leg_trousers_parse_colors():
     assert "olive pants" in pants["neg"]
 
 
+def test_ivory_raincoat_and_safety_harness_parse_live_identity():
+    identity = (
+        "1girl, young adult, shoulder-length black hair, amber eyes, "
+        "fixed ivory raincoat, navy scarf, orange safety harness, slim build"
+    )
+    probes = identity_attribute_probes(identity, view="front")
+    top = next(item for item in probes if item["id"] == "top")
+    assert "ivory raincoat" in top["pos"]
+
+
 def test_navy_torso_ok_rejects_cream_hoodie_luma():
     from anime_factory.visual_qc import navy_torso_ok
 

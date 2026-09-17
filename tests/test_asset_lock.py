@@ -297,6 +297,33 @@ def test_expressions_are_not_derived(tmp_path):
     assert specs == {}
 
 
+def test_wet_location_wording_does_not_create_character_costumes(tmp_path):
+    ep = tmp_path / "episodes" / "EP001"
+    ep.mkdir(parents=True)
+    (ep / "script.json").write_text(
+        json.dumps(
+            {
+                "scenes": [
+                    {
+                        "id": "sc1",
+                        "location_id": "harbor",
+                        "lines": [
+                            {
+                                "character_id": "hero",
+                                "prompt": "hero waits on a wet reflective platform after rain",
+                            }
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    chars, locs, _props, _interiors = harbor_mvp_cast()
+    specs = plan_derive_specs(chars, locs, tmp_path)
+    assert not any(spec.get("costume_id") == "wet" for spec in specs.values())
+
+
 def test_gate3_fail_closed_without_locked_sheet(tmp_path):
     conn = open_db(tmp_path / "s.sqlite")
     migrate(conn)
