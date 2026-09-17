@@ -7,6 +7,7 @@ They must not set waiting_for_human / human_gate.
 
 from __future__ import annotations
 
+import filecmp
 import json
 import sqlite3
 from pathlib import Path
@@ -22,6 +23,14 @@ from anime_factory.models import H3_MAX_RETRIES, VIDEO_FPS, VIDEO_HEIGHT, VIDEO_
 H3_FRAME_GRID = 17
 H3_FRAME_OFFSET = 5
 
+# LongLive native Wan2.2-TI2V-5B output (1280×704 @ 24fps). Mirrors gpu_worker.longlive;
+# anime_factory must not import gpu_worker.
+LONGLIVE_NATIVE_WIDTH = 1280
+LONGLIVE_NATIVE_HEIGHT = 704
+LONGLIVE_TEMPORAL_COMPRESSION = 4
+LONGLIVE_NUM_FRAME_PER_BLOCK = 8
+LONGLIVE_MODES = frozenset({"i2v", "t2v"})
+
 
 def h3_grid_frames(seconds: float) -> int:
     """Frames H3 actually renders for a requested duration."""
@@ -33,6 +42,26 @@ def h3_grid_frames(seconds: float) -> int:
 
 def h3_grid_step_seconds() -> float:
     return H3_FRAME_GRID / float(VIDEO_FPS)
+
+
+def longlive_latent_frames(seconds: float) -> int:
+    """Latent frames for Wan 4× temporal compression, snapped to the AR block size."""
+    video_frames = max(5, int(round(float(seconds) * VIDEO_FPS)))
+    latents = (video_frames - 1) // LONGLIVE_TEMPORAL_COMPRESSION + 1
+    while latents % LONGLIVE_NUM_FRAME_PER_BLOCK != 0:
+        latents += 1
+    return max(LONGLIVE_NUM_FRAME_PER_BLOCK, latents)
+
+
+def longlive_video_frames(seconds: float) -> int:
+    """Video frames implied by longlive_latent_frames (Wan 4× temporal, 24fps)."""
+    latents = longlive_latent_frames(seconds)
+    return max(1, (latents - 1) * LONGLIVE_TEMPORAL_COMPRESSION + 1)
+
+
+def longlive_duration_step_seconds() -> float:
+    """One 8-latent block → 32 video frames @ 24fps."""
+    return (LONGLIVE_NUM_FRAME_PER_BLOCK * LONGLIVE_TEMPORAL_COMPRESSION) / float(VIDEO_FPS)
 
 
 def record_qc(
@@ -59,15 +88,25 @@ def record_qc(
     return int(cur.lastrowid)
 
 
-def deterministic_check(meta: dict, segment_duration: float) -> tuple[str, dict]:
+def deterministic_check(
+    meta: dict,
+    segment_duration: float,
+    used_mode: str | None = None,
+) -> tuple[str, dict]:
     issues = []
-    if meta.get("width") != VIDEO_WIDTH or meta.get("height") != VIDEO_HEIGHT:
+    mode = str(used_mode or "")
+    if mode in LONGLIVE_MODES:
+        exp_w, exp_h = LONGLIVE_NATIVE_WIDTH, LONGLIVE_NATIVE_HEIGHT
+        expected_frames = longlive_video_frames(segment_duration)
+        duration_tol = longlive_duration_step_seconds() + 1e-6
+    else:
+        exp_w, exp_h = VIDEO_WIDTH, VIDEO_HEIGHT
+        expected_frames = h3_grid_frames(segment_duration)
+        duration_tol = h3_grid_step_seconds() + 1e-6
+    if meta.get("width") != exp_w or meta.get("height") != exp_h:
         issues.append("resolution")
-    expected_frames = h3_grid_frames(segment_duration)
     if meta.get("frames") is not None and abs(meta["frames"] - expected_frames) > 1:
         issues.append("frames")
-    # The clip is as long as the grid made it, so duration tolerance is one grid step.
-    duration_tol = h3_grid_step_seconds() + 1e-6
     if meta.get("duration") is not None and abs(meta["duration"] - segment_duration) > duration_tol:
         issues.append("duration")
     if meta.get("size_bytes", 10**9) < 4096:
@@ -106,7 +145,7 @@ def identity_qc(segment: dict, used_mode: str | None = None) -> tuple[str, dict]
         if not first:
             issues.append("chain_break")
         if has_char_ref:
-            if mode != "ref2va":
+            if mode not in {"ref2va", "i2v"}:
                 issues.append("chain_dropped_refs")
             if not refs:
                 issues.append("missing_character_refs")
@@ -135,13 +174,13 @@ def _same_frame(left: str | None, right: str | None) -> bool:
     if str(left) == str(right):
         return True
     a, b = Path(str(left)), Path(str(right))
-    if a.name == b.name:
-        return True
     try:
-        if a.exists() and b.exists() and a.resolve() == b.resolve():
-            return True
+        if a.is_file() and b.is_file():
+            return a.resolve() == b.resolve() or filecmp.cmp(a, b, shallow=False)
     except OSError:
         return False
+    if a.name == b.name:
+        return True
     return a.name in str(b) or b.name in str(a)
 
 
@@ -178,7 +217,7 @@ def incremental_qc_segment(
     prev_segment: dict | None = None,
     used_mode: str | None = None,
 ) -> str:
-    d_verdict, d_details = deterministic_check(meta, duration)
+    d_verdict, d_details = deterministic_check(meta, duration, used_mode)
     record_qc(conn, episode_code, segment_id, "deterministic", d_verdict, d_details)
     record_qc(conn, episode_code, segment_id, "text", "pass", {"dialogue_unchanged": True})
     merged = dict(visual_details or {"frames": ["first", "mid", "last"]})

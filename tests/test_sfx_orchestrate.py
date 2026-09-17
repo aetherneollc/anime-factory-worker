@@ -97,6 +97,29 @@ def test_freesound_miss_falls_back_to_moss_and_persists(tmp_path):
     assert "audio/sfx" in row["r2_key"]
 
 
+def test_prepare_releases_video_gpu_once_before_moss_fallbacks(tmp_path):
+    fs_client = FreesoundClient("k", opener=_fs_opener([], {}))
+    moss_client = MossSoundEffectClient(
+        config=MossRunnerConfig("py", "script.py", str(tmp_path / "weights")),
+        runner=_moss_runner_writing(voiced_dummy_wav(1.0, freq=410.0)),
+    )
+    handoffs: list[str] = []
+    out = prepare_episode_sfx(
+        [
+            {"id": "s001", "duration": 2.0, "sfx": [{"key": "a", "query": "sound a", "duration_s": 1.0}]},
+            {"id": "s002", "duration": 2.0, "sfx": [{"key": "b", "query": "sound b", "duration_s": 1.0}]},
+        ],
+        tmp_path,
+        "EP001",
+        freesound_client=fs_client,
+        moss_client=moss_client,
+        before_moss=lambda: handoffs.append("released"),
+    )
+    assert handoffs == ["released"]
+    assert len(out["sfx_clips"]) == 2
+    assert {result.provenance.source for result in out["results"].values()} == {"moss"}
+
+
 def test_both_sources_fail_raises_resolution_error(tmp_path, monkeypatch):
     for key in ("MOSS_SFX_PYTHON", "MOSS_SFX_SCRIPT", "MOSS_SFX_WEIGHTS_DIR"):
         monkeypatch.delenv(key, raising=False)

@@ -178,11 +178,13 @@ def test_one_model_load_maps_outputs_by_take_id(tmp_path, monkeypatch):
         "take-01": tmp_path / "take-01.mp4",
         "take-02": tmp_path / "take-02.mp4",
     }
-    out = submit_longlive_batch(takes, dests, infer=infer)
+    runner = LongLiveBatchRunner()
+    out = submit_longlive_batch(takes, dests, infer=infer, runner=runner)
     assert out["model_load_count"] == 1
     assert loads["n"] == 1
     assert out["h3_downloads"] == 0
     assert out["native_audio"] is False
+    assert runner.pipeline is None  # release VRAM before an isolated MOSS-SFX process
     assert out["outputs"]["take-01"].endswith("take-01.mp4")
     assert out["outputs"]["take-02"].endswith("take-02.mp4")
     marker = json.loads((tmp_path / "longlive_batch.json").read_text(encoding="utf-8"))
@@ -364,7 +366,7 @@ def test_dockerfile_longlive_contract():
     text = (root / "deploy" / "gpu-worker" / "Dockerfile.longlive").read_text(encoding="utf-8")
     assert "12.8.1-devel-ubuntu24.04" in text
     assert "12.8.1-runtime-ubuntu24.04" in text
-    assert text.count("FROM nvidia/cuda") == 2
+    assert text.count("FROM nvidia/cuda") == 3
     assert "6b36d20ec6f7958d29d11a704dfa64611a9f2572" in text
     assert "AF_IMAGE_CAPABILITY=longlive" in text
     assert 'org.aetherneo.anime-factory.h3="false"' in text
@@ -376,6 +378,8 @@ def test_dockerfile_longlive_contract():
     assert "huggingface-cli download" not in text
     assert "model_4o6.pt" in text  # path env, not a baked COPY
     assert "COPY --from=nvfp4" in text
+    assert "COPY --from=moss-sfx /opt/moss-sfx /opt/moss-sfx" in text
+    assert "MOSS_SFX_PYTHON=/opt/moss-sfx/bin/python3.12" in text
     targets = json.loads((root / "deploy" / "docker-targets.json").read_text(encoding="utf-8"))
     ll = next(t for t in targets["targets"] if t["id"] == "longlive")
     assert ll["enabled"] is True

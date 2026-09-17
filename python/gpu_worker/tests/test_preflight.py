@@ -555,3 +555,35 @@ def test_handshake_register_and_heartbeat_include_audit(monkeypatch):
     assert register_body["capabilities"]["image_digest"] == digest
     assert register_body["adaptations"][0]["result"] == "ok"
     assert register_body["preflight"]["ok"] is True
+
+
+def test_register_body_includes_longlive_video_backend(monkeypatch):
+    from gpu_worker import __main__ as worker_main
+
+    seen = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"ok": true}'
+
+    def open_control(req, timeout):
+        seen.append((req.full_url, req.data))
+        return Response()
+
+    monkeypatch.setenv("CONTROL_PLANE_URL", "https://control.example")
+    monkeypatch.setenv("AF_IMAGE_CAPABILITY", "longlive")
+    monkeypatch.setenv("AF_VIDEO_BACKEND", "longlive")
+    monkeypatch.setattr(worker_main.urllib.request, "urlopen", open_control)
+    events = worker_main.maybe_notify_control_plane("5090-1", "idle", register=True)
+    assert events == ["register", "heartbeat"]
+    register_body = json.loads(seen[0][1].decode("utf-8"))
+    caps = register_body["capabilities"]
+    assert caps["longlive"] is True
+    assert caps["h3"] is False
+    assert caps["video_backend"] == "longlive"

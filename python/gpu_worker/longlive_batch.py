@@ -9,6 +9,7 @@ Missing output fails closed; never write a placeholder mp4.
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import shutil
@@ -136,6 +137,26 @@ class LongLiveBatchRunner:
         self.inference_calls += 1
         return produced
 
+    def release_model(self) -> None:
+        """Release LongLive VRAM before a separate MOSS-SFX process may start."""
+        pipeline = self.pipeline
+        self.pipeline = None
+        self.api = None
+        self.config = None
+        self.device = None
+        del pipeline
+        gc.collect()
+        try:
+            import torch
+
+            cuda = getattr(torch, "cuda", None)
+            if cuda is not None and callable(getattr(cuda, "is_available", None)) and cuda.is_available():
+                cuda.empty_cache()
+        except (AttributeError, ImportError, RuntimeError):
+            # CPU contract tests do not install torch; a torn-down CUDA context
+            # can also reject cleanup after an earlier fail-closed inference.
+            pass
+
     def infer_take(
         self,
         take: dict[str, Any],
@@ -226,38 +247,43 @@ def submit_longlive_batch(
 
     session = runner or LongLiveBatchRunner()
     first_dest = Path(dests[take_ids[0]])
-    session.load_model(takes=takes, workdir=first_dest.parent / ".longlive-batch")
-    if session.model_load_count != 1:
-        raise RuntimeError(
-            f"{FAIL_CLOSED}: expected model_load_count==1, got {session.model_load_count}"
-        )
-    loaded_pipeline = session.pipeline
+    loaded_pipeline: Any = None
+    try:
+        session.load_model(takes=takes, workdir=first_dest.parent / ".longlive-batch")
+        if session.model_load_count != 1:
+            raise RuntimeError(
+                f"{FAIL_CLOSED}: expected model_load_count==1, got {session.model_load_count}"
+            )
+        loaded_pipeline = session.pipeline
 
-    mapped: dict[str, dict[str, Any]] = {}
-    outputs: dict[str, str] = {}
-    for take, take_id in zip(takes, take_ids):
-        if progress:
-            progress(f"anim:{take_id}")
-        result = session.infer_take(take, Path(dests[take_id]), run=infer)
-        mapped[take_id] = result
-        outputs[take_id] = result["path"]
-        if session.pipeline is not loaded_pipeline:
-            raise RuntimeError(f"{FAIL_CLOSED}: pipeline object changed during take {take_id}")
-    if session.model_load_count != 1:
-        raise RuntimeError(
-            f"{FAIL_CLOSED}: model reloaded during batch ({session.model_load_count})"
-        )
-    instrument = {
-        "model_load_count": session.model_load_count,
-        "inference_calls": session.inference_calls,
-        "h3_downloads": session.h3_downloads,
-        "mode": session.mode,
-        "take_ids": take_ids,
-        "outputs": outputs,
-        "native_audio": False,
-        "backend": "longlive",
-    }
-    marker = first_dest.parent / INSTRUMENT_NAME
-    marker.write_text(json.dumps(instrument, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps({"longlive_batch": instrument}, ensure_ascii=False), flush=True)
-    return {"ok": True, "mapped": mapped, **instrument}
+        mapped: dict[str, dict[str, Any]] = {}
+        outputs: dict[str, str] = {}
+        for take, take_id in zip(takes, take_ids):
+            if progress:
+                progress(f"anim:{take_id}")
+            result = session.infer_take(take, Path(dests[take_id]), run=infer)
+            mapped[take_id] = result
+            outputs[take_id] = result["path"]
+            if session.pipeline is not loaded_pipeline:
+                raise RuntimeError(f"{FAIL_CLOSED}: pipeline object changed during take {take_id}")
+        if session.model_load_count != 1:
+            raise RuntimeError(
+                f"{FAIL_CLOSED}: model reloaded during batch ({session.model_load_count})"
+            )
+        instrument = {
+            "model_load_count": session.model_load_count,
+            "inference_calls": session.inference_calls,
+            "h3_downloads": session.h3_downloads,
+            "mode": session.mode,
+            "take_ids": take_ids,
+            "outputs": outputs,
+            "native_audio": False,
+            "backend": "longlive",
+        }
+        marker = first_dest.parent / INSTRUMENT_NAME
+        marker.write_text(json.dumps(instrument, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps({"longlive_batch": instrument}, ensure_ascii=False), flush=True)
+        return {"ok": True, "mapped": mapped, **instrument}
+    finally:
+        loaded_pipeline = None
+        session.release_model()

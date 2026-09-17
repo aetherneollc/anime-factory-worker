@@ -1671,7 +1671,21 @@ def test_compose_uploads_video_and_subtitles_to_episode_prefix(tmp_path, monkeyp
         )
     monkeypatch.setattr(session, "collect_shot_paths", lambda *_args: [("s001", str(shot))])
     monkeypatch.setattr(session, "_board_shots", lambda _root: [])
-    monkeypatch.setattr(session, "mix_dialogue_timeline", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        session,
+        "prepare_episode_sfx",
+        lambda *_args, **_kwargs: {
+            "sfx_clips": [],
+            "ambience_clips": [],
+            "sfx_cues": [],
+            "results": {},
+        },
+    )
+    monkeypatch.setattr(
+        session,
+        "compose_episode_audio",
+        lambda *_args, **_kwargs: ({}, SimpleNamespace(sfx=(), episode_code="EP001")),
+    )
     monkeypatch.setattr(
         session,
         "build_compose_plan",
@@ -1743,14 +1757,30 @@ def _compose_harness(tmp_path, monkeypatch, pairs, shots):
         lambda command, **_kwargs: commands.append(list(command)),
     )
     captured: dict[str, object] = {}
+    prepare_calls: list[tuple] = []
 
-    def mixer(_work, _ep, mixed_shots, **kwargs):
+    def prepare_stub(passed_shots, passed_root, episode_code, **kwargs):
+        prepare_calls.append((passed_shots, passed_root, episode_code, kwargs))
+        captured["prepare_root"] = passed_root
+        return {
+            "sfx_clips": [],
+            "ambience_clips": [],
+            "sfx_cues": [],
+            "results": {},
+        }
+
+    def compose_stub(_work, _ep, mixed_shots, **kwargs):
         captured["shots"] = [dict(s) for s in mixed_shots]
         captured["clip_durations"] = dict(kwargs.get("clip_durations") or {})
         captured["video_paths"] = list(kwargs.get("video_paths") or [])
-        return {}
+        captured["sfx_clips"] = list(kwargs.get("sfx_clips") or [])
+        captured["ambience_clips"] = list(kwargs.get("ambience_clips") or [])
+        captured["sfx_cues"] = list(kwargs.get("sfx_cues") or [])
+        return ({}, SimpleNamespace(sfx=(), episode_code=_ep))
 
-    monkeypatch.setattr(session, "mix_dialogue_timeline", mixer)
+    monkeypatch.setattr(session, "prepare_episode_sfx", prepare_stub)
+    monkeypatch.setattr(session, "compose_episode_audio", compose_stub)
+    captured["prepare_calls"] = prepare_calls
     monkeypatch.setattr(
         session,
         "build_compose_plan",
@@ -1825,6 +1855,132 @@ def test_compose_pairs_shots_to_clips_by_id_not_position(tmp_path, monkeypatch):
     assert [Path(p).parent.name for p in captured["video_paths"]] == ["s001", "s003"]
 
 
+def test_run_compose_integrates_prepare_episode_sfx_into_compose_audio(tmp_path, monkeypatch):
+    """Board SFX prep uses story root; compose receives clips/cues; cue-less boards still compose."""
+    monkeypatch.setattr(session, "EP", "EP001")
+    shots = [{"id": "s001", "duration": 8.0}]
+    clip = tmp_path / "episodes" / "EP001" / "shots" / "s001" / "generation-001.mp4"
+    clip.parent.mkdir(parents=True, exist_ok=True)
+    clip.write_bytes(b"x" * 5000)
+    pairs = [("s001", "episodes/EP001/shots/s001/generation-001.mp4")]
+    final = tmp_path / "episodes" / "EP001" / "final"
+    final.mkdir(parents=True)
+    (final / "EP001.zh.mp4").write_bytes(b"video")
+    (final / "EP001.zh.srt").write_bytes(b"srt")
+
+    monkeypatch.setattr(session, "collect_shot_paths", lambda *_args: pairs)
+    monkeypatch.setattr(session, "_board_shots", lambda _root: shots)
+    monkeypatch.setattr(session, "_probe_video", lambda _path: {"duration": 8.0})
+    monkeypatch.setattr(
+        session, "_probe_audio", lambda _path: {"has_audio_stream": False, "audio_rms": 0.0}
+    )
+    monkeypatch.setattr(
+        session,
+        "fit_clip_durations_to_speech",
+        lambda _work, _shots, _langs, durations: dict(durations),
+    )
+    monkeypatch.setattr(session, "_run_checked", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        session,
+        "build_compose_plan",
+        lambda *_args, **_kwargs: SimpleNamespace(encode=[], muxes=[], srt_outputs=[]),
+    )
+    monkeypatch.setattr(
+        session, "put_file", lambda key, _path, _content_type: {"ok": True, "key": key}
+    )
+
+    fake_sfx = {
+        "sfx_clips": [(1.0, b"RIFFfake")],
+        "ambience_clips": [(0.0, b"RIFFbed")],
+        "sfx_cues": [
+            {
+                "cue_key": "door1",
+                "bus": "sfx",
+                "onset_s": 1.0,
+                "duration_s": 0.5,
+                "shared": False,
+            }
+        ],
+        "results": {
+            "door1": SimpleNamespace(
+                status="resolved",
+                provenance=SimpleNamespace(source="freesound", cached=True),
+            )
+        },
+    }
+    prepare_args: list[tuple] = []
+
+    def prepare_stub(passed_shots, passed_root, episode_code, **kwargs):
+        prepare_args.append((passed_shots, passed_root, episode_code, kwargs))
+        return fake_sfx
+
+    compose_calls: list[dict] = []
+
+    def compose_stub(work, ep, _mixed_shots, **kwargs):
+        compose_calls.append({"work": work, "ep": ep, "kwargs": dict(kwargs)})
+        timeline = SimpleNamespace(
+            sfx=(SimpleNamespace(cue_key="door1"),),
+            episode_code=ep,
+        )
+        return ({"zh": str(work / "audio" / "master.zh.wav")}, timeline)
+
+    monkeypatch.setattr(session, "prepare_episode_sfx", prepare_stub)
+    monkeypatch.setattr(session, "compose_episode_audio", compose_stub)
+
+    result = session.run_compose("story-1", tmp_path, object(), langs=("zh",))
+
+    assert len(prepare_args) == 1
+    _shots, passed_root, ep_code, kw = prepare_args[0]
+    assert passed_root == tmp_path
+    assert passed_root != tmp_path / "episodes" / "EP001"
+    assert ep_code == "EP001"
+    assert kw.get("story_id") == "story-1"
+    assert "clip_durations" in kw
+    assert callable(kw.get("before_moss"))
+
+    assert len(compose_calls) == 1
+    ck = compose_calls[0]["kwargs"]
+    assert ck["sfx_clips"] == fake_sfx["sfx_clips"]
+    assert ck["ambience_clips"] == fake_sfx["ambience_clips"]
+    assert ck["sfx_cues"] == fake_sfx["sfx_cues"]
+    assert compose_calls[0]["work"] == tmp_path / "episodes" / "EP001"
+
+    assert result["sfx"]["sfx_clip_count"] == 1
+    assert result["sfx"]["ambience_clip_count"] == 1
+    assert result["sfx"]["sfx_event_count"] == 1
+    assert result["sfx"]["timeline_path"] == "audio/timeline.json"
+    assert result["sfx"]["resolved_cues"] == [
+        {"cue_key": "door1", "source": "freesound", "cached": True}
+    ]
+
+    # Cue-less boards: empty orchestrator output still composes.
+    prepare_args.clear()
+    compose_calls.clear()
+
+    def empty_prepare_stub(passed_shots, passed_root, episode_code, **kwargs):
+        prepare_args.append((passed_shots, passed_root, episode_code, kwargs))
+        return {
+            "sfx_clips": [],
+            "ambience_clips": [],
+            "sfx_cues": [],
+            "results": {},
+        }
+
+    def empty_compose_stub(work, ep, _mixed_shots, **kwargs):
+        compose_calls.append(dict(kwargs))
+        return ({}, SimpleNamespace(sfx=(), episode_code=ep))
+
+    monkeypatch.setattr(session, "prepare_episode_sfx", empty_prepare_stub)
+    monkeypatch.setattr(session, "compose_episode_audio", empty_compose_stub)
+
+    no_cue = session.run_compose("story-1", tmp_path, object(), langs=("zh",))
+    assert compose_calls[0]["sfx_clips"] == []
+    assert compose_calls[0]["ambience_clips"] == []
+    assert compose_calls[0]["sfx_cues"] == []
+    assert no_cue["sfx"]["sfx_clip_count"] == 0
+    assert no_cue["sfx"]["resolved_cues"] == []
+
+
 def test_compose_blocks_when_no_clip_matches_a_board_segment(tmp_path, monkeypatch):
     from anime_factory.compose import MissingShotError
 
@@ -1879,7 +2035,21 @@ def test_compose_refuses_silent_missing_subtitle(tmp_path, monkeypatch):
     (final / "EP001.zh.mp4").write_bytes(b"video")
     monkeypatch.setattr(session, "collect_shot_paths", lambda *_args: [("s001", str(shot))])
     monkeypatch.setattr(session, "_board_shots", lambda _root: [])
-    monkeypatch.setattr(session, "mix_dialogue_timeline", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        session,
+        "prepare_episode_sfx",
+        lambda *_args, **_kwargs: {
+            "sfx_clips": [],
+            "ambience_clips": [],
+            "sfx_cues": [],
+            "results": {},
+        },
+    )
+    monkeypatch.setattr(
+        session,
+        "compose_episode_audio",
+        lambda *_args, **_kwargs: ({}, SimpleNamespace(sfx=(), episode_code="EP001")),
+    )
     monkeypatch.setattr(
         session,
         "build_compose_plan",

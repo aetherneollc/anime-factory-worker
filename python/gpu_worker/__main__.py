@@ -77,6 +77,8 @@ def maybe_notify_control_plane(
                 "capabilities": {
                     "comfy": bool(caps.get("comfy")),
                     "h3": bool(caps.get("h3")),
+                    "longlive": bool(caps.get("longlive")),
+                    "video_backend": caps.get("video_backend") or "",
                     "kolors": bool(caps.get("kolors")),
                     "image_gen": bool(caps.get("image_gen")),
                     "agent": True,

@@ -29,12 +29,13 @@ from anime_factory.compose import (
     chain_overlap_frames,
     collect_shot_paths,
     collect_shots,
+    compose_episode_audio,
     drop_first_frames_cmd,
     extend_clip_cmd,
     fit_clip_durations_to_speech,
-    mix_dialogue_timeline,
     write_srt,
 )
+from anime_factory.sfx_orchestrate import prepare_episode_sfx
 from anime_factory.db import checkpoint_and_upload, migrate, open_db, utcnow
 from anime_factory.design import KolorsClient
 from anime_factory.directors.common import hydrate_shot_identity, is_chain_head, needs_first_frame_still
@@ -2041,6 +2042,7 @@ def _run_anim_longlive(
         last_path = _ensure_last_frame(root, take, src)
         idx = take.get("_index")
         if last_path is not None and idx is not None:
+            shots[int(idx)]["last_frame_path"] = str(last_path)
             _link_longlive_continuation(shots, int(idx), last_path)
             nxt_idx = int(idx) + 1
             if nxt_idx < len(shots):
@@ -2050,6 +2052,9 @@ def _run_anim_longlive(
                     if str(item.get("take_id") or item.get("id") or "") == nxt_tid:
                         item["first_frame_path"] = nxt.get("first_frame_path")
                         break
+        prev_segment: dict[str, Any] | None = None
+        if idx is not None and int(idx) > 0:
+            prev_segment = dict(shots[int(idx) - 1])
         cpu.submit(
             _longlive_cpu_post,
             story_id,
@@ -2058,6 +2063,7 @@ def _run_anim_longlive(
             take,
             src,
             last_path,
+            prev_segment,
             progress,
         )
         return src
@@ -2116,6 +2122,7 @@ def _longlive_cpu_post(
     take: dict[str, Any],
     dest: Path,
     last_path: Path | None,
+    prev_segment: dict[str, Any] | None,
     progress: ProgressCallback | None,
 ) -> str:
     sid = str(take.get("id") or take.get("take_id") or "")
@@ -2133,7 +2140,7 @@ def _longlive_cpu_post(
         meta,
         float(take.get("duration") or 8.0),
         segment=take,
-        prev_segment=None,
+        prev_segment=prev_segment,
         used_mode=used_mode,
     )
     try:
@@ -2574,7 +2581,16 @@ def run_compose(
             if sid:
                 clip_durations[sid] = shot["duration"]
         local = trimmed
-    mixed = mix_dialogue_timeline(
+    sfx_prepared = prepare_episode_sfx(
+        shots,
+        root,
+        EP,
+        story_id=story_id,
+        conn=conn,
+        clip_durations=clip_durations or None,
+        before_moss=stop_comfy_for_longlive,
+    )
+    mixed, timeline = compose_episode_audio(
         work,
         EP,
         shots,
@@ -2583,7 +2599,21 @@ def run_compose(
         clip_durations=clip_durations or None,
         video_paths=local,
         audio_metas=audio_metas,
+        sfx_clips=sfx_prepared["sfx_clips"],
+        ambience_clips=sfx_prepared["ambience_clips"],
+        sfx_cues=sfx_prepared["sfx_cues"],
     )
+    sfx_results = sfx_prepared.get("results") or {}
+    resolved_sources = [
+        {
+            "cue_key": key,
+            "source": (result.provenance.source if result.provenance else None),
+            "cached": bool(result.provenance.cached) if result.provenance else False,
+        }
+        for key, result in sfx_results.items()
+        if result.status == "resolved"
+    ]
+    timeline_path = work / "audio" / "timeline.json"
     concat = work / "concat.txt"
     concat.write_text("".join(f"file '{p}'\n" for p in local), encoding="utf-8")
     plan: ComposePlan = build_compose_plan(work, EP, local, langs=langs, require_audio=True)
@@ -2628,6 +2658,14 @@ def run_compose(
         "subtitle_keys": subtitle_keys,
         "n_shots": len(local),
         "mixed_wavs": mixed,
+        "sfx": {
+            "timeline_path": timeline_path.relative_to(work).as_posix(),
+            "timeline_exists": timeline_path.is_file(),
+            "sfx_event_count": len(timeline.sfx),
+            "sfx_clip_count": len(sfx_prepared.get("sfx_clips") or []),
+            "ambience_clip_count": len(sfx_prepared.get("ambience_clips") or []),
+            "resolved_cues": resolved_sources,
+        },
     }
 
 

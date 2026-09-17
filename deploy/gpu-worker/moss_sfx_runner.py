@@ -56,7 +56,9 @@ PINNED_PIPELINE_MODULE = "OpenMOSS/MOSS-TTS/moss_soundeffect_v2"
 PINNED_MODEL_REVISION = "e35df4d82fbe87fcd5d14e5d100e349c0c3c076d"
 
 REQUIRED_PYTHON = (3, 12)
-REQUIRED_TORCH_MINOR = "2.9"
+REQUIRED_TORCH = "2.9.0+cu128"
+REQUIRED_TORCHAUDIO = "2.9.0+cu128"
+REQUIRED_TORCHVISION = "0.24.0+cu128"
 REQUIRED_CUDA = "12.8"  # cu128
 
 DEFAULT_STEPS = 100
@@ -124,15 +126,10 @@ def validate_python(version_info: tuple = tuple(sys.version_info)) -> None:
         )
 
 
-def _version_ok(version: str, minor: str) -> bool:
-    base = str(version or "").split("+", 1)[0]
-    return base == minor or base.startswith(minor + ".")
-
-
 def validate_torch(torch_mod: object) -> None:
     version = getattr(torch_mod, "__version__", "")
-    if not _version_ok(version, REQUIRED_TORCH_MINOR):
-        raise RunnerError(f"torch {version!r} is not the required {REQUIRED_TORCH_MINOR}.x")
+    if version != REQUIRED_TORCH:
+        raise RunnerError(f"torch {version!r} is not the required {REQUIRED_TORCH!r}")
     cuda = getattr(getattr(torch_mod, "version", None), "cuda", None)
     if str(cuda or "") != REQUIRED_CUDA:
         raise RunnerError(
@@ -142,8 +139,18 @@ def validate_torch(torch_mod: object) -> None:
 
 def validate_torchaudio(torchaudio_mod: object) -> None:
     version = getattr(torchaudio_mod, "__version__", "")
-    if not _version_ok(version, REQUIRED_TORCH_MINOR):
-        raise RunnerError(f"torchaudio {version!r} is not the required {REQUIRED_TORCH_MINOR}.x")
+    if version != REQUIRED_TORCHAUDIO:
+        raise RunnerError(
+            f"torchaudio {version!r} is not the required {REQUIRED_TORCHAUDIO!r}"
+        )
+
+
+def validate_torchvision(torchvision_mod: object) -> None:
+    version = getattr(torchvision_mod, "__version__", "")
+    if version != REQUIRED_TORCHVISION:
+        raise RunnerError(
+            f"torchvision {version!r} is not the required {REQUIRED_TORCHVISION!r}"
+        )
 
 
 def ensure_weights(weights_dir: str, *, snapshot_download=None) -> str:
@@ -258,6 +265,7 @@ def main(
     *,
     torch_mod=None,
     torchaudio_mod=None,
+    torchvision_mod=None,
     pipeline_factory=None,
     snapshot_download=None,
 ) -> int:
@@ -269,8 +277,11 @@ def main(
             import torch as torch_mod  # noqa: PLC0415 — lazy: only a real invocation imports torch
         if torchaudio_mod is None:
             import torchaudio as torchaudio_mod  # noqa: PLC0415
+        if torchvision_mod is None:
+            import torchvision as torchvision_mod  # noqa: PLC0415
         validate_torch(torch_mod)
         validate_torchaudio(torchaudio_mod)
+        validate_torchvision(torchvision_mod)
         out = generate(
             args,
             pipeline_factory=pipeline_factory,

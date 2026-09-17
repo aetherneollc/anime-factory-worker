@@ -19,7 +19,7 @@ import logging
 import sqlite3
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from anime_factory.db import utcnow
 from anime_factory.r2_paths import episode_sfx_key, shared_sfx_key
@@ -125,6 +125,7 @@ def resolve_cue(
     conn: sqlite3.Connection | None = None,
     freesound_client: FreesoundClient | None = None,
     moss_client: MossSoundEffectClient | None = None,
+    before_moss: Callable[[], Any] | None = None,
 ) -> SfxResult:
     """Freesound first, MOSS-SoundEffect v2 only on a Freesound miss/QC-fail/license-reject.
 
@@ -141,6 +142,22 @@ def resolve_cue(
     except Exception as exc:  # noqa: BLE001 — any Freesound failure falls back to MOSS
         freesound_error = exc
         log.info("freesound miss for cue=%s (%s); falling back to MOSS", cue.cue_key, type(exc).__name__)
+
+    if before_moss is not None:
+        try:
+            before_moss()
+        except Exception as exc:  # noqa: BLE001 — an uncleared GPU cannot safely load MOSS
+            failure = SfxResult(
+                cue_key=cue.cue_key,
+                status="failed",
+                reason=f"moss GPU handoff failed: {redact_secrets(str(exc))}",
+            )
+            if conn is not None:
+                _record_cue(conn, story_id, cue, failure)
+            raise SfxResolutionError(
+                f"{cue.cue_key}: could not release the video stack before MOSS "
+                f"({redact_secrets(str(exc))})"
+            ) from exc
 
     moss = moss_client or MossSoundEffectClient()
     fs_reason = redact_secrets(str(freesound_error))
@@ -290,6 +307,7 @@ def prepare_episode_sfx(
     clip_durations: dict[str, float] | None = None,
     freesound_client: FreesoundClient | None = None,
     moss_client: MossSoundEffectClient | None = None,
+    before_moss: Callable[[], Any] | None = None,
 ) -> dict[str, Any]:
     """Resolve every explicit board cue and return compose-ready inputs.
 
@@ -309,6 +327,15 @@ def prepare_episode_sfx(
     ambience_clips: list[tuple[float, bytes]] = []
     cue_rows: list[dict] = []
     results: dict[str, SfxResult] = {}
+    moss_handoff_done = False
+
+    def handoff_to_moss_once() -> None:
+        nonlocal moss_handoff_done
+        if moss_handoff_done or before_moss is None:
+            return
+        before_moss()
+        moss_handoff_done = True
+
     for item in derived:
         cue: SfxCue = item["cue"]
         onset_s = float(item["onset_s"])
@@ -320,6 +347,7 @@ def prepare_episode_sfx(
                 conn=conn,
                 freesound_client=freesound_client,
                 moss_client=moss_client,
+                before_moss=handoff_to_moss_once if before_moss is not None else None,
             )
         except SfxResolutionError:
             if item["required"]:

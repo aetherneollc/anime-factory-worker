@@ -3,11 +3,28 @@
 # H3-only production image: official torch cu128 wheels; no CUDA extension compile path.
 # Labels must stay comfy/h3/kolors/image-gen true so the scheduler will lease.
 
+FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04 AS moss-sfx
+
+ARG MOSS_TTS_REF=934d6826b084c46a0d033402174d5f8ac4ed2519
+ARG MOSS_TORCH=2.9.0
+ARG MOSS_TORCHAUDIO=2.9.0
+ARG MOSS_TORCHVISION=0.24.0
+
+COPY deploy/gpu-worker/install_moss_sfx_runtime.sh /tmp/install_moss_sfx_runtime.sh
+RUN chmod +x /tmp/install_moss_sfx_runtime.sh \
+    && MOSS_TTS_REF="${MOSS_TTS_REF}" MOSS_TORCH="${MOSS_TORCH}" \
+       MOSS_TORCHAUDIO="${MOSS_TORCHAUDIO}" MOSS_TORCHVISION="${MOSS_TORCHVISION}" \
+       /tmp/install_moss_sfx_runtime.sh \
+    && rm -f /tmp/install_moss_sfx_runtime.sh
+
 FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04
 
 ARG TARGETARCH=amd64
 # Immutable source revisions. Update only after the image canary passes.
 ARG COMFYUI_REF=7ba217d6b5ac7ef984b157f7e5dfc93465b9937d
+ARG MOSS_TORCH=2.9.0
+ARG MOSS_TORCHAUDIO=2.9.0
+ARG MOSS_TORCHVISION=0.24.0
 
 ENV DEBIAN_FRONTEND=noninteractive \
     VIRTUAL_ENV=/opt/venv \
@@ -17,7 +34,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-         python3 python3-venv ca-certificates curl ffmpeg git git-lfs \
+         python3 python3-venv ca-certificates curl ffmpeg git git-lfs libsndfile1 \
          fontconfig fonts-noto-cjk \
     && case "${TARGETARCH}" in amd64|x86_64) cf_arch=amd64 ;; arm64|aarch64) cf_arch=arm64 ;; *) cf_arch=amd64 ;; esac \
     && curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}" \
@@ -33,6 +50,8 @@ RUN apt-get update \
     && git -C /opt/ComfyUI fetch --depth 1 origin "${COMFYUI_REF}" \
     && git -C /opt/ComfyUI checkout --detach FETCH_HEAD \
     && rm -rf /var/lib/apt/lists/* /root/.cache /tmp/* /var/tmp/*
+
+COPY --from=moss-sfx /opt/moss-sfx /opt/moss-sfx
 
 RUN COMFYUI_REF="${COMFYUI_REF}" python3 - <<'PY'
 import json
@@ -99,7 +118,9 @@ COPY schema/ /app/schema/
 COPY workflows/ /app/workflows/
 COPY config/ /app/config/
 COPY deploy/gpu-worker/start.sh /usr/local/bin/af-start
+COPY deploy/gpu-worker/moss_sfx_runner.py /opt/moss-sfx/moss_sfx_runner.py
 RUN chmod +x /usr/local/bin/af-start \
+    /opt/moss-sfx/moss_sfx_runner.py \
     && mkdir -p /work \
     && pip install --no-cache-dir --only-binary=:all: \
          "Pillow>=10,<12" huggingface_hub boto3 "open_clip_torch==2.32.0" \
@@ -134,6 +155,45 @@ if kept:
     )
 PY
 
+# Prove the isolated MOSS stack did not replace H3's torch, and that the final
+# image contains neither nvcc nor a compiler.
+RUN MOSS_TORCH="${MOSS_TORCH}" MOSS_TORCHAUDIO="${MOSS_TORCHAUDIO}" \
+    MOSS_TORCHVISION="${MOSS_TORCHVISION}" python3 - <<'PY'
+import os
+import shutil
+import subprocess
+
+import torch
+import torchaudio
+import torchvision
+
+worker = (torch.__version__, torchaudio.__version__, torchvision.__version__, torch.version.cuda)
+if worker != ("2.8.0+cu128", "2.8.0+cu128", "0.23.0+cu128", "12.8"):
+    raise SystemExit(f"h3_worker_stack_contaminated: {worker}")
+probe = subprocess.check_output(
+    [
+        "/opt/moss-sfx/bin/python3.12",
+        "-c",
+        "import sys,torch,torchaudio,torchvision;"
+        "print(sys.version_info.major,sys.version_info.minor,torch.__version__,"
+        "torchaudio.__version__,torchvision.__version__,torch.version.cuda)",
+    ],
+    text=True,
+).strip()
+want = (
+    f"3 12 {os.environ['MOSS_TORCH']}+cu128 {os.environ['MOSS_TORCHAUDIO']}+cu128 "
+    f"{os.environ['MOSS_TORCHVISION']}+cu128 12.8"
+)
+if probe != want:
+    raise SystemExit(f"moss_sfx_runtime_mismatch: {probe!r} != {want!r}")
+if shutil.which("nvcc"):
+    raise SystemExit("nvcc present in final runtime")
+for command in ("gcc", "g++", "cc"):
+    if shutil.which(command):
+        raise SystemExit(f"build tool present in final runtime: {command}")
+print("isolated stacks ok:", worker, probe)
+PY
+
 ENV PYTHONPATH=/app/python \
     PYTHONUNBUFFERED=1 \
     VAST_DRY_RUN=1 \
@@ -153,7 +213,12 @@ ENV PYTHONPATH=/app/python \
     AF_VISUAL_QC_CLIP_WEIGHTS=/opt/ComfyUI/models/visual_qc/open_clip_model.safetensors \
     AF_VISUAL_QC_CLIP_CONFIG=/opt/ComfyUI/models/visual_qc/open_clip_config.json \
     AF_OPEN_CLIP_MODEL=ViT-B-32 \
-    AF_OPEN_CLIP_PRETRAINED=openai
+    AF_OPEN_CLIP_PRETRAINED=openai \
+    MOSS_SFX_PYTHON=/opt/moss-sfx/bin/python3.12 \
+    MOSS_SFX_SCRIPT=/opt/moss-sfx/moss_sfx_runner.py \
+    MOSS_SFX_WEIGHTS_DIR=/work/.model-cache/moss-sfx \
+    MOSS_SFX_DEVICE=cuda:0 \
+    TORCHDYNAMO_DISABLE=1
 
 LABEL org.aetherneo.anime-factory.comfy="true" \
       org.aetherneo.anime-factory.h3="true" \

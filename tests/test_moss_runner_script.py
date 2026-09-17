@@ -25,7 +25,7 @@ def _load_runner():
 runner = _load_runner()
 
 
-def _fake_torch(version="2.9.1+cu128", cuda="12.8"):
+def _fake_torch(version="2.9.0+cu128", cuda="12.8"):
     seeds: list[int] = []
     mod = SimpleNamespace(
         __version__=version,
@@ -36,7 +36,11 @@ def _fake_torch(version="2.9.1+cu128", cuda="12.8"):
     return mod, seeds
 
 
-def _fake_torchaudio(version="2.9.0"):
+def _fake_torchaudio(version="2.9.0+cu128"):
+    return SimpleNamespace(__version__=version)
+
+
+def _fake_torchvision(version="0.24.0+cu128"):
     return SimpleNamespace(__version__=version)
 
 
@@ -115,7 +119,10 @@ def test_validate_torch_requires_29_cu128():
         runner.validate_torch(bad_cuda)
     runner.validate_torchaudio(_fake_torchaudio())
     with pytest.raises(runner.RunnerError):
-        runner.validate_torchaudio(_fake_torchaudio("2.8.0"))
+        runner.validate_torchaudio(_fake_torchaudio("2.8.0+cu128"))
+    runner.validate_torchvision(_fake_torchvision())
+    with pytest.raises(runner.RunnerError):
+        runner.validate_torchvision(_fake_torchvision("0.23.0+cu128"))
 
 
 def test_validate_pins_rejects_drift(tmp_path):
@@ -157,6 +164,7 @@ def test_main_end_to_end_writes_pcm16_wav_and_seeds(tmp_path):
         _argv(tmp_path),
         torch_mod=torch_mod,
         torchaudio_mod=_fake_torchaudio(),
+        torchvision_mod=_fake_torchvision(),
         pipeline_factory=lambda model_dir, device: pipe,
         snapshot_download=lambda **kw: (_ for _ in ()).throw(AssertionError("weights already pinned")),
     )
@@ -186,6 +194,7 @@ def test_main_never_leaks_tokens_on_failure(tmp_path, monkeypatch, capsys):
         _argv(tmp_path),
         torch_mod=torch_mod,
         torchaudio_mod=_fake_torchaudio(),
+        torchvision_mod=_fake_torchvision(),
         pipeline_factory=exploding_factory,
     )
     assert code == 1
@@ -206,6 +215,7 @@ def test_main_fails_before_weights_on_bad_torch(tmp_path):
         _argv(tmp_path),
         torch_mod=torch_mod,
         torchaudio_mod=_fake_torchaudio(),
+        torchvision_mod=_fake_torchvision(),
         pipeline_factory=lambda m, d: FakePipe(),
         snapshot_download=must_not_download,
     )
@@ -221,3 +231,39 @@ def test_write_pcm16_wav_clamps_out_of_range(tmp_path):
     _, samples = decode_pcm16_mono(out.read_bytes())
     assert samples[0] == 32767
     assert samples[1] == -32767
+
+
+@pytest.mark.parametrize("docker_name", ["Dockerfile", "Dockerfile.longlive"])
+def test_docker_images_bake_official_isolated_moss_runtime(docker_name):
+    deploy = REPO_ROOT / "deploy" / "gpu-worker"
+    text = (deploy / docker_name).read_text(encoding="utf-8")
+    pins = dict(
+        line.split("=", 1)
+        for line in (deploy / "pins.env").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.startswith("#")
+    )
+    assert pins["MOSS_TTS_REF"] == runner.PINNED_SOURCE_COMMIT
+    assert pins["MOSS_TORCH"] == runner.REQUIRED_TORCH
+    assert pins["MOSS_TORCHAUDIO"] == runner.REQUIRED_TORCHAUDIO
+    assert pins["MOSS_TORCHVISION"] == runner.REQUIRED_TORCHVISION
+    install = (deploy / "install_moss_sfx_runtime.sh").read_text(encoding="utf-8")
+    assert f"ARG MOSS_TTS_REF={pins['MOSS_TTS_REF']}" in text
+    assert "install_moss_sfx_runtime.sh" in text
+    assert 'test "$(git -C /tmp/MOSS-TTS rev-parse HEAD)" = "${MOSS_TTS_REF}"' in install
+    assert "ARG MOSS_TORCH=2.9.0" in text
+    assert "ARG MOSS_TORCHAUDIO=2.9.0" in text
+    assert "ARG MOSS_TORCHVISION=0.24.0" in text
+    assert "COPY --from=moss-sfx /opt/moss-sfx /opt/moss-sfx" in text
+    assert "COPY deploy/gpu-worker/moss_sfx_runner.py /opt/moss-sfx/moss_sfx_runner.py" in text
+    assert "MOSS_SFX_PYTHON=/opt/moss-sfx/bin/python3.12" in text
+    assert "MOSS_SFX_SCRIPT=/opt/moss-sfx/moss_sfx_runner.py" in text
+    assert "MOSS_SFX_WEIGHTS_DIR=/work/.model-cache/moss-sfx" in text
+    assert "MOSS_SFX_DEVICE=cuda:0" in text
+    assert "TORCHDYNAMO_DISABLE=1" in text
+    assert "OpenMOSS-Team/MOSS-SoundEffect-v2.0" not in text
+    assert "huggingface-cli download" not in text
+    assert "/moss_soundeffect_v2/finetuning" not in text
+    final_stage = text.rsplit("FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04", 1)[-1]
+    assert "python3-dev" not in final_stage
+    assert "ninja-build" not in final_stage
+    assert 'shutil.which("nvcc")' in final_stage

@@ -12,6 +12,20 @@
 # the LongLive KV-dequant extension are built the same way.
 # Final stage is CUDA runtime-only (no nvcc). Do not pip install -e fouroversix there.
 
+FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04 AS moss-sfx
+
+ARG MOSS_TTS_REF=934d6826b084c46a0d033402174d5f8ac4ed2519
+ARG MOSS_TORCH=2.9.0
+ARG MOSS_TORCHAUDIO=2.9.0
+ARG MOSS_TORCHVISION=0.24.0
+
+COPY deploy/gpu-worker/install_moss_sfx_runtime.sh /tmp/install_moss_sfx_runtime.sh
+RUN chmod +x /tmp/install_moss_sfx_runtime.sh \
+    && MOSS_TTS_REF="${MOSS_TTS_REF}" MOSS_TORCH="${MOSS_TORCH}" \
+       MOSS_TORCHAUDIO="${MOSS_TORCHAUDIO}" MOSS_TORCHVISION="${MOSS_TORCHVISION}" \
+       /tmp/install_moss_sfx_runtime.sh \
+    && rm -f /tmp/install_moss_sfx_runtime.sh
+
 FROM nvidia/cuda:12.8.1-devel-ubuntu24.04 AS nvfp4
 
 ARG LONGLIVE_REF=6b36d20ec6f7958d29d11a704dfa64611a9f2572
@@ -169,6 +183,9 @@ ARG LONGLIVE_REF=6b36d20ec6f7958d29d11a704dfa64611a9f2572
 ARG LONGLIVE_TORCH=2.10.0
 ARG LONGLIVE_TORCHVISION=0.25.0
 ARG LONGLIVE_TORCHAUDIO=2.10.0
+ARG MOSS_TORCH=2.9.0
+ARG MOSS_TORCHAUDIO=2.9.0
+ARG MOSS_TORCHVISION=0.24.0
 
 ENV DEBIAN_FRONTEND=noninteractive \
     VIRTUAL_ENV=/opt/venv \
@@ -181,7 +198,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-         python3 python3-venv ca-certificates curl ffmpeg git git-lfs \
+         python3 python3-venv ca-certificates curl ffmpeg git git-lfs libsndfile1 \
          fontconfig fonts-noto-cjk \
     && case "${TARGETARCH}" in amd64|x86_64) cf_arch=amd64 ;; arm64|aarch64) cf_arch=arm64 ;; *) cf_arch=amd64 ;; esac \
     && curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}" \
@@ -253,6 +270,7 @@ PY
 COPY --from=nvfp4 /opt/venv /opt/venv
 COPY --from=nvfp4 /opt/LongLive /opt/LongLive
 COPY --from=nvfp4 /opt/longlive-wheels /opt/longlive-wheels
+COPY --from=moss-sfx /opt/moss-sfx /opt/moss-sfx
 
 WORKDIR /app
 
@@ -261,7 +279,9 @@ COPY schema/ /app/schema/
 COPY workflows/ /app/workflows/
 COPY config/ /app/config/
 COPY deploy/gpu-worker/start.sh /usr/local/bin/af-start
+COPY deploy/gpu-worker/moss_sfx_runner.py /opt/moss-sfx/moss_sfx_runner.py
 RUN chmod +x /usr/local/bin/af-start \
+    /opt/moss-sfx/moss_sfx_runner.py \
     && mkdir -p /work \
     && pip install --no-cache-dir --only-binary=:all: \
          "Pillow>=10,<12" huggingface_hub boto3 "open_clip_torch==2.32.0" \
@@ -304,10 +324,12 @@ PY
 # libcuda.so.1 — verify wheel metadata and .so presence only; CUDA import/load
 # is deferred to GPU preflight on the leased card.
 RUN LONGLIVE_TORCH="${LONGLIVE_TORCH}" LONGLIVE_TORCHVISION="${LONGLIVE_TORCHVISION}" \
-    LONGLIVE_TORCHAUDIO="${LONGLIVE_TORCHAUDIO:-2.10.0}" python - <<'PY'
+    LONGLIVE_TORCHAUDIO="${LONGLIVE_TORCHAUDIO:-2.10.0}" MOSS_TORCH="${MOSS_TORCH}" \
+    MOSS_TORCHAUDIO="${MOSS_TORCHAUDIO}" MOSS_TORCHVISION="${MOSS_TORCHVISION}" python - <<'PY'
 import importlib.metadata as im
 import os
 import shutil
+import subprocess
 import sys
 
 import torch
@@ -345,8 +367,27 @@ if fouro_version != "1.1.0":
     problems.append(f"fouroversix {fouro_version} != 1.1.0")
 elif not dist_has_so("fouroversix"):
     problems.append("fouroversix missing CUDA extension .so")
+moss_probe = subprocess.check_output(
+    [
+        "/opt/moss-sfx/bin/python3.12",
+        "-c",
+        "import sys,torch,torchaudio,torchvision;"
+        "print(sys.version_info.major,sys.version_info.minor,torch.__version__,"
+        "torchaudio.__version__,torchvision.__version__,torch.version.cuda)",
+    ],
+    text=True,
+).strip()
+want_moss = (
+    f"3 12 {os.environ['MOSS_TORCH']}+cu128 {os.environ['MOSS_TORCHAUDIO']}+cu128 "
+    f"{os.environ['MOSS_TORCHVISION']}+cu128 12.8"
+)
+if moss_probe != want_moss:
+    problems.append(f"moss runtime {moss_probe!r} != {want_moss!r}")
 if shutil.which("nvcc"):
     problems.append("nvcc present in the runtime stage")
+for command in ("gcc", "g++", "cc"):
+    if shutil.which(command):
+        problems.append(f"build tool present in runtime: {command}")
 if problems:
     raise SystemExit("longlive_fail_closed: " + "; ".join(problems))
 print(
@@ -356,6 +397,7 @@ print(
     torchaudio.__version__,
     flash_version,
     fouro_version,
+    moss_probe,
 )
 PY
 
@@ -385,7 +427,12 @@ ENV PYTHONPATH=/app/python \
     AF_VISUAL_QC_CLIP_WEIGHTS=/opt/ComfyUI/models/visual_qc/open_clip_model.safetensors \
     AF_VISUAL_QC_CLIP_CONFIG=/opt/ComfyUI/models/visual_qc/open_clip_config.json \
     AF_OPEN_CLIP_MODEL=ViT-B-32 \
-    AF_OPEN_CLIP_PRETRAINED=openai
+    AF_OPEN_CLIP_PRETRAINED=openai \
+    MOSS_SFX_PYTHON=/opt/moss-sfx/bin/python3.12 \
+    MOSS_SFX_SCRIPT=/opt/moss-sfx/moss_sfx_runner.py \
+    MOSS_SFX_WEIGHTS_DIR=/work/.model-cache/moss-sfx \
+    MOSS_SFX_DEVICE=cuda:0 \
+    TORCHDYNAMO_DISABLE=1
 
 LABEL org.aetherneo.anime-factory.comfy="true" \
       org.aetherneo.anime-factory.h3="false" \

@@ -533,8 +533,9 @@ def test_dockerfile_h3_only_no_compile():
     text = (Path(__file__).resolve().parents[1] / "deploy" / "gpu-worker" / "Dockerfile").read_text(
         encoding="utf-8"
     )
-    assert text.count("FROM nvidia/cuda") == 1
+    assert text.count("FROM nvidia/cuda") == 2
     assert "12.8.1-runtime-ubuntu24.04" in text
+    assert "devel-ubuntu" not in text
     assert "torch==2.8.0+cu128" in text
     assert "torchvision==0.23.0+cu128" in text
     assert "torchaudio==2.8.0+cu128" in text
@@ -559,16 +560,10 @@ def test_dockerfile_h3_only_no_compile():
         "python3-dev",
         "ninja-build",
         " AS nvfp4",
-        "COPY --from=",
         "org.aetherneo.anime-factory.longlive",
         "LONGLIVE_",
         "CUDA_ARCHS",
-        "pip install -e",
         "build_ext",
-        "nvcc",
-        "g++",
-        "gcc ",
-        "ninja-build",
         "no-build-isolation",
     )
     lowered = text.lower()
@@ -579,6 +574,9 @@ def test_dockerfile_h3_only_no_compile():
     for line in pip_install_lines:
         assert "--only-binary=:all:" in line, line
     assert '"--only-binary=:all:"' in text
+    assert "COPY --from=moss-sfx /opt/moss-sfx /opt/moss-sfx" in text
+    assert 'shutil.which("nvcc")' in text
+    assert "MOSS_SFX_PYTHON=/opt/moss-sfx/bin/python3.12" in text
     assert not re.search(r"^RUN .*pip install -e /opt/LongLive/fouroversix", text, re.M)
     assert not re.search(r"^PY\s*\n\s*&&", text, re.M)
     start = (Path(__file__).resolve().parents[1] / "deploy" / "gpu-worker" / "start.sh").read_text(
