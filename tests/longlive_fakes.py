@@ -121,6 +121,7 @@ class FakeCausalDiffusionInferencePipeline:
         self.text_encoder = object()
         self.vae = _Vae(log)
         log.setdefault("constructed", []).append(id(self))
+        log.setdefault("constructed_cwds", []).append(str(Path.cwd()))
 
     def inference(self, **kwargs):
         self.log.setdefault("inference", []).append(

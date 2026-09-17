@@ -19,7 +19,9 @@ Nothing in this module shells out to ``inference.py``.
 from __future__ import annotations
 
 import importlib
+import os
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -119,6 +121,20 @@ def load_official_config(api: OfficialApi, yaml_path: Path) -> Any:
     return config
 
 
+@contextmanager
+def _official_working_directory():
+    """Resolve NVlabs' cwd-relative ``wan_models/...`` sidecar paths."""
+    root = longlive_root()
+    if not root.is_dir():
+        raise RuntimeError(f"{FAIL_CLOSED}: LongLive root is missing: {root}. {SETUP_HINT}")
+    previous = Path.cwd()
+    os.chdir(root)
+    try:
+        yield
+    finally:
+        os.chdir(previous)
+
+
 def build_pipeline(api: OfficialApi, config: Any, *, device: Any = None) -> tuple[Any, Any]:
     """Construct and set up the NVFP4 pipeline exactly once, per the official README."""
     torch = api.torch
@@ -126,8 +142,12 @@ def build_pipeline(api: OfficialApi, config: Any, *, device: Any = None) -> tupl
     torch.set_grad_enabled(False)
     # Measured before the generator lands on the card, as inference.py does.
     low_memory = float(api.get_cuda_free_memory_gb(dev)) < LOW_VRAM_GB
-    pipe = api.CausalDiffusionInferencePipeline(config, device=dev)
-    api.setup_nvfp4_pipeline(pipe, config, dev)
+    # The pinned wrapper opens config, UMT5, tokenizer and VAE files as
+    # ``wan_models/Wan2.2-TI2V-5B/...``. The container starts in /app, so building
+    # without the official cwd makes diffusers misread that path as a Hub repo.
+    with _official_working_directory():
+        pipe = api.CausalDiffusionInferencePipeline(config, device=dev)
+        api.setup_nvfp4_pipeline(pipe, config, dev)
     if low_memory:
         api.DynamicSwapInstaller.install_model(pipe.text_encoder, device=dev)
     pipe.generator.model.eval().requires_grad_(False)

@@ -38,7 +38,7 @@ def longlive_env(tmp_path, monkeypatch):
     monkeypatch.delenv("AF_SKIP_WEIGHTS", raising=False)
     # Weight/extension presence is probed elsewhere; these tests are about sampling.
     monkeypatch.setattr(longlive_batch, "missing_longlive_requirements", lambda: [])
-    log: dict = {}
+    log: dict = {"caller_cwd": str(Path.cwd())}
     install_official_stubs(monkeypatch, log)
     return log
 
@@ -111,6 +111,8 @@ def test_pipeline_is_constructed_and_set_up_exactly_once(longlive_env, tmp_path)
     assert len(log["constructed"]) == 1, "pipeline must be constructed once per batch"
     assert len(log["setup"]) == 1, "setup_nvfp4_pipeline must run once"
     assert log["setup"][0]["pipeline_id"] == log["constructed"][0]
+    assert log["constructed_cwds"] == [str(longlive.longlive_root())]
+    assert str(Path.cwd()) == log["caller_cwd"], "pipeline build must restore the worker cwd"
     assert out["model_load_count"] == 1
     assert out["inference_calls"] == 2
 
