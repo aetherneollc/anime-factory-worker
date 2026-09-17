@@ -246,9 +246,11 @@ def test_docker_images_bake_official_isolated_moss_runtime(docker_name):
     assert pins["MOSS_TORCH"] == runner.REQUIRED_TORCH
     assert pins["MOSS_TORCHAUDIO"] == runner.REQUIRED_TORCHAUDIO
     assert pins["MOSS_TORCHVISION"] == runner.REQUIRED_TORCHVISION
+    moss = (deploy / "Dockerfile.moss").read_text(encoding="utf-8")
     install = (deploy / "install_moss_sfx_runtime.sh").read_text(encoding="utf-8")
-    assert f"ARG MOSS_TTS_REF={pins['MOSS_TTS_REF']}" in text
-    assert "install_moss_sfx_runtime.sh" in text
+    assert f"ARG MOSS_TTS_REF={pins['MOSS_TTS_REF']}" in moss
+    assert "install_moss_sfx_runtime.sh" in moss
+    assert "ARG MOSS_IMAGE=" in text
     assert 'test "$(git -C /tmp/MOSS-TTS rev-parse HEAD)" = "${MOSS_TTS_REF}"' in install
     assert '--no-deps --only-binary=:all:' in install
     assert '"descript-audiotools==0.7.2"' in install

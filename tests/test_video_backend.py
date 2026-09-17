@@ -533,7 +533,9 @@ def test_dockerfile_h3_only_no_compile():
     text = (Path(__file__).resolve().parents[1] / "deploy" / "gpu-worker" / "Dockerfile").read_text(
         encoding="utf-8"
     )
-    assert text.count("FROM nvidia/cuda") == 2
+    assert text.count("FROM nvidia/cuda") == 1
+    assert "ARG MOSS_IMAGE=" in text
+    assert "FROM ${MOSS_IMAGE} AS moss-sfx" in text
     assert "12.8.1-runtime-ubuntu24.04" in text
     assert "devel-ubuntu" not in text
     assert "torch==2.8.0+cu128" in text

@@ -366,7 +366,9 @@ def test_dockerfile_longlive_contract():
     text = (root / "deploy" / "gpu-worker" / "Dockerfile.longlive").read_text(encoding="utf-8")
     assert "12.8.1-devel-ubuntu24.04" in text
     assert "12.8.1-runtime-ubuntu24.04" in text
-    assert text.count("FROM nvidia/cuda") == 3
+    assert text.count("FROM nvidia/cuda") == 2
+    assert "ARG MOSS_IMAGE=" in text
+    assert "FROM ${MOSS_IMAGE} AS moss-sfx" in text
     assert "6b36d20ec6f7958d29d11a704dfa64611a9f2572" in text
     assert "AF_IMAGE_CAPABILITY=longlive" in text
     assert 'org.aetherneo.anime-factory.h3="false"' in text
@@ -418,20 +420,25 @@ def test_dockerfile_longlive_kv_dequant_sm120a_patch_contract():
     assert "kv_dequant gencode contract violated" in text
 
 
-def test_dockerfile_longlive_fouroversix_force_build_only():
-    text = (
-        Path(__file__).resolve().parents[1]
-        / "deploy"
-        / "gpu-worker"
-        / "Dockerfile.longlive"
-    ).read_text(encoding="utf-8")
-    fouro_block = text.split("WORKDIR /opt/LongLive/fouroversix", 1)[1].split(
-        "# FlashAttention", 1
-    )[0]
-    assert "FORCE_BUILD=1 pip wheel" in fouro_block
-    assert "import fouroversix" not in fouro_block
-    assert "from fouroversix import _C" not in fouro_block
-    assert "importlib.metadata" in fouro_block
+def test_dockerfile_longlive_uses_pinned_release_wheels():
+    root = Path(__file__).resolve().parents[1]
+    deploy = root / "deploy" / "gpu-worker"
+    text = (deploy / "Dockerfile.longlive").read_text(encoding="utf-8")
+    pins = dict(
+        line.split("=", 1)
+        for line in (deploy / "pins.env").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.startswith("#")
+    )
+    fetch = (deploy / "fetch_pinned_wheel.sh").read_text(encoding="utf-8")
+    assert "sha256sum --check --strict" in fetch
+    assert "FORCE_BUILD=1" not in text
+    assert "FLASH_ATTENTION_FORCE_BUILD" not in text
+    assert "Dao-AILab/flash-attention.git" not in text
+    assert "NVIDIA/cutlass.git" not in text
+    assert pins["FOUROVERSIX_WHEEL_SHA256"] in text
+    assert pins["FLASH_ATTN_WHEEL_SHA256"] in text
+    assert "fetch_pinned_wheel.sh" in text
+    assert "importlib.metadata" in text.split("fouroversix.whl", 1)[1]
 
 
 def test_dockerfile_longlive_runtime_skips_cuda_extension_import():
@@ -467,19 +474,14 @@ def test_dockerfile_longlive_matches_official_nvfp4_stack():
         "ARG LONGLIVE_TORCH=2.10.0",
         "ARG LONGLIVE_TORCHVISION=0.25.0",
         "ARG LONGLIVE_TORCHAO=0.16.0",
-        f"ARG FLASH_ATTN_REF={pins['FLASH_ATTN_REF']}",
-        f"ARG CUTLASS_REF={pins['CUTLASS_REF']}",
-        f"ARG FOUROVERSIX_REF={pins['FOUROVERSIX_REF']}",
+        f"ARG FLASH_ATTN_WHEEL_SHA256={pins['FLASH_ATTN_WHEEL_SHA256']}",
+        f"ARG FOUROVERSIX_WHEEL_SHA256={pins['FOUROVERSIX_WHEEL_SHA256']}",
     ):
         assert arg in text, arg
-    # flash-attn must be compiled, not pulled from a third-party release wheel.
-    assert "Dao-AILab/flash-attention.git" in text
-    assert "FLASH_ATTENTION_FORCE_BUILD=TRUE" in text
+    assert pins["FLASH_ATTN_WHEEL_URL"] in text
+    assert pins["FOUROVERSIX_WHEEL_URL"] in text
     assert "my-pytorch-builds" not in text
-    assert "FLASH_ATTN_WHEEL_URL" not in text
-    # CUTLASS is pinned rather than taken from a branch tip.
-    assert "NVIDIA/cutlass.git" in text
-    assert "--depth 1 origin \"${CUTLASS_REF}\"" in text
+    assert "FORCE_BUILD=1" not in text
     # Runtime stage must stay build-tool free and version-locked.
     assert 'shutil.which("nvcc")' in text
     assert "longlive_fail_closed" in text
@@ -489,17 +491,17 @@ def test_dockerfile_longlive_matches_official_nvfp4_stack():
 def test_dockerfiles_parse_as_buildkit_instructions():
     """Heredoc bodies must not leave a bare `&&` continuation as a new instruction."""
     root = Path(__file__).resolve().parents[1]
-    for name in ("Dockerfile", "Dockerfile.longlive"):
+    for name in ("Dockerfile", "Dockerfile.longlive", "Dockerfile.moss"):
         path = root / "deploy" / "gpu-worker" / name
         instructions, errors = parse_dockerfile(path)
         assert not errors, f"{name}: {errors}"
         assert instructions, name
-        assert instructions[0] == "FROM", name
+        assert instructions[0] in {"FROM", "ARG"}, name
 
 
 def test_dockerfile_longlive_has_no_trailing_whitespace():
     root = Path(__file__).resolve().parents[1]
-    for name in ("Dockerfile", "Dockerfile.longlive"):
+    for name in ("Dockerfile", "Dockerfile.longlive", "Dockerfile.moss"):
         text = (root / "deploy" / "gpu-worker" / name).read_text(encoding="utf-8")
         offenders = [i + 1 for i, line in enumerate(text.splitlines()) if line != line.rstrip()]
         assert not offenders, f"{name} trailing whitespace on lines {offenders}"
@@ -612,12 +614,14 @@ def test_planned_mode_covers_continuation_before_its_frame_exists(tmp_path):
         longlive.batch_longlive_mode([first, {"take_id": "take-03"}])
 
 
-def test_docker_workflow_budgets_source_cuda_builds():
+def test_docker_workflow_reuses_moss_and_pinned_wheels():
     root = Path(__file__).resolve().parents[1]
     workflow = (root / ".github" / "workflows" / "docker.yml").read_text(encoding="utf-8")
-    # 360 minutes is the GitHub-hosted runner job maximum.
-    assert "timeout-minutes: 360" in workflow
-    assert "swapon" in workflow
+    assert "deploy/gpu-worker/Dockerfile.moss" in workflow
+    assert "MOSS_IMAGE=" in workflow
+    assert "timeout-minutes: 90" in workflow
+    assert "timeout-minutes: 360" not in workflow
+    assert "needs: [matrix, moss]" in workflow
 
 
 def test_incremental_r2_skips_existing(tmp_path, monkeypatch):

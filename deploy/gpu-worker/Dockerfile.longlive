@@ -6,40 +6,28 @@
 # docs/getting_started.md ("NVFP4 Environment") and the
 # Efficient-Large-Model/LongLive-2.0-5B-NVFP4-S2 model card:
 #   Python 3.12 / PyTorch 2.10.0+cu128 / TorchVision 0.25.0+cu128 / CUDA 12.8 /
-#   TorchAO 0.16.0 / FlashAttention 2.8.3 built from source.
-# Dao-AILab publishes no cu12+torch2.10 release wheel for 2.8.3 (only cu13torch2.10),
-# so flash-attn is compiled here for SM 12.0 and shipped as a wheel. FourOverSix and
-# the LongLive KV-dequant extension are built the same way.
-# Final stage is CUDA runtime-only (no nvcc). Do not pip install -e fouroversix there.
+#   TorchAO 0.16.0 / FlashAttention 2.8.3 / FourOverSix 1.1.0.
+# FourOverSix comes from the official v1.1.0 GitHub Release wheel (includes SM120).
+# Dao-AILab has no cu12+torch2.10 flash-attn wheel; the cu128 torch2.10 wheel is
+# SHA-256 pinned. Only the LongLive KV-dequant kernel is compiled here — upstream
+# still hardcodes sm_100a. Final stage is CUDA runtime-only (no nvcc).
+# MOSS runtime is the shared moss image, not rebuilt here.
 
-FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04 AS moss-sfx
-
-ARG MOSS_TTS_REF=934d6826b084c46a0d033402174d5f8ac4ed2519
-ARG MOSS_TORCH=2.9.0
-ARG MOSS_TORCHAUDIO=2.9.0
-ARG MOSS_TORCHVISION=0.24.0
-
-COPY deploy/gpu-worker/install_moss_sfx_runtime.sh /tmp/install_moss_sfx_runtime.sh
-RUN chmod +x /tmp/install_moss_sfx_runtime.sh \
-    && MOSS_TTS_REF="${MOSS_TTS_REF}" MOSS_TORCH="${MOSS_TORCH}" \
-       MOSS_TORCHAUDIO="${MOSS_TORCHAUDIO}" MOSS_TORCHVISION="${MOSS_TORCHVISION}" \
-       /tmp/install_moss_sfx_runtime.sh \
-    && rm -f /tmp/install_moss_sfx_runtime.sh
+ARG MOSS_IMAGE=ghcr.io/aetherneollc/anime-factory-worker-moss:main
+FROM ${MOSS_IMAGE} AS moss-sfx
 
 FROM nvidia/cuda:12.8.1-devel-ubuntu24.04 AS nvfp4
 
 ARG LONGLIVE_REF=6b36d20ec6f7958d29d11a704dfa64611a9f2572
-# NVIDIA/cutlass revision pinned by mit-han-lab/fouroversix@FOUROVERSIX_REF.
-# LongLive vendors fouroversix as plain files, so third_party/cutlass must be
-# supplied explicitly; taking whatever is at a branch tip is not reproducible.
-ARG FOUROVERSIX_REF=dadfad6901d473a734fe71e0b082e70ee993e23a
-ARG CUTLASS_REF=ec8daf642d69fc31352ac6fa6e14a0de9019604b
-ARG FLASH_ATTN_REF=060c9188beec3a8b62b33a3bfa6d5d2d44975fab
 ARG FLASH_ATTN_VERSION=2.8.3
 ARG LONGLIVE_TORCH=2.10.0
 ARG LONGLIVE_TORCHVISION=0.25.0
 ARG LONGLIVE_TORCHAUDIO=2.10.0
 ARG LONGLIVE_TORCHAO=0.16.0
+ARG FOUROVERSIX_WHEEL_URL=https://github.com/mit-han-lab/fouroversix/releases/download/v1.1.0/fouroversix-1.1.0%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+ARG FOUROVERSIX_WHEEL_SHA256=e44c418d8c0e3db1f2f6925bf8ce09fc109efa150a9aa5480fae8055021dceb3
+ARG FLASH_ATTN_WHEEL_URL=https://github.com/PozzettiAndrea/cuda-wheels/releases/download/flash_attn-latest/flash_attn-2.8.3%2Bcu128torch2.10-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl
+ARG FLASH_ATTN_WHEEL_SHA256=f96a6af43785a0a9c5cd9bbfe385515ffc39839debb952474ecf238cfda62e6b
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
@@ -89,67 +77,52 @@ if torch.version.cuda != "12.8":
 print("torch", torch.__version__, "cuda", torch.version.cuda, "tv", torchvision.__version__)
 PY
 
-# Pin NVlabs/LongLive plus the CUTLASS revision its vendored fouroversix expects.
-RUN git init /opt/LongLive \
+# Pin NVlabs/LongLive for inference.py and the KV-dequant kernel. FourOverSix and
+# flash-attn come from SHA-256-pinned release wheels; do not compile CUTLASS here.
+COPY deploy/gpu-worker/fetch_pinned_wheel.sh /tmp/fetch_pinned_wheel.sh
+RUN chmod +x /tmp/fetch_pinned_wheel.sh \
+    && git init /opt/LongLive \
     && git -C /opt/LongLive remote add origin https://github.com/NVlabs/LongLive.git \
     && git -C /opt/LongLive fetch --depth 1 origin "${LONGLIVE_REF}" \
     && git -C /opt/LongLive checkout --detach FETCH_HEAD \
-    && mkdir -p /opt/LongLive/fouroversix/third_party/cutlass \
-    && git init /opt/LongLive/fouroversix/third_party/cutlass \
-    && git -C /opt/LongLive/fouroversix/third_party/cutlass remote add origin \
-         https://github.com/NVIDIA/cutlass.git \
-    && git -C /opt/LongLive/fouroversix/third_party/cutlass fetch --depth 1 origin "${CUTLASS_REF}" \
-    && git -C /opt/LongLive/fouroversix/third_party/cutlass checkout --detach FETCH_HEAD \
-    && rm -rf /opt/LongLive/fouroversix/third_party/cutlass/.git \
-    && test -d /opt/LongLive/fouroversix/third_party/cutlass/include \
     && test -f /opt/LongLive/inference.py \
     && test -f /opt/LongLive/utils/inference_utils.py \
     && grep -q "def setup_nvfp4_pipeline" /opt/LongLive/utils/inference_utils.py \
     && grep -q "class ImagePromptDataset" /opt/LongLive/utils/dataset.py
 
-WORKDIR /opt/LongLive/fouroversix
-# FORCE_BUILD=1: never download a release wheel — always compile from the pinned source tree.
-RUN mkdir -p /opt/longlive-wheels \
-    && FORCE_BUILD=1 pip wheel --no-cache-dir --no-build-isolation --no-deps -w /opt/longlive-wheels . \
-    && pip install --no-cache-dir --no-deps --no-build-isolation /opt/longlive-wheels/fouroversix*.whl \
-    && python - <<'PY' \
-    && rm -rf build /root/.cache /tmp/* /var/tmp/*
-import importlib.metadata as im
+RUN python - <<'PY'
+import torch
 
-version = im.version("fouroversix")
-if version != "1.1.0":
-    raise SystemExit(f"fouroversix {version} != 1.1.0")
-dist = im.distribution("fouroversix")
-so_files = [f for f in (dist.files or []) if str(f).endswith(".so")]
-if not so_files:
-    raise SystemExit("fouroversix wheel missing CUDA extension .so")
-print("fouroversix", version, "so", len(so_files))
+abi = str(torch._C._GLIBCXX_USE_CXX11_ABI).upper()
+if abi != "TRUE":
+    raise SystemExit(f"torch cxx11 abi {abi} != TRUE; fouroversix wheel pin is cxx11abiTRUE")
+print("torch abi", abi)
 PY
 
-# FlashAttention 2.8.3 from source, per docs/getting_started.md. Restricted to
-# SM 12.0 so the 72 CUDA translation units stay inside the CI build budget.
-RUN git init /tmp/flash-attention \
-    && git -C /tmp/flash-attention remote add origin https://github.com/Dao-AILab/flash-attention.git \
-    && git -C /tmp/flash-attention fetch --depth 1 origin "${FLASH_ATTN_REF}" \
-    && git -C /tmp/flash-attention checkout --detach FETCH_HEAD \
-    && FLASH_ATTENTION_FORCE_BUILD=TRUE FLASH_ATTN_CUDA_ARCHS=120 \
-       pip wheel --no-cache-dir --no-build-isolation --no-deps \
-         -w /opt/longlive-wheels /tmp/flash-attention \
-    && pip install --no-cache-dir --no-deps --no-build-isolation /opt/longlive-wheels/flash_attn-*.whl \
+RUN mkdir -p /opt/longlive-wheels \
+    && /tmp/fetch_pinned_wheel.sh "${FOUROVERSIX_WHEEL_URL}" \
+         /opt/longlive-wheels/fouroversix.whl "${FOUROVERSIX_WHEEL_SHA256}" \
+    && /tmp/fetch_pinned_wheel.sh "${FLASH_ATTN_WHEEL_URL}" \
+         /opt/longlive-wheels/flash_attn.whl "${FLASH_ATTN_WHEEL_SHA256}" \
+    && pip install --no-cache-dir --no-deps /opt/longlive-wheels/fouroversix.whl \
+         /opt/longlive-wheels/flash_attn.whl \
     && FLASH_ATTN_VERSION="${FLASH_ATTN_VERSION}" python - <<'PY' \
-    && rm -rf /tmp/flash-attention /root/.cache /tmp/* /var/tmp/*
+    && rm -rf /root/.cache /tmp/fetch_pinned_wheel.sh /tmp/* /var/tmp/*
 import importlib.metadata as im
 import os
 
 want = os.environ["FLASH_ATTN_VERSION"]
-version = im.version("flash_attn")
-if not version.startswith(want):
-    raise SystemExit(f"flash_attn {version} != {want}")
-dist = im.distribution("flash_attn")
-so_files = [f for f in (dist.files or []) if str(f).endswith(".so")]
-if not so_files:
-    raise SystemExit("flash_attn wheel missing CUDA extension .so")
-print("flash_attn", version, "so", len(so_files))
+flash_version = im.version("flash_attn")
+if not flash_version.startswith(want):
+    raise SystemExit(f"flash_attn {flash_version} != {want}")
+fouro_version = im.version("fouroversix")
+if fouro_version != "1.1.0":
+    raise SystemExit(f"fouroversix {fouro_version} != 1.1.0")
+for name in ("flash_attn", "fouroversix"):
+    dist = im.distribution(name)
+    if not any(str(f).endswith(".so") for f in (dist.files or [])):
+        raise SystemExit(f"{name} wheel missing CUDA extension .so")
+print("wheels ok", flash_version, fouro_version)
 PY
 
 COPY deploy/gpu-worker/patches/kv_dequant_sm120a.patch /tmp/kv_dequant_sm120a.patch

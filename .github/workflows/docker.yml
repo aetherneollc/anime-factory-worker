@@ -44,13 +44,55 @@ jobs:
           print(json.dumps(enabled, indent=2))
           PY
 
-  docker:
-    needs: matrix
+  moss:
     runs-on: ubuntu-latest
-    # The longlive target compiles FlashAttention 2.8.3, FourOverSix and the
-    # LongLive KV-dequant extension from source for SM 12.0. 360 minutes is the
-    # GitHub-hosted runner maximum and the only budget that fits those builds.
-    timeout-minutes: 360
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      actions: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        name: Tags
+        run: |
+          short="${GITHUB_SHA::7}"
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          image="ghcr.io/${owner}/anime-factory-worker-moss"
+          echo "image=${image}:sha-${short}" >> "$GITHUB_OUTPUT"
+          {
+            echo "tags<<EOF"
+            echo "${image}:sha-${short}"
+            echo "${image}:main"
+            echo "${image}:${GITHUB_SHA}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/gpu-worker/Dockerfile.moss
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: |
+            type=gha,scope=anime-factory-gpu-moss,ignore-error=true
+            type=registry,ref=ghcr.io/${{ github.repository_owner }}/anime-factory-worker-moss:main,ignore-error=true
+          cache-to: type=gha,mode=min,scope=anime-factory-gpu-moss,ignore-error=true
+
+  docker:
+    needs: [matrix, moss]
+    runs-on: ubuntu-latest
+    # Wheels plus one small KV-dequant kernel. 90 minutes is enough once FlashAttention
+    # and FourOverSix are no longer compiled from source.
+    timeout-minutes: 90
     if: needs.matrix.outputs.targets != '[]'
     strategy:
       fail-fast: false
@@ -74,12 +116,11 @@ jobs:
           echo "Disk after cleanup:"
           df -h
 
-      # nvcc peaks well above the 16 GB runner RAM with MAX_JOBS=2 x NVCC_THREADS=2.
-      # Swap keeps the CUDA extension builds from being OOM-killed mid-compile.
       - name: Add build swap
+        if: matrix.target.id == 'longlive'
         run: |
           sudo swapoff -a || true
-          sudo fallocate -l 16G /mnt/buildswap
+          sudo fallocate -l 8G /mnt/buildswap
           sudo chmod 600 /mnt/buildswap
           sudo mkswap /mnt/buildswap
           sudo swapon /mnt/buildswap
@@ -117,5 +158,9 @@ jobs:
           platforms: ${{ join(matrix.target.platforms, ',') }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
-          cache-from: type=gha,scope=anime-factory-gpu-${{ matrix.target.id }},ignore-error=true
+          build-args: |
+            MOSS_IMAGE=${{ needs.moss.outputs.image }}
+          cache-from: |
+            type=gha,scope=anime-factory-gpu-${{ matrix.target.id }},ignore-error=true
+            type=registry,ref=ghcr.io/${{ github.repository_owner }}/${{ matrix.target.image_name }}:main,ignore-error=true
           cache-to: type=gha,mode=min,scope=anime-factory-gpu-${{ matrix.target.id }},ignore-error=true

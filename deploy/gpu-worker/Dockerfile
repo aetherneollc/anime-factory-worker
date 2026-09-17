@@ -2,20 +2,10 @@
 # Weights are NOT baked — first boot pulls HuggingFace onto instance-local disk (never R2).
 # H3-only production image: official torch cu128 wheels; no CUDA extension compile path.
 # Labels must stay comfy/h3/kolors/image-gen true so the scheduler will lease.
+# MOSS runtime is the shared moss image, not rebuilt here.
 
-FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04 AS moss-sfx
-
-ARG MOSS_TTS_REF=934d6826b084c46a0d033402174d5f8ac4ed2519
-ARG MOSS_TORCH=2.9.0
-ARG MOSS_TORCHAUDIO=2.9.0
-ARG MOSS_TORCHVISION=0.24.0
-
-COPY deploy/gpu-worker/install_moss_sfx_runtime.sh /tmp/install_moss_sfx_runtime.sh
-RUN chmod +x /tmp/install_moss_sfx_runtime.sh \
-    && MOSS_TTS_REF="${MOSS_TTS_REF}" MOSS_TORCH="${MOSS_TORCH}" \
-       MOSS_TORCHAUDIO="${MOSS_TORCHAUDIO}" MOSS_TORCHVISION="${MOSS_TORCHVISION}" \
-       /tmp/install_moss_sfx_runtime.sh \
-    && rm -f /tmp/install_moss_sfx_runtime.sh
+ARG MOSS_IMAGE=ghcr.io/aetherneollc/anime-factory-worker-moss:main
+FROM ${MOSS_IMAGE} AS moss-sfx
 
 FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04
 
