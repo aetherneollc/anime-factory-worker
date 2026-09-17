@@ -250,6 +250,16 @@ def test_docker_images_bake_official_isolated_moss_runtime(docker_name):
     assert f"ARG MOSS_TTS_REF={pins['MOSS_TTS_REF']}" in text
     assert "install_moss_sfx_runtime.sh" in text
     assert 'test "$(git -C /tmp/MOSS-TTS rev-parse HEAD)" = "${MOSS_TTS_REF}"' in install
+    assert '--no-deps --only-binary=:all:' in install
+    assert '"descript-audiotools==0.7.2"' in install
+    assert '"from .layers import BaseModel\\n"' in install
+    binary_block = install.split(
+        "/opt/moss-sfx/bin/pip install --only-binary=:all:",
+    )[-1].split(
+        "/opt/moss-sfx/bin/pip install --no-deps --only-binary=:all:",
+        1,
+    )[0]
+    assert '\n    "descript-audiotools' not in binary_block
     assert "ARG MOSS_TORCH=2.9.0" in text
     assert "ARG MOSS_TORCHAUDIO=2.9.0" in text
     assert "ARG MOSS_TORCHVISION=0.24.0" in text

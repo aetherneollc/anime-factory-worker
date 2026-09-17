@@ -60,8 +60,31 @@ fi
     "soundfile==0.13.1" \
     "imageio==2.37.3" \
     "typing-extensions>=4.10" \
-    "descript-audiotools==0.7.2" \
-    "huggingface_hub>=0.26.0"
+    "huggingface_hub>=0.26.0" \
+    "scipy==1.17.1" \
+    "julius==0.2.8" \
+    "ffmpy==1.0.0" \
+    "importlib-resources==7.1.0" \
+    "flatten-dict==0.5.0"
+
+# MOSS only needs AudioSignal and BaseModel from descript-audiotools. Installing
+# its full dependency graph pulls source-only argbind/randomname packages (which
+# --only-binary correctly rejects) plus training/notebook dependencies. Install
+# the wheel without those extras and keep its eagerly imported ml namespace to
+# the inference surface used by the pinned DAC implementation.
+/opt/moss-sfx/bin/pip install --no-deps --only-binary=:all: \
+    "descript-audiotools==0.7.2"
+/opt/moss-sfx/bin/python - <<'PY'
+from pathlib import Path
+
+site_packages = next(Path("/opt/moss-sfx/lib").glob("python*/site-packages"))
+ml_init = site_packages / "audiotools" / "ml" / "__init__.py"
+ml_init.write_text(
+    "from . import layers\n"
+    "from .layers import BaseModel\n",
+    encoding="utf-8",
+)
+PY
 
 cd /opt/moss-sfx/source/moss_soundeffect_v2
 /opt/moss-sfx/bin/pip install --no-deps -e .
