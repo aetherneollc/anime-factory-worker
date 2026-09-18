@@ -17,7 +17,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     MAX_JOBS=2 \
     NVCC_THREADS=2 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    PIP_BREAK_SYSTEM_PACKAGES=1
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git patch ca-certificates ninja-build \
@@ -39,7 +40,8 @@ if torch.version.cuda != "12.8":
     raise SystemExit(f"torch CUDA {torch.version.cuda} != 12.8")
 PY
 
-RUN python -m pip install --no-cache-dir ninja packaging wheel "setuptools>=77.0.3"
+RUN python -m pip install --no-cache-dir --break-system-packages \
+        ninja packaging wheel setuptools
 
 COPY deploy/gpu-worker/patches/kv_dequant_sm120a.patch /tmp/kv_dequant_sm120a.patch
 RUN git init /opt/LongLive \
