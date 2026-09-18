@@ -40,6 +40,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     VIRTUAL_ENV=/opt/venv \
     PATH=/opt/venv/bin:$PATH \
     PIP_ONLY_BINARY=:all: \
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
     CUDA_ARCHS=120 \
     LONGLIVE_WHEELS=/opt/longlive-wheels \
     AF_IMAGE_CAPABILITY=longlive \
@@ -49,15 +50,23 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
          ca-certificates curl ffmpeg git git-lfs libsndfile1 \
-         fontconfig fonts-noto-cjk \
+         fontconfig fonts-noto-cjk python3-venv \
     && case "${TARGETARCH}" in amd64|x86_64) cf_arch=amd64 ;; arm64|aarch64) cf_arch=arm64 ;; *) cf_arch=amd64 ;; esac \
     && curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}" \
          -o /usr/local/bin/cloudflared \
     && chmod +x /usr/local/bin/cloudflared \
     && git lfs install \
-    && python -m venv --system-site-packages /opt/venv \
-    && pip install --no-cache-dir --only-binary=:all: --upgrade pip \
-    && git init /opt/ComfyUI \
+    && apt-get purge -y --auto-remove gcc g++ cpp \
+    && rm -rf /var/lib/apt/lists/*
+
+# Official runtime Python is Debian 3.12 (PEP 668) plus torch under /usr/local.
+# python3-venv is required; conda-style ensurepip is not present.
+RUN python -m venv --system-site-packages /opt/venv \
+    || { rm -rf /opt/venv && python -m venv --system-site-packages --without-pip /opt/venv; } \
+    && /opt/venv/bin/python -m pip install --no-cache-dir --only-binary=:all: --upgrade pip \
+    && /opt/venv/bin/python -c "import torch; print('venv torch', torch.__version__, torch.version.cuda)"
+
+RUN git init /opt/ComfyUI \
     && git -C /opt/ComfyUI remote add origin https://github.com/comfyanonymous/ComfyUI.git \
     && git -C /opt/ComfyUI fetch --depth 1 origin "${COMFYUI_REF}" \
     && git -C /opt/ComfyUI checkout --detach FETCH_HEAD \
