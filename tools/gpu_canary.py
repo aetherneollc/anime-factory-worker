@@ -64,7 +64,8 @@ INSTANCE_RESOLVE_MAX_ATTEMPTS = 5
 INSTANCE_RESOLVE_RETRY_S = 2.0
 DELETE_CONFIRM_MAX_ATTEMPTS = 5
 V1_GONE_STREAK = 3
-CANARY_GONE_RETRIES = 2
+# Live canary: one lease per invocation — no auto re-lease after instance_gone.
+CANARY_GONE_RETRIES = 0
 # Match packages/cf-control seasons.ts PULL_STUCK_MS — Vast `loading` is docker pull.
 CANARY_PULL_STATES = frozenset({"loading", "creating", "created", "pending"})
 CANARY_PULL_STALL_S = 12 * 60
@@ -425,12 +426,12 @@ def r2_output_artifacts_present(
     episode: str = DEFAULT_EPISODE,
     backend: str = "h3",
 ) -> list[str]:
-    """Return generated output keys/prefixes that forbid a fresh canary lease."""
+    """Return generation artifacts that forbid a fresh canary lease.
+
+    Pre-seeded still assets (hero sheets, loc plates, index.json, story.sqlite)
+    are allowed so a retry can skip the Flux still pipeline and go straight to H3.
+    """
     found: list[str] = []
-    found.extend(_r2_list_keys(join_story(story_id, "assets/"), max_keys=500))
-    sqlite_key = join_story(story_id, "story.sqlite")
-    if _r2_key_nonempty(sqlite_key):
-        found.append(sqlite_key)
     if _r2_has_shot_video_mp4(story_id, episode, backend=backend):
         if normalize_canary_backend(backend) == "longlive":
             found.append(r2_generation_shot_prefix(story_id, DEFAULT_CANARY_SHOT_ID) + "{generation-*,v*.mp4}")

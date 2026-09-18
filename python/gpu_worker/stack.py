@@ -773,6 +773,91 @@ def want_comfy_lowvram(vram_mb: int | None = None) -> bool:
     return os.environ.get("AF_COMFY_LOWVRAM", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def comfy_subprocess_env() -> dict[str, str]:
+    """Environment for the Comfy child process.
+
+    The agent image sets ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`` for
+    in-process torch. Comfy's ``cuda_malloc.py`` appends ``backend:cudaMallocAsync``
+    for cu130 before the first torch import; that combination SIGSEGVs on RTX 5090.
+    ``--disable-cuda-malloc`` in :func:`comfy_launch_args` prevents the append.
+    """
+    return os.environ.copy()
+
+
+_COMFY_TORCH_PROBE_SCRIPT = r"""
+import os
+import sys
+
+comfy_dir = sys.argv[-1]
+flags = sys.argv[1:-1]
+sys.argv = ["main.py", *flags]
+os.chdir(comfy_dir)
+sys.path.insert(0, comfy_dir)
+import comfy.options
+
+comfy.options.enable_args_parsing()
+import cuda_malloc  # noqa: F401 — must run before torch, same as Comfy main.py
+import torch
+
+if torch.cuda.is_available():
+    x = torch.zeros(1, device="cuda")
+    torch.cuda.synchronize()
+    if int((x + 1).item()) != 1:
+        raise SystemExit("cuda_smoke_failed")
+print("ok")
+"""
+
+
+def probe_comfy_torch_import(
+    main_py: Path | None = None,
+    *,
+    timeout_s: float = 120.0,
+) -> dict[str, Any]:
+    """Fail closed before Comfy main.py if the cuda_malloc→torch path SIGSEGVs."""
+    launch = comfy_launch_args(main_py)
+    comfy = str(launch[1])
+    flags = launch[2:]
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _COMFY_TORCH_PROBE_SCRIPT, *flags, comfy],
+            env=comfy_subprocess_env(),
+            capture_output=True,
+            text=True,
+            timeout=max(1.0, float(timeout_s)),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise PreflightFailure(
+            "comfy_startup_failed",
+            "torch_import_timeout",
+            f"Comfy torch import probe timed out after {timeout_s:.0f}s",
+            {"timeout_s": timeout_s, "stdout": (exc.stdout or "")[-500:], "stderr": (exc.stderr or "")[-500:]},
+        ) from exc
+    tail = "\n".join(
+        part
+        for part in (
+            (proc.stdout or "").strip(),
+            (proc.stderr or "").strip(),
+        )
+        if part
+    )
+    if proc.returncode in {-11, 139}:
+        raise PreflightFailure(
+            "comfy_startup_failed",
+            "torch_import_sigsegv",
+            "Comfy torch import segfaulted (exit -11); "
+            "PYTORCH_CUDA_ALLOC_CONF expandable_segments + cudaMallocAsync is incompatible on cu130",
+            {"returncode": proc.returncode, "tail": tail[-1200:]},
+        )
+    if proc.returncode != 0:
+        raise PreflightFailure(
+            "comfy_startup_failed",
+            "torch_import_failed",
+            f"Comfy torch import probe failed: exit {proc.returncode}",
+            {"returncode": proc.returncode, "tail": tail[-1200:]},
+        )
+    return {"ok": True, "returncode": proc.returncode}
+
+
 def comfy_launch_args(
     main_py: Path | None = None,
     extra_paths: Path | None = None,
@@ -787,6 +872,7 @@ def comfy_launch_args(
         "--port",
         "8188",
         "--disable-auto-launch",
+        "--disable-cuda-malloc",
     ]
     if want_comfy_lowvram(vram_mb):
         args.append("--lowvram")
@@ -814,8 +900,12 @@ def _start_comfy_logged(args: list[str]) -> subprocess.Popen:
     with COMFY_BOOT_LOG.open("ab") as logf:
         logf.write(f"\n--- comfy start {_utc_iso()} ---\n".encode())
     log_handle = COMFY_BOOT_LOG.open("ab", buffering=0)
-    env = os.environ.copy()
-    return subprocess.Popen(args, env=env, stdout=log_handle, stderr=subprocess.STDOUT)
+    return subprocess.Popen(
+        args,
+        env=comfy_subprocess_env(),
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+    )
 
 
 def comfy_process_exited(proc: subprocess.Popen | None) -> bool:
@@ -1165,6 +1255,9 @@ def boot_gpu_stack(progress: Callable[[str], None] | None = None) -> dict:
             progress("startup_stage:weights:stills")
         weights = ensure_still_weights(COMFY_DIR, progress=progress)
         if progress:
+            progress("startup_stage:comfy_torch_probe")
+        probe_comfy_torch_import()
+        if progress:
             progress("startup_stage:start_comfy")
         comfy = start_comfy()
         comfy_wait = wait_comfy_process(
@@ -1242,6 +1335,9 @@ def boot_gpu_stack(progress: Callable[[str], None] | None = None) -> dict:
     if progress:
         progress("startup_stage:weights:stills")
     weights = ensure_still_weights(COMFY_DIR, progress=progress)
+    if progress:
+        progress("startup_stage:comfy_torch_probe")
+    probe_comfy_torch_import()
     if progress:
         progress("startup_stage:start_comfy")
     comfy = start_comfy()

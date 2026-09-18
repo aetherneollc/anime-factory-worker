@@ -513,3 +513,32 @@ def test_sitecustomize_does_not_import_torch_at_startup():
     assert not any(line.strip() == "import torch" for line in preamble.splitlines())
     assert "_AfTorchPatchFinder" in _SITECUSTOMIZE_INFER_SCHEMA
 
+
+def test_comfy_launch_args_disable_cuda_malloc(monkeypatch):
+    """expandable_segments + cudaMallocAsync (cu130 default) SIGSEGVs; Comfy must opt out."""
+    from gpu_worker import stack
+
+    monkeypatch.delenv("AF_GPU_PROFILE", raising=False)
+    args = stack.comfy_launch_args()
+    assert "--disable-cuda-malloc" in args
+    assert "--disable-pinned-memory" in args
+
+
+def test_probe_comfy_torch_import_maps_sigsegv_to_preflight(monkeypatch):
+    from gpu_worker import stack
+    from gpu_worker.preflight import PreflightFailure
+
+    class _Proc:
+        returncode = -11
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(stack.subprocess, "run", lambda *_a, **_k: _Proc())
+    try:
+        stack.probe_comfy_torch_import()
+        raise AssertionError("must fail closed on SIGSEGV")
+    except PreflightFailure as exc:
+        assert exc.failure_class == "comfy_startup_failed"
+        assert exc.code == "torch_import_sigsegv"
+        assert "cudaMallocAsync" in exc.message
+

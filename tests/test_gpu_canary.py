@@ -840,17 +840,13 @@ def test_main_loads_dotenv_before_reading_env(monkeypatch, tmp_path, capsys):
     assert "hf_dotenv_secret_token" not in out
 
 
-def test_instance_gone_retries_other_offer(monkeypatch):
+def test_instance_gone_does_not_re_lease(monkeypatch):
     monkeypatch.setenv("VAST_API_KEY", "k-test")
     monkeypatch.setenv("VAST_ALLOW_REPLACE", "0")
     monkeypatch.setattr(gc, "r2_live_preflight", lambda *_a, **_k: {"ok": True, "reason": "ready"})
-    polls = [
-        {"status": "failed", "reason": "instance_gone"},
-        {"status": "success", "reason": "r2_canary"},
-    ]
     leases: list[str] = []
 
-    class RetryWatchdog(gc.CanaryWatchdog):
+    class NoRetryWatchdog(gc.CanaryWatchdog):
         def lease_selected(self, offer, *, image_ref, lease_env):
             oid = str(offer.get("id"))
             leases.append(oid)
@@ -858,7 +854,7 @@ def test_instance_gone_retries_other_offer(monkeypatch):
             return {"action": "leased", "offer_id": oid, "instance_id": f"inst-{oid}"}
 
         def poll_until_done(self, offer):
-            return polls.pop(0)
+            return {"status": "failed", "reason": "instance_gone"}
 
         def destroy_registered(self):
             self._instance_id = None
@@ -875,15 +871,15 @@ def test_instance_gone_retries_other_offer(monkeypatch):
         return {"instances": []}
 
     client = VastClient("fake", opener=opener, dry_run=False)
-    wd = RetryWatchdog(
+    wd = NoRetryWatchdog(
         _cfg(live=True, confirm=gc.LIVE_CONFIRM_PHRASE, api_key="k-test"),
         client=client,
     )
     out = wd.run()
-    assert leases[0] == "offer-a"
-    assert "offer-b" in leases
-    assert out["final_status"] == "success"
-    assert out["gone_retries"] == 1
+    assert leases == ["offer-a"]
+    assert out["final_status"] == "failed"
+    assert out["poll"]["reason"] == "instance_gone"
+    assert "gone_retries" not in out
 
 
 class _FakeClock:
@@ -1083,13 +1079,13 @@ def test_poll_progress_includes_status_msg(capsys):
     assert "Pulling from" in err
 
 
-def test_destroy_failure_blocks_gone_retry(monkeypatch):
+def test_destroy_failure_does_not_re_lease(monkeypatch):
     monkeypatch.setenv("VAST_API_KEY", "k-test")
     monkeypatch.setenv("VAST_ALLOW_REPLACE", "0")
     monkeypatch.setattr(gc, "r2_live_preflight", lambda *_a, **_k: {"ok": True, "reason": "ready"})
     leases: list[str] = []
 
-    class RetryWatchdog(gc.CanaryWatchdog):
+    class NoRetryWatchdog(gc.CanaryWatchdog):
         def lease_selected(self, offer, *, image_ref, lease_env):
             oid = str(offer.get("id"))
             leases.append(oid)
@@ -1110,14 +1106,15 @@ def test_destroy_failure_blocks_gone_retry(monkeypatch):
         return {"instances": []}
 
     client = VastClient("fake", opener=opener, dry_run=False)
-    wd = RetryWatchdog(
+    wd = NoRetryWatchdog(
         _cfg(live=True, confirm=gc.LIVE_CONFIRM_PHRASE, api_key="k-test"),
         client=client,
     )
     out = wd.run()
     assert leases == ["offer-a"]
-    assert out["reason"] == "destroy_failed_before_retry"
-    assert "inst-offer-a" in wd._allowlist
+    assert out["final_status"] == "failed"
+    assert out["poll"]["reason"] == "instance_gone"
+    assert out.get("reason") != "destroy_failed_before_retry"
 
 
 def test_sigint_does_not_put_another_ask(monkeypatch):

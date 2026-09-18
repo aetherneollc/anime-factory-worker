@@ -756,6 +756,7 @@ def test_stack_boot_reports_startup_stages_and_font_verification(monkeypatch):
     monkeypatch.setattr(stack, "patch_kitchen_triton_optional", lambda: False)
     monkeypatch.setattr(stack, "patch_comfy_kitchen_for_torch26", lambda: [])
     monkeypatch.setattr(stack, "probe_comfy_nodes", lambda *_a, **_k: {"nodes": ["IPAdapterAdvanced"]})
+    monkeypatch.setattr(stack, "probe_comfy_torch_import", lambda **_k: {"ok": True})
 
     def stills(_root, progress=None):
         if progress:
@@ -790,6 +791,7 @@ def test_stack_boot_reports_startup_stages_and_font_verification(monkeypatch):
     assert "startup_stage:preflight" in events
     assert "startup_stage:fonts" in events
     assert "startup_stage:weights:stills" in events
+    assert "startup_stage:comfy_torch_probe" in events
     assert "startup_stage:weights:h3_background" in events
     assert result["h3_weights_background"] is True
     assert "startup_bytes:1024" in events
@@ -812,6 +814,7 @@ def test_stack_boot_longlive_starts_comfy_stills_skips_h3(monkeypatch):
     monkeypatch.setattr(stack, "ensure_infer_schema_sitecustomize", lambda: None)
     monkeypatch.setattr(stack, "patch_kitchen_triton_optional", lambda: False)
     monkeypatch.setattr(stack, "patch_comfy_kitchen_for_torch26", lambda: [])
+    monkeypatch.setattr(stack, "probe_comfy_torch_import", lambda **_k: {"ok": True})
 
     def stills(_root, progress=None):
         if progress:
@@ -905,6 +908,13 @@ def test_budget_defaults_and_global_usd_clamp(monkeypatch):
 
 
 def test_watch_usd_is_independently_configurable(monkeypatch):
+    for name in (
+        "VAST_MAX_LEASE_MINUTES",
+        "VAST_MAX_LEASE_USD",
+        "VAST_IDLE_MINUTES",
+        "VAST_WATCH_USD",
+    ):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("VAST_WATCH_USD", "27.5")
     runtime = session.LeaseRuntime(instance_id="123")
     assert runtime.watch_usd == 27.5
@@ -2236,6 +2246,7 @@ def test_stack_boot_surfaces_comfy_exit_before_router_wait(monkeypatch):
     monkeypatch.setattr(stack, "ensure_infer_schema_sitecustomize", lambda: None)
     monkeypatch.setattr(stack, "patch_kitchen_triton_optional", lambda: False)
     monkeypatch.setattr(stack, "patch_comfy_kitchen_for_torch26", lambda: [])
+    monkeypatch.setattr(stack, "probe_comfy_torch_import", lambda **_k: {"ok": True})
     monkeypatch.setattr(stack, "ensure_still_weights", lambda *_a, **_k: {"kind": "stills"})
     monkeypatch.setattr(stack, "start_h3_weights_background", lambda *_a, **_k: None)
     monkeypatch.setattr(stack, "start_comfy", lambda: SimpleNamespace(pid=99, poll=lambda: 1))

@@ -262,6 +262,7 @@ def test_probe_comfy_nodes_missing_node_fails(monkeypatch):
 def test_recycle_failure_class_maps_stable_codes():
     assert recycle_failure_class("capability_mismatch:torch_abi") == "capability_mismatch"
     assert recycle_failure_class("comfy_startup_failed:exit_1") == "comfy_startup_failed"
+    assert recycle_failure_class("comfy_startup_failed:torch_import_sigsegv") == "comfy_startup_failed"
     assert recycle_failure_class(PreflightFailure("preflight_failed", "nvidia_smi", "no gpu")) == (
         "preflight_failed"
     )
