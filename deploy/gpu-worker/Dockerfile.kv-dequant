@@ -1,0 +1,78 @@
+# Tiny NVFP4 KV-dequant wheel. Built rarely; the LongLive worker copies this
+# artifact instead of pulling CUDA devel and compiling on every image build.
+# Upstream LongLive@6b36d20 hardcodes sm_100a; RTX 5090 needs sm_120a.
+#
+# Official PyTorch devel already has Python 3.12 + torch 2.10.0+cu128 + nvcc.
+# Do not pip install torch here.
+
+FROM pytorch/pytorch:2.10.0-cuda12.8-cudnn9-devel@sha256:b574d4ccf6d8856a5d87dcadc667aa4f95dc18d337ef3a28d02b7b01897d7081 AS build
+
+ARG LONGLIVE_REF=6b36d20ec6f7958d29d11a704dfa64611a9f2572
+ARG LONGLIVE_TORCH=2.10.0
+ARG LONGLIVE_TORCHVISION=0.25.0
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    CUDA_HOME=/usr/local/cuda \
+    TORCH_CUDA_ARCH_LIST=12.0 \
+    MAX_JOBS=2 \
+    NVCC_THREADS=2 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git patch ca-certificates \
+    && python -c "import sys; v=sys.version_info; assert (v.major, v.minor) == (3, 12), sys.version" \
+    && pip install --no-cache-dir ninja packaging wheel "setuptools>=77.0.3" \
+    && LONGLIVE_TORCH="${LONGLIVE_TORCH}" LONGLIVE_TORCHVISION="${LONGLIVE_TORCHVISION}" python - <<'PY' \
+    && rm -rf /var/lib/apt/lists/* /root/.cache /tmp/* /var/tmp/*
+import os
+import torch
+import torchvision
+
+want_torch = os.environ["LONGLIVE_TORCH"] + "+cu128"
+want_tv = os.environ["LONGLIVE_TORCHVISION"] + "+cu128"
+if torch.__version__ != want_torch:
+    raise SystemExit(f"torch {torch.__version__} != {want_torch}")
+if torchvision.__version__ != want_tv:
+    raise SystemExit(f"torchvision {torchvision.__version__} != {want_tv}")
+if torch.version.cuda != "12.8":
+    raise SystemExit(f"torch CUDA {torch.version.cuda} != 12.8")
+print("kv-dequant torch", torch.__version__, "cuda", torch.version.cuda)
+PY
+
+COPY deploy/gpu-worker/patches/kv_dequant_sm120a.patch /tmp/kv_dequant_sm120a.patch
+RUN git init /opt/LongLive \
+    && git -C /opt/LongLive remote add origin https://github.com/NVlabs/LongLive.git \
+    && git -C /opt/LongLive fetch --depth 1 origin "${LONGLIVE_REF}" \
+    && git -C /opt/LongLive checkout --detach FETCH_HEAD \
+    && test -f /opt/LongLive/utils/kernel/setup.py \
+    && grep -q 'compute_100a,code=sm_100a' /opt/LongLive/utils/kernel/setup.py
+
+WORKDIR /opt/LongLive/utils/kernel
+RUN patch -p1 --forward --batch < /tmp/kv_dequant_sm120a.patch \
+    && grep -q 'compute_120a,code=sm_120a' setup.py \
+    && ! grep -q 'compute_100a,code=sm_100a' setup.py \
+    || (echo "kv_dequant_sm120a patch failed closed" >&2; exit 1) \
+    && python setup.py bdist_wheel \
+    && mkdir -p /opt/longlive-wheels \
+    && cp dist/*.whl /opt/longlive-wheels/ \
+    && python - <<'PY' \
+    && rm -rf /root/.cache /tmp/* /var/tmp/* build dist
+import zipfile
+from pathlib import Path
+
+text = Path("setup.py").read_text(encoding="utf-8")
+if "compute_100a,code=sm_100a" in text or "compute_120a,code=sm_120a" not in text:
+    raise SystemExit("kv_dequant gencode contract violated")
+wheels = list(Path("/opt/longlive-wheels").glob("longlive_kv_dequant_cuda*.whl"))
+if not wheels:
+    raise SystemExit("kv_dequant bdist_wheel produced no wheel")
+with zipfile.ZipFile(wheels[0]) as archive:
+    sos = [name for name in archive.namelist() if name.endswith(".so")]
+if not sos:
+    raise SystemExit("kv_dequant wheel missing CUDA extension .so")
+print("kv_dequant wheel ok", wheels[0].name, sos[0])
+PY
+
+FROM scratch
+COPY --from=build /opt/longlive-wheels /opt/longlive-wheels

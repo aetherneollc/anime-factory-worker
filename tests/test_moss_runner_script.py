@@ -276,7 +276,8 @@ def test_docker_images_bake_official_isolated_moss_runtime(docker_name):
     assert "OpenMOSS-Team/MOSS-SoundEffect-v2.0" not in text
     assert "huggingface-cli download" not in text
     assert "/moss_soundeffect_v2/finetuning" not in text
-    final_stage = text.rsplit("FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04", 1)[-1]
+    final_from = [line for line in text.splitlines() if line.startswith("FROM ")][-1]
+    final_stage = text.rsplit(final_from, 1)[-1]
     assert "python3-dev" not in final_stage
     assert "ninja-build" not in final_stage
     assert 'shutil.which("nvcc")' in final_stage

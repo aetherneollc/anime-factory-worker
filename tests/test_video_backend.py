@@ -530,17 +530,22 @@ def test_h3_backend_unchanged_by_longlive_defaults():
 
 
 def test_dockerfile_h3_only_no_compile():
-    text = (Path(__file__).resolve().parents[1] / "deploy" / "gpu-worker" / "Dockerfile").read_text(
-        encoding="utf-8"
+    root = Path(__file__).resolve().parents[1]
+    text = (root / "deploy" / "gpu-worker" / "Dockerfile").read_text(encoding="utf-8")
+    pins = dict(
+        line.split("=", 1)
+        for line in (root / "deploy" / "gpu-worker" / "pins.env").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.startswith("#")
     )
-    assert text.count("FROM nvidia/cuda") == 1
+    assert text.count("FROM nvidia/cuda") == 0
+    assert pins["H3_PYTORCH_IMAGE"] in text
     assert "ARG MOSS_IMAGE=" in text
     assert "FROM ${MOSS_IMAGE} AS moss-sfx" in text
-    assert "13.0.0-runtime-ubuntu24.04" in text
+    assert "13.0.0-runtime-ubuntu24.04" not in text
     assert "devel-ubuntu" not in text
-    assert "torch==2.13.0+cu130" in text
-    assert "torchvision==0.28.0+cu130" in text
-    assert "torchaudio==2.11.0+cu130" in text
+    assert '"2.13.0+cu130"' in text
+    assert '"0.28.0+cu130"' in text
+    assert '"2.11.0+cu130"' in text
     assert "KJ_NODES_REF=d3cfe21625e5170126ce06fbfcfe1d88108688c3" in text
     assert "org.aetherneo.anime-factory.h3=\"true\"" in text
     assert "org.aetherneo.anime-factory.comfy=\"true\"" in text
@@ -551,6 +556,8 @@ def test_dockerfile_h3_only_no_compile():
     assert "huggingface_hub" in text
     assert "boto3" in text
     assert "open_clip_torch==2.32.0" in text
+    assert "python -m venv --system-site-packages /opt/venv" in text
+    assert "pip install --no-cache-dir --only-binary=:all: --index-url https://download.pytorch.org/whl" not in text
     forbidden = (
         "nvfp4",
         "LongLive",

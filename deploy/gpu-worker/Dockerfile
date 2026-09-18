@@ -1,13 +1,14 @@
 # Anime Factory GPU worker: ComfyUI + MiniMax H3 + anime SDXL 生图 (IP-Adapter) + agent + ffmpeg + cloudflared.
 # Weights are NOT baked — first boot pulls HuggingFace onto instance-local disk (never R2).
-# H3-only production image: official torch cu130 wheels; no CUDA extension compile path.
+# H3-only production image: official pytorch/pytorch cu130 runtime (torch trio already
+# present). No CUDA extension compile path and no torch reinstall.
 # Labels must stay comfy/h3/kolors/image-gen true so the scheduler will lease.
 # MOSS runtime is the shared moss image, not rebuilt here.
 
 ARG MOSS_IMAGE=ghcr.io/aetherneollc/anime-factory-worker-moss:main
 FROM ${MOSS_IMAGE} AS moss-sfx
 
-FROM nvidia/cuda:13.0.0-runtime-ubuntu24.04
+FROM pytorch/pytorch:2.13.0-cuda13.0-cudnn9-runtime@sha256:db80a41f8428644cebcb3d75b0b62df334ab6c0e75785951eb25f48bfbd42407
 
 ARG TARGETARCH=amd64
 # Immutable source revisions. Update only after the image canary passes.
@@ -25,17 +26,15 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-         python3 python3-venv ca-certificates curl ffmpeg git git-lfs libsndfile1 \
+         ca-certificates curl ffmpeg git git-lfs libsndfile1 \
          fontconfig fonts-noto-cjk \
     && case "${TARGETARCH}" in amd64|x86_64) cf_arch=amd64 ;; arm64|aarch64) cf_arch=arm64 ;; *) cf_arch=amd64 ;; esac \
     && curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}" \
          -o /usr/local/bin/cloudflared \
     && chmod +x /usr/local/bin/cloudflared \
     && git lfs install \
-    && python3 -m venv /opt/venv \
+    && python -m venv --system-site-packages /opt/venv \
     && pip install --no-cache-dir --only-binary=:all: --upgrade pip \
-    && pip install --no-cache-dir --only-binary=:all: --index-url https://download.pytorch.org/whl/cu130 \
-         torch==2.13.0+cu130 torchvision==0.28.0+cu130 torchaudio==2.11.0+cu130 \
     && git init /opt/ComfyUI \
     && git -C /opt/ComfyUI remote add origin https://github.com/comfyanonymous/ComfyUI.git \
     && git -C /opt/ComfyUI fetch --depth 1 origin "${COMFYUI_REF}" \

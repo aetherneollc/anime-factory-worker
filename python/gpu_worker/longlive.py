@@ -101,8 +101,8 @@ SETUP_HINT = (
     "Sidecar-only Wan files under LONGLIVE_WAN_DIR: config.json, Wan2.2_VAE.pth, "
     "models_t5_umt5-xxl-enc-bf16.pth, google/umt5-xxl/. "
     "Do not snapshot the full Wan-AI/Wan2.2-TI2V-5B training repo. "
-    "Do not load the BF16 generator. FourOverSix is baked as an SM 12.0 wheel in the Hub "
-    "image; first boot must not pip install -e (that needs nvcc and fails on slim). "
+    "Do not load the BF16 generator. FourOverSix, flash-attn, and KV-dequant are baked "
+    "wheels in the Hub image; first boot must not pip install -e (that needs nvcc and fails on slim). "
     "First boot pulls Hub onto this card when AF_VIDEO_BACKEND=longlive. "
     "No Comfy node and no commercial API — do not fake an mp4."
 )
@@ -519,13 +519,26 @@ def _build_kv_dequant_kernel(progress: ProgressCallback | None = None) -> None:
     if progress:
         progress("weights:longlive:kv_dequant")
     kernel_dir = longlive_root() / "utils" / "kernel"
-    if not (kernel_dir / "setup.py").is_file():
+    if not (kernel_dir / "setup.py").is_file() and not (kernel_dir / "kv_dequant.py").is_file():
         raise RuntimeError(f"{FAIL_CLOSED}: LongLive KV dequant setup missing at {kernel_dir}. {SETUP_HINT}")
+    env = _longlive_inference_env()
+    wheel = _prebuilt_wheel("longlive_kv_dequant")
+    if wheel is not None:
+        try:
+            _install_wheel(wheel, env)
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(
+                f"{FAIL_CLOSED}: KV dequant wheel install failed (exit {exc.returncode}). {SETUP_HINT}"
+            ) from exc
+        if _kv_dequant_ready():
+            return
     if production_stack_locked():
         raise RuntimeError(
             f"{FAIL_CLOSED}: KV dequant extension missing in production image. "
             f"Live compile is forbidden. {SETUP_HINT}"
         )
+    if not (kernel_dir / "setup.py").is_file():
+        raise RuntimeError(f"{FAIL_CLOSED}: LongLive KV dequant setup missing at {kernel_dir}. {SETUP_HINT}")
     if not _nvcc_available():
         raise RuntimeError(
             f"{FAIL_CLOSED}: utils/kernel KV dequant missing and nvcc is not on this image. {SETUP_HINT}"
@@ -533,7 +546,6 @@ def _build_kv_dequant_kernel(progress: ProgressCallback | None = None) -> None:
     from gpu_worker.stack import ensure_c_compiler
 
     ensure_c_compiler()
-    env = _longlive_inference_env()
     subprocess.run(
         [python_bin(), "setup.py", "build_ext", "--inplace"],
         check=True,

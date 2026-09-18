@@ -364,25 +364,33 @@ def test_clone_pins_nvlabs_commit():
 
 def test_dockerfile_longlive_contract():
     root = Path(__file__).resolve().parents[1]
-    text = (root / "deploy" / "gpu-worker" / "Dockerfile.longlive").read_text(encoding="utf-8")
-    assert "12.8.1-devel-ubuntu24.04" in text
-    assert "12.8.1-runtime-ubuntu24.04" in text
-    assert text.count("FROM nvidia/cuda") == 2
+    deploy = root / "deploy" / "gpu-worker"
+    pins = parse_pins_env(deploy / "pins.env")
+    text = (deploy / "Dockerfile.longlive").read_text(encoding="utf-8")
+    assert pins["LONGLIVE_PYTORCH_IMAGE"] in text
+    assert "devel-ubuntu" not in text
+    assert "12.8.1-devel-ubuntu24.04" not in text
+    assert text.count("FROM nvidia/cuda") == 0
     assert "ARG MOSS_IMAGE=" in text
+    assert "ARG KV_DEQUANT_IMAGE=" in text
     assert "FROM ${MOSS_IMAGE} AS moss-sfx" in text
+    assert "FROM ${KV_DEQUANT_IMAGE} AS kv-dequant" in text
     assert "6b36d20ec6f7958d29d11a704dfa64611a9f2572" in text
     assert "AF_IMAGE_CAPABILITY=longlive" in text
     assert 'org.aetherneo.anime-factory.h3="false"' in text
     assert 'org.aetherneo.anime-factory.longlive="true"' in text
     assert "fouroversix" in text
     assert "flash_attn" in text
-    assert "setup.py build_ext --inplace" in text
+    assert "setup.py build_ext --inplace" not in text
+    assert "setup.py bdist_wheel" not in text
     assert "minimax_h3" not in text.lower()
     assert "huggingface-cli download" not in text
     assert "model_4o6.pt" in text  # path env, not a baked COPY
-    assert "COPY --from=nvfp4" in text
+    assert "COPY --from=nvfp4" not in text
+    assert "COPY --from=kv-dequant /opt/longlive-wheels /opt/longlive-wheels" in text
     assert "COPY --from=moss-sfx /opt/moss-sfx /opt/moss-sfx" in text
     assert "MOSS_SFX_PYTHON=/opt/moss-sfx/bin/python3.12" in text
+    assert "pip install --no-cache-dir --index-url https://download.pytorch.org/whl" not in text
     targets = json.loads((root / "deploy" / "docker-targets.json").read_text(encoding="utf-8"))
     ll = next(t for t in targets["targets"] if t["id"] == "longlive")
     assert ll["enabled"] is True
@@ -411,14 +419,22 @@ def test_longlive_profile_matches_pins_and_dockerfile():
 def test_dockerfile_longlive_kv_dequant_sm120a_patch_contract():
     root = Path(__file__).resolve().parents[1]
     deploy = root / "deploy" / "gpu-worker"
+    pins = parse_pins_env(deploy / "pins.env")
     patch = (deploy / "patches" / "kv_dequant_sm120a.patch").read_text(encoding="utf-8")
     assert "compute_100a,code=sm_100a" in patch
     assert "compute_120a,code=sm_120a" in patch
-    text = (deploy / "Dockerfile.longlive").read_text(encoding="utf-8")
+    text = (deploy / "Dockerfile.kv-dequant").read_text(encoding="utf-8")
+    assert pins["LONGLIVE_PYTORCH_DEVEL_IMAGE"] in text
     assert "kv_dequant_sm120a.patch" in text
     assert "patch failed closed" in text
     assert "compute_120a,code=sm_120a" in text
     assert "kv_dequant gencode contract violated" in text
+    assert "setup.py bdist_wheel" in text
+    assert "FROM scratch" in text
+    longlive = (deploy / "Dockerfile.longlive").read_text(encoding="utf-8")
+    assert "kv_dequant_sm120a.patch" not in longlive
+    assert "setup.py bdist_wheel" not in longlive
+    assert "setup.py build_ext" not in longlive
 
 
 def test_dockerfile_longlive_uses_pinned_release_wheels():
@@ -454,7 +470,7 @@ def test_dockerfile_longlive_runtime_skips_cuda_extension_import():
         / "gpu-worker"
         / "Dockerfile.longlive"
     ).read_text(encoding="utf-8")
-    runtime = text.rsplit("FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04", 1)[1]
+    runtime = text.rsplit("FROM pytorch/pytorch:2.10.0-cuda12.8-cudnn9-runtime", 1)[1]
     fail_closed = runtime.split("longlive_fail_closed", 1)[0]
     assert "import flash_attn" not in fail_closed
     assert "from fouroversix import _C" not in fail_closed
@@ -492,12 +508,13 @@ def test_dockerfile_longlive_matches_official_nvfp4_stack():
     assert 'shutil.which("nvcc")' in text
     assert "longlive_fail_closed" in text
     assert "LONGLIVE_NVFP4_SAMPLING_STEPS=2" in text
+    assert pins["H3_PYTORCH_IMAGE"].split("@", 1)[0] not in text
 
 
 def test_dockerfiles_parse_as_buildkit_instructions():
     """Heredoc bodies must not leave a bare `&&` continuation as a new instruction."""
     root = Path(__file__).resolve().parents[1]
-    for name in ("Dockerfile", "Dockerfile.longlive", "Dockerfile.moss"):
+    for name in ("Dockerfile", "Dockerfile.longlive", "Dockerfile.moss", "Dockerfile.kv-dequant"):
         path = root / "deploy" / "gpu-worker" / name
         instructions, errors = parse_dockerfile(path)
         assert not errors, f"{name}: {errors}"
@@ -507,7 +524,7 @@ def test_dockerfiles_parse_as_buildkit_instructions():
 
 def test_dockerfile_longlive_has_no_trailing_whitespace():
     root = Path(__file__).resolve().parents[1]
-    for name in ("Dockerfile", "Dockerfile.longlive", "Dockerfile.moss"):
+    for name in ("Dockerfile", "Dockerfile.longlive", "Dockerfile.moss", "Dockerfile.kv-dequant"):
         text = (root / "deploy" / "gpu-worker" / name).read_text(encoding="utf-8")
         offenders = [i + 1 for i, line in enumerate(text.splitlines()) if line != line.rstrip()]
         assert not offenders, f"{name} trailing whitespace on lines {offenders}"
@@ -625,13 +642,19 @@ def test_docker_workflow_reuses_moss_and_pinned_wheels():
     workflow = (root / ".github" / "workflows" / "docker.yml").read_text(encoding="utf-8")
     makefile = (root / "Makefile").read_text(encoding="utf-8")
     assert "deploy/gpu-worker/Dockerfile.moss" in workflow
+    assert "deploy/gpu-worker/Dockerfile.kv-dequant" in workflow
     assert "MOSS_IMAGE=" in workflow
-    assert "timeout-minutes: 90" in workflow
+    assert "KV_DEQUANT_IMAGE=" in workflow
+    assert "timeout-minutes: 45" in workflow
+    assert "timeout-minutes: 90" not in workflow
     assert "timeout-minutes: 360" not in workflow
-    assert "needs: [matrix, moss]" in workflow
+    assert "needs: [matrix, moss, kv-dequant]" in workflow
     assert "Dockerfile.moss" in makefile
+    assert "Dockerfile.kv-dequant" in makefile
     assert "MOSS_CHECK_IMAGE" in makefile
+    assert "KV_DEQUANT_CHECK_IMAGE" in makefile
     assert "--build-arg MOSS_IMAGE=" in makefile
+    assert "--build-arg KV_DEQUANT_IMAGE=" in makefile
     assert "nvidia/cuda:12.8.1-runtime-ubuntu24.04" in makefile
 
 

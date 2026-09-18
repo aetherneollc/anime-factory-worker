@@ -2,7 +2,7 @@
 # Vast onstart / image entrypoint. No `set -e`. No `seq`.
 # Comfy and router bind 127.0.0.1 only. cloudflared dials out if token is set.
 # Weights: HuggingFace → instance disk. HF_TOKEN optional. Never R2 weight cache.
-# /opt/venv holds the image Python (torch 2.8.0+cu128 official wheels).
+# /opt/venv holds the image Python (official PyTorch runtime + system site-packages).
 
 export VIRTUAL_ENV="${VIRTUAL_ENV:-/opt/venv}"
 if [ -x /opt/venv/bin/python ]; then
