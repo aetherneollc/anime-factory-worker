@@ -15,6 +15,8 @@ export AF_START_COMFY="${AF_START_COMFY:-1}"
 export AF_PRODUCTION_STACK="${AF_PRODUCTION_STACK:-1}"
 export AF_COMFY_REQS_BAKED="${AF_COMFY_REQS_BAKED:-1}"
 export ANIME_FACTORY_GPU_STILLS="${ANIME_FACTORY_GPU_STILLS:-1}"
+# Must be set before this process imports torch (video sampling is in-process).
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 # Preflight validate_container_contract requires /work before weight pull.
 mkdir -p "${AF_WORK_DIR:-/work}"
 exec python -m gpu_worker

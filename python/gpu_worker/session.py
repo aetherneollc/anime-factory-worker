@@ -3046,6 +3046,8 @@ def run_gpu_episode(
     except VideoBackendLockError as exc:
         raise RuntimeError(str(exc)) from exc
     if backend == "longlive":
+        unload_still_models(router)
+        stop_comfy_for_longlive()
         if progress:
             progress("weights:longlive")
         try:
@@ -3057,9 +3059,7 @@ def run_gpu_episode(
             progress("weights:h3_join")
         join_h3_weights()
         ensure_h3_dits_for_shots(_board_shots(root))
-    unload_still_models(router)
-    if backend == "longlive":
-        stop_comfy_for_longlive()
+        unload_still_models(router)
     anim = run_anim(story_id, root, conn, router, progress=progress)
     if backend != "longlive" and anim.get("gpu_done"):
         try:

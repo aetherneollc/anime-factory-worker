@@ -272,6 +272,7 @@ def test_docker_images_bake_official_isolated_moss_runtime(docker_name):
     assert "MOSS_SFX_WEIGHTS_DIR=/work/.model-cache/moss-sfx" in text
     assert "MOSS_SFX_DEVICE=cuda:0" in text
     assert "TORCHDYNAMO_DISABLE=1" in text
+    assert "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True" in text
     assert "OpenMOSS-Team/MOSS-SoundEffect-v2.0" not in text
     assert "huggingface-cli download" not in text
     assert "/moss_soundeffect_v2/finetuning" not in text

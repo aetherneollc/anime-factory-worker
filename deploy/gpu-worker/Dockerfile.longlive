@@ -404,7 +404,8 @@ ENV PYTHONPATH=/app/python \
     MOSS_SFX_SCRIPT=/opt/moss-sfx/moss_sfx_runner.py \
     MOSS_SFX_WEIGHTS_DIR=/work/.model-cache/moss-sfx \
     MOSS_SFX_DEVICE=cuda:0 \
-    TORCHDYNAMO_DISABLE=1
+    TORCHDYNAMO_DISABLE=1 \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 LABEL org.aetherneo.anime-factory.comfy="true" \
       org.aetherneo.anime-factory.h3="false" \

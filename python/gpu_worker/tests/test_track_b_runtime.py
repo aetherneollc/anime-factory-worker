@@ -2175,6 +2175,27 @@ def test_filtered_comfy_requirements_skip_torch_family(tmp_path):
     assert "comfy-kitchen==0.2.33" in text
 
 
+def test_stop_comfy_for_longlive_waits_until_vram_drops(monkeypatch):
+    calls = []
+    used = {"mb": 9000}
+
+    def fake_run(args, **_kwargs):
+        calls.append(list(args))
+        if args[:1] == ["pkill"]:
+            used["mb"] = 400
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(stack.subprocess, "run", fake_run)
+    monkeypatch.setattr(stack, "_gpu_memory_used_mb", lambda: used["mb"])
+    monkeypatch.setattr(stack.time, "sleep", lambda _s: None)
+    out = stack.stop_comfy_for_longlive()
+    assert out["ok"] is True
+    assert out["vram_used_mb"] == 400
+    assert any(row[:2] == ["pkill", "-TERM"] for row in calls)
+    assert any(row[:2] == ["pkill", "-KILL"] for row in calls)
+    assert any("ComfyUI/main.py" in row for row in calls)
+
+
 def test_ensure_c_compiler_installs_python_dev_when_gcc_present(monkeypatch):
     calls = []
     monkeypatch.setattr(stack.shutil, "which", lambda name: "/usr/bin/gcc" if name == "gcc" else None)

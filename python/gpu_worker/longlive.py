@@ -198,16 +198,20 @@ def _patch_wrapper_skip_wan_init() -> bool:
 
 
 def _patch_wrapper_t5_lowmem() -> bool:
-    """UMT5 as float32 on CPU is ~22GB and SIGKILLs a 32GB cgroup. Use bf16 on CUDA."""
+    """UMT5 float32 on CPU is ~22GB and SIGKILLs a 32GB cgroup.
+
+    Keep bf16 on CPU (~11GB RAM) after Comfy is gone, and let DynamicSwap page
+    layers onto the GPU during encode. An earlier CUDA placement saved RAM but
+    parked ~11GB on the 32GB card, so NVFP4 sampling OOM'd around 28GiB allocated.
+    """
     path = _wan_wrapper_path()
     if not path.is_file():
         return False
     text = path.read_text(encoding="utf-8")
     patched = text.replace("dtype=torch.float32,", "dtype=torch.bfloat16,")
     patched = patched.replace(
-        "device=torch.device('cpu')",
         "device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')",
-        1,
+        "device=torch.device('cpu')",
     )
     patched = patched.replace(
         'map_location=\'cpu\', weights_only=False)',
@@ -219,10 +223,15 @@ def _patch_wrapper_t5_lowmem() -> bool:
         'map_location="cpu", weights_only=False, mmap=True)',
         1,
     )
-    if patched == text:
-        return "bfloat16" in text and "mmap=True" in text
-    path.write_text(patched, encoding="utf-8")
-    return "bfloat16" in patched
+    ok = (
+        "dtype=torch.bfloat16" in patched
+        and "device=torch.device('cpu')" in patched
+        and "mmap=True" in patched
+        and "device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')" not in patched
+    )
+    if patched != text:
+        path.write_text(patched, encoding="utf-8")
+    return ok
 
 
 def _patch_inference_mmap_load() -> bool:

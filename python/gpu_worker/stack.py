@@ -854,22 +854,73 @@ def start_comfy() -> subprocess.Popen | None:
     return _start_comfy_logged(comfy_launch_args(main_py))
 
 
-def stop_comfy_for_longlive() -> dict:
-    """Drop Comfy/router RAM before LongLive inference.py on a ~32GB cgroup.
+_COMFY_LONGLIVE_PATTERNS = ("ComfyUI/main.py", "gpu_worker.router")
+# Driver + empty CUDA context on a 5090 is well under this; Animagine/Comfy is not.
+_VRAM_VACATE_MB = 2048
+_VRAM_VACATE_S = 30.0
 
-    Unloading Flux VRAM is not enough: parent Comfy + child inference.py together
-    SIGKILL (exit -9) while loading model_bf16.pt + UMT5. Never start Comfy on
-    the LongLive boot path; this kill is for leftovers and older images.
+
+def _gpu_memory_used_mb() -> int | None:
+    smi = shutil.which("nvidia-smi") or "nvidia-smi"
+    try:
+        raw = subprocess.check_output(
+            [smi, "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            timeout=10,
+            stderr=subprocess.DEVNULL,
+        ).decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001 — vacate can still proceed
+        return None
+    line = raw.strip().splitlines()[0] if raw.strip() else ""
+    try:
+        return int(float(line.strip()))
+    except ValueError:
+        return None
+
+
+def _wait_gpu_memory_below(limit_mb: int, timeout_s: float) -> int | None:
+    deadline = time.monotonic() + timeout_s
+    last = _gpu_memory_used_mb()
+    while True:
+        if last is None or last <= limit_mb:
+            return last
+        if time.monotonic() >= deadline:
+            return last
+        time.sleep(0.5)
+        last = _gpu_memory_used_mb()
+
+
+def stop_comfy_for_longlive() -> dict:
+    """Vacate Comfy/router so LongLive can own the 32GB card.
+
+    Stills (Animagine via Comfy) run first; video is the last heavy visual GPU
+    step. Unloading Flux VRAM is not enough: leftover Comfy plus UMT5 used to
+    SIGKILL a 32GB cgroup, and a fire-and-forget pkill left the NVFP4 sampler
+    competing for the same 32GB. MOSS SFX still needs GPU after LongLive
+    ``release_model``.
     """
     killed: list[str] = []
-    for pattern in ("ComfyUI/main.py", "gpu_worker.router"):
-        try:
-            proc = subprocess.run(["pkill", "-f", pattern], check=False, timeout=15)
-            killed.append(f"{pattern}:{proc.returncode}")
-        except Exception as exc:  # noqa: BLE001 — inference can still try
-            killed.append(f"{pattern}:err:{type(exc).__name__}")
-    print(json.dumps({"comfy": "stopped_for_longlive", "killed": killed}), flush=True)
-    return {"ok": True, "killed": killed}
+    for sig in ("-TERM", "-KILL"):
+        for pattern in _COMFY_LONGLIVE_PATTERNS:
+            try:
+                proc = subprocess.run(["pkill", sig, "-f", pattern], check=False, timeout=15)
+                killed.append(f"{sig}:{pattern}:{proc.returncode}")
+            except Exception as exc:  # noqa: BLE001 — inference can still try
+                killed.append(f"{sig}:{pattern}:err:{type(exc).__name__}")
+        time.sleep(0.4 if sig == "-TERM" else 0.1)
+    used = _wait_gpu_memory_below(_VRAM_VACATE_MB, _VRAM_VACATE_S)
+    try:
+        import torch
+
+        cuda = getattr(torch, "cuda", None)
+        if cuda is not None and callable(getattr(cuda, "is_available", None)) and cuda.is_available():
+            cuda.empty_cache()
+    except Exception:  # noqa: BLE001 — LongLive can still try on a CPU test box
+        pass
+    print(
+        json.dumps({"comfy": "stopped_for_longlive", "killed": killed, "vram_used_mb": used}),
+        flush=True,
+    )
+    return {"ok": True, "killed": killed, "vram_used_mb": used}
 
 
 def start_router() -> subprocess.Popen | None:

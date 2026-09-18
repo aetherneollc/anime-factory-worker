@@ -596,7 +596,7 @@ def test_refuse_bf16_generator(tmp_path: Path, monkeypatch):
         _assert_nvfp4_generator()
 
 
-def test_patch_wrapper_t5_uses_bf16_cuda(tmp_path: Path, monkeypatch):
+def test_patch_wrapper_t5_uses_bf16_cpu(tmp_path: Path, monkeypatch):
     repo = tmp_path / "LongLive"
     wrapper = repo / "utils" / "wan_5b_wrapper.py"
     wrapper.parent.mkdir(parents=True)
@@ -617,9 +617,34 @@ def test_patch_wrapper_t5_uses_bf16_cuda(tmp_path: Path, monkeypatch):
     assert _patch_wrapper_t5_lowmem()
     text = wrapper.read_text(encoding="utf-8")
     assert "dtype=torch.bfloat16" in text
-    assert "torch.cuda.is_available()" in text
+    assert "device=torch.device('cpu')" in text
+    assert "torch.cuda.is_available()" not in text
     assert "mmap=True" in text
     assert "dtype=torch.float32" not in text
+
+
+def test_patch_wrapper_t5_reverts_cuda_to_cpu(tmp_path: Path, monkeypatch):
+    repo = tmp_path / "LongLive"
+    wrapper = repo / "utils" / "wan_5b_wrapper.py"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text(
+        "self.text_encoder = umt5_xxl(\n"
+        "            encoder_only=True,\n"
+        "            return_tokenizer=False,\n"
+        "            dtype=torch.bfloat16,\n"
+        "            device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')\n"
+        "        ).eval().requires_grad_(False)\n"
+        "        self.text_encoder.load_state_dict(\n"
+        '            torch.load("wan_models/Wan2.2-TI2V-5B/models_t5_umt5-xxl-enc-bf16.pth",\n'
+        '                       map_location="cpu", weights_only=False, mmap=True)\n'
+        "        )\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LONGLIVE_ROOT", str(repo))
+    assert _patch_wrapper_t5_lowmem()
+    text = wrapper.read_text(encoding="utf-8")
+    assert "device=torch.device('cpu')" in text
+    assert "torch.cuda.is_available()" not in text
 
 
 def test_fouroversix_skips_when_ready(monkeypatch):
