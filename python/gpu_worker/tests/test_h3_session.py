@@ -14,6 +14,7 @@ from gpu_worker.h3_session import (
     can_prefetch_staging,
     model_load_count_for_modes,
     modes_for_shots,
+    plan_h3_mode_groups,
     unet_name_for_mode,
 )
 from gpu_worker import session
@@ -29,6 +30,16 @@ def test_unet_names_and_mode_load_budget():
     modes = modes_for_shots(shots)
     assert modes == {"ref2va", "fl2va_first"}
     assert model_load_count_for_modes(modes) == 2
+
+
+def test_mode_groups_merge_consecutive_same_dit():
+    shots = [
+        {"id": "a", "h3_mode": "ref2va", "character_id": "ke", "refs": ["sheet"]},
+        {"id": "b", "h3_mode": "ref2va", "character_id": "ke", "refs": ["sheet"]},
+        {"id": "c", "h3_mode": "fl2va_first", "first_frame_path": "f1.png"},
+    ]
+    groups = plan_h3_mode_groups(shots)
+    assert [len(g["indices"]) for g in groups] == [2, 1]
 
 
 def test_chain_tails_are_not_prefetched():
@@ -99,7 +110,7 @@ def test_run_anim_h3_queues_upload_after_gpu(tmp_path, monkeypatch):
     monkeypatch.setattr(
         session,
         "_probe_video",
-        lambda _path: {"width": 864, "height": 480, "duration": 8, "frames": 192, "size_bytes": 5000},
+        lambda _path: {"width": 1280, "height": 720, "duration": 8, "frames": 192, "size_bytes": 5000},
     )
     monkeypatch.setattr(session, "incremental_qc_segment", lambda *_args, **_kwargs: "pass")
     monkeypatch.setattr(session, "mark_completed_passing", lambda *_args, **_kwargs: None)

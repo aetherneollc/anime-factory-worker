@@ -1,17 +1,18 @@
 # Anime Factory GPU worker: ComfyUI + MiniMax H3 + anime SDXL 生图 (IP-Adapter) + agent + ffmpeg + cloudflared.
 # Weights are NOT baked — first boot pulls HuggingFace onto instance-local disk (never R2).
-# H3-only production image: official torch cu128 wheels; no CUDA extension compile path.
+# H3-only production image: official torch cu130 wheels; no CUDA extension compile path.
 # Labels must stay comfy/h3/kolors/image-gen true so the scheduler will lease.
 # MOSS runtime is the shared moss image, not rebuilt here.
 
 ARG MOSS_IMAGE=ghcr.io/aetherneollc/anime-factory-worker-moss:main
 FROM ${MOSS_IMAGE} AS moss-sfx
 
-FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04
+FROM nvidia/cuda:13.0.0-runtime-ubuntu24.04
 
 ARG TARGETARCH=amd64
 # Immutable source revisions. Update only after the image canary passes.
 ARG COMFYUI_REF=7ba217d6b5ac7ef984b157f7e5dfc93465b9937d
+ARG KJ_NODES_REF=d3cfe21625e5170126ce06fbfcfe1d88108688c3
 ARG MOSS_TORCH=2.9.0
 ARG MOSS_TORCHAUDIO=2.9.0
 ARG MOSS_TORCHVISION=0.24.0
@@ -33,8 +34,8 @@ RUN apt-get update \
     && git lfs install \
     && python3 -m venv /opt/venv \
     && pip install --no-cache-dir --only-binary=:all: --upgrade pip \
-    && pip install --no-cache-dir --only-binary=:all: --index-url https://download.pytorch.org/whl/cu128 \
-         torch==2.8.0+cu128 torchvision==0.23.0+cu128 torchaudio==2.8.0+cu128 \
+    && pip install --no-cache-dir --only-binary=:all: --index-url https://download.pytorch.org/whl/cu130 \
+         torch==2.13.0+cu130 torchvision==0.28.0+cu130 torchaudio==2.11.0+cu130 \
     && git init /opt/ComfyUI \
     && git -C /opt/ComfyUI remote add origin https://github.com/comfyanonymous/ComfyUI.git \
     && git -C /opt/ComfyUI fetch --depth 1 origin "${COMFYUI_REF}" \
@@ -101,6 +102,35 @@ except Exception:
 manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 PY
 
+# KJNodes low-VRAM MiniMax nodes (pinned; no on-box compile).
+RUN git init /opt/ComfyUI/custom_nodes/ComfyUI-KJNodes \
+    && git -C /opt/ComfyUI/custom_nodes/ComfyUI-KJNodes remote add origin \
+         https://github.com/kijai/ComfyUI-KJNodes.git \
+    && git -C /opt/ComfyUI/custom_nodes/ComfyUI-KJNodes fetch --depth 1 origin "${KJ_NODES_REF}" \
+    && git -C /opt/ComfyUI/custom_nodes/ComfyUI-KJNodes checkout --detach FETCH_HEAD
+
+RUN KJ_NODES_REF="${KJ_NODES_REF}" python3 - <<'PY'
+import json
+import os
+import subprocess
+from pathlib import Path
+
+comfy = Path("/opt/ComfyUI")
+kj = comfy / "custom_nodes" / "ComfyUI-KJNodes"
+manifest_path = comfy / ".af-source-manifest.json"
+manifest = {}
+if manifest_path.is_file():
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+manifest["kjnodes_ref"] = os.environ["KJ_NODES_REF"]
+try:
+    manifest["kjnodes_sha"] = subprocess.check_output(
+        ["git", "-C", str(kj), "rev-parse", "HEAD"], text=True
+    ).strip()
+except Exception:
+    manifest["kjnodes_sha"] = ""
+manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+PY
+
 WORKDIR /app
 
 COPY python/ /app/python/
@@ -140,7 +170,7 @@ if kept:
             "-r",
             str(filt),
             "--extra-index-url",
-            "https://download.pytorch.org/whl/cu128",
+            "https://download.pytorch.org/whl/cu130",
         ]
     )
 PY
@@ -158,7 +188,7 @@ import torchaudio
 import torchvision
 
 worker = (torch.__version__, torchaudio.__version__, torchvision.__version__, torch.version.cuda)
-if worker != ("2.8.0+cu128", "2.8.0+cu128", "0.23.0+cu128", "12.8"):
+if worker != ("2.13.0+cu130", "2.11.0+cu130", "0.28.0+cu130", "13.0"):
     raise SystemExit(f"h3_worker_stack_contaminated: {worker}")
 probe = subprocess.check_output(
     [

@@ -1,28 +1,198 @@
 {
   "prompt": {
-        "r1": {
-          "class_type": "LoadImage",
-          "_meta": { "role": "ref_images.ref_image_0" },
-          "inputs": { "image": "assets/characters/hero/sheet_front.png" }
-        },
-        "r2": {
-          "class_type": "LoadImage",
-          "_meta": { "role": "ref_images.ref_image_1" },
-          "inputs": { "image": "assets/scenes/store/plate_base.png" }
-        },
-        "2": {
-          "class_type": "MiniMaxH3ReferenceToVideo",
-          "inputs": {
-            "clip": ["clip", 0],
-            "vae": ["vvae", 0],
-            "ref_images.ref_image_0": ["r1", 0],
-            "ref_images.ref_image_1": ["r2", 0],
-            "ref_image_size": "match",
-            "prompt": "<Picture 1> character sheet and <Picture 2> scene plate. @hero 站在 @store 中.",
-            "width": 864,
-            "height": 480,
-            "length": 192
-          }
-        }
+    "1": {
+      "class_type": "UNETLoader",
+      "inputs": {
+        "unet_name": "minimax_h3_ref2va_pruned_nvfp4.safetensors",
+        "weight_dtype": "default"
+      }
+    },
+    "2": {
+      "class_type": "CLIPLoader",
+      "inputs": {
+        "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+        "type": "minimax",
+        "device": "default"
+      }
+    },
+    "3": {
+      "class_type": "VAELoader",
+      "inputs": {
+        "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+      }
+    },
+    "16": {
+      "class_type": "MiniMaxH3SigmaShift",
+      "inputs": {
+        "model": [
+          "lv_ff",
+          0
+        ],
+        "shift_video": 12.0,
+        "shift_audio": 3.0
+      }
+    },
+    "6": {
+      "class_type": "MiniMaxH3ReferenceToVideo",
+      "inputs": {
+        "clip": [
+          "2",
+          0
+        ],
+        "vae": [
+          "3",
+          0
+        ],
+        "prompt": "<<<image_1>>>, <<<image_2>>> are the locked character-sheet and scene-plate reference pack for this story. Keep face and costume of these refs; no face drift; no costume swap; \u7981\u6b62\u4e94\u5b98\u6f02\u79fb/\u6362\u88c5. Do not mint a new first frame. original cinematic animation for this story, named character and scene refs already bound, camera and acting motion must change this shot, 24fps, no text, no watermark, no spoken dialogue., camera: Static Shot, subtle body and face motion, speaking gesture, do not freeze as a still, camera and subject motion are the changing terms this shot; do not freeze a still photograph; keep face and costume of the named character refs; no face drift, no costume swap, \u7981\u6b62\u4e94\u5b98\u6f02\u79fb/\u6362\u88c5; do not generate spoken dialogue",
+        "width": 1024,
+        "height": 576,
+        "length": 192,
+        "ref_image_size": "match",
+        "ref_images.ref_image_0": [
+          "r1",
+          0
+        ],
+        "ref_images.ref_image_1": [
+          "r2",
+          0
+        ]
+      }
+    },
+    "7": {
+      "class_type": "RandomNoise",
+      "inputs": {
+        "noise_seed": 11
+      }
+    },
+    "8": {
+      "class_type": "KSamplerSelect",
+      "inputs": {
+        "sampler_name": "res_multistep"
+      }
+    },
+    "9": {
+      "class_type": "BasicScheduler",
+      "inputs": {
+        "model": [
+          "16",
+          0
+        ],
+        "scheduler": "simple",
+        "steps": 8,
+        "denoise": 1.0
+      }
+    },
+    "10": {
+      "class_type": "BasicGuider",
+      "inputs": {
+        "model": [
+          "16",
+          0
+        ],
+        "conditioning": [
+          "6",
+          0
+        ]
+      }
+    },
+    "11": {
+      "class_type": "SamplerCustomAdvanced",
+      "inputs": {
+        "noise": [
+          "7",
+          0
+        ],
+        "guider": [
+          "10",
+          0
+        ],
+        "sampler": [
+          "8",
+          0
+        ],
+        "sigmas": [
+          "9",
+          0
+        ],
+        "latent_image": [
+          "6",
+          1
+        ]
+      }
+    },
+    "12": {
+      "class_type": "VAEDecode",
+      "inputs": {
+        "samples": [
+          "11",
+          0
+        ],
+        "vae": [
+          "3",
+          0
+        ]
+      }
+    },
+    "14": {
+      "class_type": "CreateVideo",
+      "inputs": {
+        "images": [
+          "12",
+          0
+        ],
+        "fps": 24
+      }
+    },
+    "15": {
+      "class_type": "SaveVideo",
+      "inputs": {
+        "video": [
+          "14",
+          0
+        ],
+        "filename_prefix": "h3/E01-03",
+        "format": "auto",
+        "codec": "auto"
+      }
+    },
+    "lv_attn": {
+      "class_type": "MiniMaxLowVRAMAttention",
+      "inputs": {
+        "model": [
+          "1",
+          0
+        ],
+        "head_chunks": 16
+      }
+    },
+    "lv_ff": {
+      "class_type": "MiniMaxChunkFeedForward",
+      "inputs": {
+        "model": [
+          "lv_attn",
+          0
+        ],
+        "chunks": 8,
+        "seq_threshold": 4096
+      }
+    },
+    "r1": {
+      "class_type": "LoadImage",
+      "_meta": {
+        "role": "ref_images.ref_image_0"
+      },
+      "inputs": {
+        "image": "char_ke_sheet.png"
+      }
+    },
+    "r2": {
+      "class_type": "LoadImage",
+      "_meta": {
+        "role": "ref_images.ref_image_1"
+      },
+      "inputs": {
+        "image": "plate_store.png"
+      }
+    }
   }
 }

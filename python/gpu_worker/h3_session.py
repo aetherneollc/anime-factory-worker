@@ -25,6 +25,52 @@ def model_load_count_for_modes(modes: set[str] | None) -> int:
     return len({unet_name_for_mode(mode) for mode in modes})
 
 
+def _continues_chain(prev: dict, shot: dict) -> bool:
+    chain_id = str(shot.get("chain_id") or "").strip()
+    prev_chain = str(prev.get("chain_id") or "").strip()
+    if not chain_id or prev_chain != chain_id:
+        return False
+    return int(shot.get("chain_index") or 0) == int(prev.get("chain_index") or 0) + 1
+
+
+def plan_h3_mode_groups(shots: list[dict]) -> list[dict[str, Any]]:
+    """Consecutive compose-order groups sharing one DiT; chains stay atomic units.
+
+    Each group is ``{"mode": str, "indices": [int, ...]}``. Reordering never crosses
+    a chain boundary or the original board index order.
+    """
+    groups: list[dict[str, Any]] = []
+    for index, shot in enumerate(shots or []):
+        mode = select_mode(shot)
+        if not groups:
+            groups.append({"mode": mode, "indices": [index]})
+            continue
+        current = groups[-1]
+        prev = shots[current["indices"][-1]]
+        prev_chain = str(prev.get("chain_id") or "").strip()
+        cur_chain = str(shot.get("chain_id") or "").strip()
+        same_mode = current["mode"] == mode
+        chain_ok = (
+            not cur_chain
+            or not prev_chain
+            or _continues_chain(prev, shot)
+            or (cur_chain != prev_chain and int(shot.get("chain_index") or 0) == 0)
+        )
+        if same_mode and chain_ok:
+            current["indices"].append(index)
+        else:
+            groups.append({"mode": mode, "indices": [index]})
+    return groups
+
+
+def flatten_h3_group_indices(groups: list[dict[str, Any]]) -> list[int]:
+    """Return compose-order indices for all planned groups."""
+    out: list[int] = []
+    for group in groups or []:
+        out.extend(int(i) for i in group.get("indices") or [])
+    return out
+
+
 class H3SessionTracker:
     """Track which H3 DiT weights were touched this lease (one load per UNet file)."""
 
@@ -80,8 +126,13 @@ def can_prefetch_staging(shot: dict) -> bool:
 
 def instrument_h3_session(shots: list[dict], *, warmed: bool = False) -> dict[str, Any]:
     modes = modes_for_shots(shots)
+    groups = plan_h3_mode_groups(shots)
     payload = {
         "modes": sorted(modes),
+        "mode_groups": [
+            {"mode": group["mode"], "shot_count": len(group["indices"]), "indices": group["indices"]}
+            for group in groups
+        ],
         "expected_model_load_count": model_load_count_for_modes(modes),
         "model_load_count": model_load_count_for_modes(modes) if warmed else 0,
         "warmed": bool(warmed),

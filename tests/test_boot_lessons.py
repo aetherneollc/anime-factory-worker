@@ -444,28 +444,31 @@ def test_ensure_story_db_rebuilds_segments_from_board(tmp_path):
     assert (root / "story.sqlite").is_file()
 
 
-def test_blackwell_torch_index_is_cu128(monkeypatch):
-    """cu124 wheels have no sm_120 kernels; 5090 must use cu128+."""
+def test_blackwell_torch_index_is_cu130(monkeypatch):
+    """H3 Blackwell production stack uses cu130 wheels."""
     from gpu_worker import stack
 
     monkeypatch.delenv("TORCH_INDEX_URL", raising=False)
+    monkeypatch.delenv("AF_GPU_PROFILE", raising=False)
+    assert stack.torch_index_url("sm_120") == stack.TORCH_CU130
+    monkeypatch.setenv("AF_GPU_PROFILE", "longlive-nvfp4-sm120")
     assert stack.torch_index_url("sm_120") == stack.TORCH_CU128
     assert stack.torch_index_url("sm_90") == stack.TORCH_CU124
-    monkeypatch.setenv("TORCH_INDEX_URL", "https://example.invalid/cu130")
-    assert stack.torch_index_url("sm_120") == "https://example.invalid/cu130"
+    monkeypatch.setenv("TORCH_INDEX_URL", "https://example.invalid/custom")
+    assert stack.torch_index_url("sm_120") == "https://example.invalid/custom"
 
 
-def test_blackwell_nvidia_smi_fallback_picks_cu128(monkeypatch):
-    """Broken cu124 torch cannot report sm_120; nvidia-smi still must select cu128."""
+def test_blackwell_nvidia_smi_fallback_picks_cu130(monkeypatch):
+    """Broken torch probe still routes H3 Blackwell to cu130."""
     from gpu_worker import stack
 
     monkeypatch.delenv("TORCH_INDEX_URL", raising=False)
+    monkeypatch.delenv("AF_GPU_PROFILE", raising=False)
     monkeypatch.setattr(stack, "cuda_sm", lambda: None)
     monkeypatch.setattr(stack, "_nvidia_smi_sm", lambda: "sm_120")
-    # cuda_sm is patched None; torch_index_url should still accept explicit sm.
-    assert stack.torch_index_url("sm_120") == stack.TORCH_CU128
+    assert stack.torch_index_url("sm_120") == stack.TORCH_CU130
     monkeypatch.setattr(stack, "cuda_sm", lambda: stack._nvidia_smi_sm())
-    assert stack.torch_index_url() == stack.TORCH_CU128
+    assert stack.torch_index_url() == stack.TORCH_CU130
 
 
 def test_kitchen_torch26_rewrites_list_int(tmp_path):

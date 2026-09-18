@@ -20,9 +20,9 @@ class StackContract:
 
 
 H3_STACK = StackContract(
-    torch="2.8.0+cu128",
-    torchvision="0.23.0+cu128",
-    torchaudio="2.8.0+cu128",
+    torch="2.13.0+cu130",
+    torchvision="0.28.0+cu130",
+    torchaudio="2.11.0+cu130",
 )
 
 LONGLIVE_STACK = StackContract(
@@ -34,7 +34,7 @@ LONGLIVE_STACK = StackContract(
 )
 
 PROFILE_STACK: dict[str, StackContract] = {
-    "h3-comfy-cu128-sm120": H3_STACK,
+    "h3-comfy-cu130-sm120": H3_STACK,
     "longlive-nvfp4-sm120": LONGLIVE_STACK,
 }
 

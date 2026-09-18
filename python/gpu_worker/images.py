@@ -286,16 +286,17 @@ class CapabilityProfile:
 
 
 CAPABILITY_PROFILES: dict[str, CapabilityProfile] = {
-    "h3-comfy-cu128-sm120": CapabilityProfile(
-        profile_id="h3-comfy-cu128-sm120",
+    "h3-comfy-cu130-sm120": CapabilityProfile(
+        profile_id="h3-comfy-cu130-sm120",
         supported_sm=("sm_120",),
+        min_mem_gb=64.0,
         require_torch=True,
         require_flash_attn=False,
         require_fouroversix=False,
         expected_torch=H3_STACK.torch,
         expected_torchvision=H3_STACK.torchvision,
         expected_torchaudio=H3_STACK.torchaudio,
-        note="Default RTX 5090 Comfy+H3+SDXL stills (CUDA 12.8, sm_120).",
+        note="Default RTX 5090 Comfy+H3+SDXL stills (CUDA 13.0, sm_120, NVFP4 + KJNodes low-VRAM).",
     ),
     "longlive-nvfp4-sm120": CapabilityProfile(
         profile_id="longlive-nvfp4-sm120",
@@ -320,12 +321,12 @@ def default_profile_id() -> str:
     backend = (os.environ.get("AF_VIDEO_BACKEND") or "h3").strip().lower()
     if backend == "longlive":
         return "longlive-nvfp4-sm120"
-    return "h3-comfy-cu128-sm120"
+    return "h3-comfy-cu130-sm120"
 
 
 def resolve_capability_profile(profile_id: str | None = None) -> CapabilityProfile:
     key = (profile_id or default_profile_id()).strip()
-    return CAPABILITY_PROFILES.get(key, CAPABILITY_PROFILES["h3-comfy-cu128-sm120"])
+    return CAPABILITY_PROFILES.get(key, CAPABILITY_PROFILES["h3-comfy-cu130-sm120"])
 
 
 def expected_image_digest(profile_id: str | None = None) -> str | None:

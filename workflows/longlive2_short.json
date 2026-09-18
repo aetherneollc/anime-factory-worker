@@ -17,8 +17,8 @@
   "continuation_mechanism": "i2v_first_frame",
   "compose": {
     "scale_pad_only": true,
-    "delivery_width": 864,
-    "delivery_height": 480
+    "delivery_width": 1280,
+    "delivery_height": 720
   },
   "take_fields": [
     "take_id",

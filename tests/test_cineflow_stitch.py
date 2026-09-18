@@ -223,7 +223,7 @@ def test_chain_tail_graph_has_addguide_same_refs_and_image_tags():
         Path("prev_last.png"),
     )
     assert linked["first_frame_path"].endswith("prev_last.png")
-    assert "prev_last.png" in linked["refs"]
+    assert "prev_last.png" not in (linked.get("refs") or [])
 
 
 def test_concat_drops_frame_zero_same_chain_hard_cut_cross_scene():

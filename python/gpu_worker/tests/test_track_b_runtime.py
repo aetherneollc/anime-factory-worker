@@ -343,37 +343,30 @@ def test_parse_batch_preserves_multi_episode_contract():
     assert parse_batch({"batch": None}) is None
 
 
-def test_h3_resolution_uses_actual_vram_tier():
-    native = h3.h3_resolution_profile(
-        {"width": 1344, "height": 768},
-        detected_vram_mb=32_640,
-    )
-    assert (native["width"], native["height"]) == (864, 480)
+def test_h3_resolution_primary_and_oom_fallback():
+    native = h3.h3_resolution_profile({"width": 1344, "height": 768})
+    assert (native["gen_width"], native["gen_height"]) == (1024, 576)
     assert native["downgraded"] is False
-    assert native["tier"] == "gen_480p"
-    low = h3.h3_resolution_profile(
-        {"width": 1344, "height": 768},
-        detected_vram_mb=24_576,
-    )
-    assert low["width"] <= 512 and low["height"] <= 288
+    assert native["tier"] == "gen_576p"
+    low = h3.h3_resolution_profile({"width": 1344, "height": 768}, oom_fallback=True)
+    assert (low["gen_width"], low["gen_height"]) == (864, 480)
     assert low["downgraded"] is True
-    assert low["reason"] == "vram_24576mb_below_32000mb"
+    assert low["tier"] == "oom_fallback_480p"
 
 
-def test_32gb_default_ignores_legacy_h3_max_env(monkeypatch):
+def test_primary_canvas_ignores_legacy_h3_max_env(monkeypatch):
     monkeypatch.delenv("H3_MAX_WIDTH", raising=False)
     monkeypatch.delenv("H3_MAX_HEIGHT", raising=False)
-    monkeypatch.setattr(h3, "gpu_vram_mb", lambda: 32_640)
-    assert h3.h3_spatial_size({}) == (864, 480)
+    assert h3.h3_spatial_size({}) == (1024, 576)
     monkeypatch.setenv("H3_MAX_WIDTH", "512")
     monkeypatch.setenv("H3_MAX_HEIGHT", "288")
-    assert h3.h3_spatial_size({}) == (864, 480)
+    assert h3.h3_spatial_size({}) == (1024, 576)
     graph = h3.native_h3_graph(
         {"id": "E01-01", "first_frame_path": "f.png"},
         "fl2va_first",
     )
-    assert graph["6"]["inputs"]["width"] == 864
-    assert graph["6"]["inputs"]["height"] == 480
+    assert graph["6"]["inputs"]["width"] == 1024
+    assert graph["6"]["inputs"]["height"] == 576
 
 
 def test_h3_sampler_steps_default_remains_eight(monkeypatch):
@@ -432,7 +425,7 @@ def test_native_h3_graph_loads_nvfp4_dits(monkeypatch):
     assert fl2va["2"]["inputs"]["clip_name"] == "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
     assert fl2va["3"]["inputs"]["vae_name"] == "minimax_h3_video_vae_fp16.safetensors"
     assert fl2va["9"]["inputs"]["steps"] == 8
-    assert (fl2va["6"]["inputs"]["width"], fl2va["6"]["inputs"]["height"]) == (864, 480)
+    assert (fl2va["6"]["inputs"]["width"], fl2va["6"]["inputs"]["height"]) == (1024, 576)
 
 
 def test_still_weights_do_not_block_on_h3(tmp_path, monkeypatch):
@@ -516,7 +509,7 @@ def test_32gb_comfy_does_not_split_dit_during_sampling(monkeypatch, tmp_path):
     assert "--lowvram" in low
 
 
-def test_low_vram_output_is_normalized_before_delivery_qc(tmp_path, monkeypatch):
+def test_oom_fallback_output_is_upscaled_to_720p(tmp_path, monkeypatch):
     shot = tmp_path / "v001.mp4"
     shot.write_bytes(b"low-resolution")
     seen = {}
@@ -529,33 +522,44 @@ def test_low_vram_output_is_normalized_before_delivery_qc(tmp_path, monkeypatch)
     monkeypatch.setattr(session, "_run_checked", transcode)
     session._normalize_h3_for_qc(
         shot,
-        {"downgraded": True, "width": 512, "height": 288},
+        {
+            "downgraded": True,
+            "gen_width": 864,
+            "gen_height": 480,
+            "delivery_width": 1280,
+            "delivery_height": 720,
+        },
     )
     assert shot.read_bytes() == b"delivery-resolution"
-    assert "scale=864:480:flags=lanczos" in seen["command"]
+    assert "scale=1280:720:flags=lanczos" in seen["command"]
     assert seen["stage"] == "anim"
 
 
-def test_480p_native_output_is_not_upscaled_to_720p(tmp_path, monkeypatch):
+def test_primary_output_is_upscaled_to_720p(tmp_path, monkeypatch):
     shot = tmp_path / "v001.mp4"
-    shot.write_bytes(b"480p-generation")
+    shot.write_bytes(b"576p-generation")
     seen = {}
 
     def transcode(command, progress=None, stage="compose"):
         seen["command"] = command
-        Path(command[-1]).write_bytes(b"480p-delivery")
+        Path(command[-1]).write_bytes(b"720p-delivery")
 
     monkeypatch.setattr(session, "_run_checked", transcode)
     session._normalize_h3_for_qc(
         shot,
-        {"downgraded": False, "width": 864, "height": 480, "tier": "gen_480p"},
+        {
+            "downgraded": False,
+            "gen_width": 1024,
+            "gen_height": 576,
+            "delivery_width": 1280,
+            "delivery_height": 720,
+            "tier": "gen_576p",
+        },
     )
-    assert shot.read_bytes() == b"480p-delivery"
-    assert "scale=1280:720:flags=lanczos" not in seen["command"]
-    assert "scale=864:480:flags=lanczos" not in seen["command"]
-    assert "null" in seen["command"]
+    assert shot.read_bytes() == b"720p-delivery"
+    assert "scale=1280:720:flags=lanczos" in seen["command"]
     assert "-an" in seen["command"]
-    assert "-crf" in seen["command"] and "17" in seen["command"]
+    assert "-crf" in seen["command"] and "18" in seen["command"]
 
 
 def test_tunnel_status_reports_missing_token(monkeypatch):
@@ -718,10 +722,10 @@ def test_heartbeat_includes_handshake_fields():
     runtime = session.LeaseRuntime(instance_id="123")
     runtime.set_handshake(
         {
-            "profile_id": "h3-comfy-cu128-sm120",
+            "profile_id": "h3-comfy-cu130-sm120",
             "image_digest": "sha-0090c77",
             "host": {"sm": "sm_120"},
-            "stack": {"torch": "2.8.0+cu128"},
+            "stack": {"torch": "2.13.0+cu130"},
             "resources": {"disk_free_gb": 180},
             "preflight": {"ok": True, "stage": "complete", "adaptations": []},
             "adaptations": [{"action": "fix_onstart", "before": {}, "after": {}, "attempt": 1, "result": "ok"}],
@@ -729,7 +733,7 @@ def test_heartbeat_includes_handshake_fields():
         }
     )
     fields = runtime.heartbeat_fields({})
-    assert fields["profile_id"] == "h3-comfy-cu128-sm120"
+    assert fields["profile_id"] == "h3-comfy-cu130-sm120"
     assert fields["image_digest"] == "sha-0090c77"
     assert fields["preflight"]["ok"] is True
     assert fields["adaptations"][0]["action"] == "fix_onstart"
@@ -739,7 +743,7 @@ def test_heartbeat_includes_handshake_fields():
 def test_stack_boot_reports_startup_stages_and_font_verification(monkeypatch):
     events = []
     monkeypatch.setenv("AF_VIDEO_BACKEND", "h3")
-    monkeypatch.setattr(stack, "run_hardware_preflight", lambda **_k: {"profile_id": "h3-comfy-cu128-sm120", "preflight": {"ok": True}})
+    monkeypatch.setattr(stack, "run_hardware_preflight", lambda **_k: {"profile_id": "h3-comfy-cu130-sm120", "preflight": {"ok": True}})
     monkeypatch.setattr(stack, "ensure_torch", lambda: None)
     monkeypatch.setattr(stack, "ensure_c_compiler", lambda: None)
     monkeypatch.setattr(stack, "ensure_comfy_reqs", lambda: None)
@@ -1083,8 +1087,8 @@ def test_run_anim_progress_requires_qc_and_successful_r2_upload(tmp_path, monkey
         session,
         "_probe_video",
         lambda _path: {
-            "width": 864,
-            "height": 480,
+            "width": 1280,
+            "height": 720,
             "duration": 8,
             "frames": 192,
             "size_bytes": 5000,
@@ -1223,10 +1227,10 @@ def test_batch_runs_every_episode_and_reports(monkeypatch):
             "remaining": 0,
             "anim": {
                 "resolution": {
-                    "width": 864,
-                    "height": 480,
+                    "width": 1024,
+                    "height": 576,
                     "downgraded": False,
-                    "reason": "vram_at_least_32gb",
+                    "reason": "primary_1024x576",
                 }
             },
             "compose": {
@@ -1263,7 +1267,7 @@ def test_batch_runs_every_episode_and_reports(monkeypatch):
     ]
     assert [body["episode_code"] for body in reports] == ["EP001", "EP002"]
     assert all(body["status"] == "done" for body in reports)
-    assert reports[0]["artifacts"]["h3_resolution"]["width"] == 864
+    assert reports[0]["artifacts"]["h3_resolution"]["width"] == 1024
     assert reports[0]["artifacts"]["final"] == (
         "stories/story-1/episodes/EP001/final/EP001.zh.mp4"
     )
@@ -2224,7 +2228,7 @@ def test_ensure_c_compiler_installs_python_dev_when_gcc_present(monkeypatch):
 def test_stack_boot_surfaces_comfy_exit_before_router_wait(monkeypatch):
     events = []
     monkeypatch.setenv("AF_VIDEO_BACKEND", "h3")
-    monkeypatch.setattr(stack, "run_hardware_preflight", lambda **_k: {"profile_id": "h3-comfy-cu128-sm120", "preflight": {"ok": True}})
+    monkeypatch.setattr(stack, "run_hardware_preflight", lambda **_k: {"profile_id": "h3-comfy-cu130-sm120", "preflight": {"ok": True}})
     monkeypatch.setattr(stack, "ensure_torch", lambda: None)
     monkeypatch.setattr(stack, "ensure_c_compiler", lambda: None)
     monkeypatch.setattr(stack, "ensure_comfy_reqs", lambda: None)

@@ -141,12 +141,14 @@ def scrub_copycat(text: str) -> str:
     return cleaned.strip(" ,")
 
 
-# H3 generates 864×480 (32-aligned 480p; community 5090 measured). Odd sizes
-# break the 32px latent grid. QC / compose / shorts deliver the same 480p — no 720p upscale.
-H3_GEN_WIDTH = 864
-H3_GEN_HEIGHT = 480
-VIDEO_WIDTH = H3_GEN_WIDTH
-VIDEO_HEIGHT = H3_GEN_HEIGHT
+# H3 generates 1024×576 (primary) or 864×480 (OOM fallback). Both scale to delivery
+# 1280×720 at session normalize. Odd sizes break the 32px latent grid.
+H3_GEN_WIDTH = 1024
+H3_GEN_HEIGHT = 576
+H3_OOM_FALLBACK_WIDTH = 864
+H3_OOM_FALLBACK_HEIGHT = 480
+VIDEO_WIDTH = 1280
+VIDEO_HEIGHT = 720
 VIDEO_FPS = 24
 TARGET_EPISODE_SECONDS = 600
 DEFAULT_SHORT_SECONDS = 120.0

@@ -128,20 +128,20 @@ def test_ref2va_without_first_frame_has_no_dummy_f1():
     assert "5" not in graph
 
 
-def test_h3_spatial_size_caps_24gb(monkeypatch):
+def test_h3_spatial_size_primary_canvas(monkeypatch):
     from gpu_worker.h3 import h3_spatial_size, prepare_workflow
 
     monkeypatch.delenv("H3_WIDTH", raising=False)
     monkeypatch.delenv("H3_HEIGHT", raising=False)
-    monkeypatch.setenv("H3_MAX_WIDTH", "960")
-    monkeypatch.setenv("H3_MAX_HEIGHT", "544")
     w, h = h3_spatial_size({"width": 1344, "height": 768})
-    assert w <= 960 and h <= 544
-    assert w % 32 == 0 and h % 32 == 0
+    assert (w, h) == (1024, 576)
     wf = prepare_workflow({"id": "E01-01", "duration": 8, "first_frame_path": "f.png", "width": 1344, "height": 768})
     cond = next(n for n in wf["prompt"].values() if n.get("class_type") == "MiniMaxH3ImageToVideo")
     assert cond["inputs"]["width"] == w
     assert cond["inputs"]["height"] == h
+    types = {n.get("class_type") for n in wf["prompt"].values() if isinstance(n, dict)}
+    assert "MiniMaxLowVRAMAttention" in types
+    assert "MiniMaxChunkFeedForward" in types
 
 
 def test_i2v_graph_skips_audio_vae():
@@ -173,16 +173,14 @@ def test_ref2va_graph_skips_h3_speech():
     assert graph["r2"]["inputs"]["image"] == "plate_store.png"
 
 
-def test_default_24gb_cap_aligns_32(monkeypatch):
+def test_oom_fallback_canvas_aligns_32(monkeypatch):
     from gpu_worker.h3 import h3_spatial_size
 
     monkeypatch.delenv("H3_WIDTH", raising=False)
     monkeypatch.delenv("H3_HEIGHT", raising=False)
-    monkeypatch.delenv("H3_MAX_WIDTH", raising=False)
-    monkeypatch.delenv("H3_MAX_HEIGHT", raising=False)
-    w, h = h3_spatial_size({"width": 1344, "height": 768})
+    w, h = h3_spatial_size({"width": 1344, "height": 768}, oom_fallback=True)
     assert w % 32 == 0 and h % 32 == 0
-    assert w <= 512 and h <= 288
+    assert (w, h) == (864, 480)
 
 
 def test_upload_image_is_multipart():

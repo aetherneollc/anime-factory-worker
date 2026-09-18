@@ -42,6 +42,7 @@ COMFY_DIR = Path(os.environ.get("COMFYUI_DIR") or "/opt/ComfyUI")
 ROUTER_URL = os.environ.get("COMFYUI_BASE_URL") or "http://127.0.0.1:8199"
 TORCH_CU124 = "https://download.pytorch.org/whl/cu124"
 TORCH_CU128 = "https://download.pytorch.org/whl/cu128"
+TORCH_CU130 = "https://download.pytorch.org/whl/cu130"
 TUNNEL_METRICS_URL = "http://127.0.0.1:49312/metrics"
 DEFAULT_TUNNEL_HOSTNAME = ""
 COMFY_BOOT_LOG = Path(os.environ.get("AF_COMFY_BOOT_LOG") or "/tmp/af-comfy-boot.log")
@@ -296,10 +297,13 @@ def cuda_sm() -> str | None:
 
 
 def torch_index_url(sm: str | None = None) -> str:
-    """Blackwell (sm_12x / 50-series) has no kernels in cu124 wheels."""
+    """Blackwell (sm_12x / 50-series) uses the baked cu130 H3 stack when applicable."""
     explicit = os.environ.get("TORCH_INDEX_URL")
     if explicit:
         return explicit
+    profile = resolve_capability_profile(select_profile_id())
+    if str(profile.profile_id).startswith("h3-comfy-cu130"):
+        return TORCH_CU130
     sm = sm or cuda_sm()
     if sm and sm.startswith("sm_12"):
         return TORCH_CU128
@@ -786,6 +790,9 @@ def comfy_launch_args(
     ]
     if want_comfy_lowvram(vram_mb):
         args.append("--lowvram")
+    profile = resolve_capability_profile(select_profile_id())
+    if str(profile.profile_id).startswith("h3-comfy"):
+        args.append("--disable-pinned-memory")
     extra = extra_paths if extra_paths is not None else (COMFY_DIR / "extra_model_paths.yaml")
     if extra.is_file():
         args.extend(["--extra-model-paths-config", str(extra)])

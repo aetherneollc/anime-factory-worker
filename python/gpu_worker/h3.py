@@ -5,11 +5,20 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
 
-from anime_factory.models import H3_GEN_HEIGHT, H3_GEN_WIDTH, H3_MAX_REFS
+from anime_factory.models import (
+    H3_GEN_HEIGHT,
+    H3_GEN_WIDTH,
+    H3_MAX_REFS,
+    H3_OOM_FALLBACK_HEIGHT,
+    H3_OOM_FALLBACK_WIDTH,
+    VIDEO_HEIGHT,
+    VIDEO_WIDTH,
+)
 
 WORKFLOWS_DIR = Path(__file__).resolve().parents[2] / "workflows"
 
@@ -36,9 +45,30 @@ H3_AUDIO_VAE = "minimax_h3_audio_vae_fp32.safetensors"
 FORBIDDEN_H3_SPEECH_NODES = ("VAEDecodeAudio",)
 H3_NATIVE_WIDTH = H3_GEN_WIDTH
 H3_NATIVE_HEIGHT = H3_GEN_HEIGHT
-H3_LOW_VRAM_WIDTH = 512
-H3_LOW_VRAM_HEIGHT = 288
+H3_LOW_VRAM_WIDTH = H3_OOM_FALLBACK_WIDTH
+H3_LOW_VRAM_HEIGHT = H3_OOM_FALLBACK_HEIGHT
 H3_NATIVE_VRAM_MB = 32_000
+H3_LOW_VRAM_HEAD_CHUNKS = 16
+H3_LOW_VRAM_FF_CHUNKS = 8
+H3_LOW_VRAM_SEQ_THRESHOLD = 4096
+
+_H3_OOM_MARKERS = (
+    "out of memory",
+    "outofmemory",
+    "cuda out of memory",
+    "cudamalloc",
+    "cuda error",
+    "allocator",
+    "allocat",
+    "oom",
+    "sigkill",
+    "killed",
+    "ran out of memory",
+    "insufficient memory",
+    "nvml error",
+    "execution_error",
+    "torch.cuda.outofmemoryerror",
+)
 
 
 def load_workflow(name: str) -> dict:
@@ -53,6 +83,18 @@ def is_directory_like(value: Any) -> bool:
         return False
     text = value.strip()
     if text == "" or text.endswith("/") or text in {".", "./", "input", "input/", "input\\"}:
+        return True
+    return False
+
+
+def is_h3_oom(error: BaseException | str | None) -> bool:
+    """Structured OOM classification for Comfy execution, CUDA allocator, and host kills."""
+    if error is None:
+        return False
+    text = str(error).lower().replace("-", " ").replace("_", " ")
+    if any(marker.replace("_", " ") in text for marker in _H3_OOM_MARKERS):
+        return True
+    if re.search(r"\boom\b", text):
         return True
     return False
 
@@ -135,6 +177,8 @@ def image_filename(value: Any) -> str | None:
 
 def ref_image_filenames(segment: dict) -> list[str]:
     """Basenames for LoadImage nodes. One file per sheet; never a dummy f1.png."""
+    chain_tail = int(segment.get("chain_index") or 0) > 0 or bool(segment.get("chain_source_last_frame"))
+    chain_first = image_filename(segment.get("first_frame_path")) if chain_tail else None
     names: list[str] = []
     for raw in list(segment.get("refs") or [])[:H3_MAX_REFS]:
         name = image_filename(raw)
@@ -142,6 +186,8 @@ def ref_image_filenames(segment: dict) -> list[str]:
             continue
         if "." not in name:
             name = f"{name}.png"
+        if chain_tail and chain_first and name == chain_first:
+            continue
         names.append(name)
     return names[:H3_MAX_REFS]
 
@@ -213,13 +259,6 @@ def apply_chain_first_frame(segment: dict, last_frame_path: str | Path) -> dict:
     nxt["first_frame_path"] = path
     nxt["chain_source_last_frame"] = path
     nxt["status"] = "prepared"
-    refs = [str(r).strip() for r in (nxt.get("refs") or []) if str(r).strip()]
-    last_name = Path(path).name or path
-    if last_name and last_name not in refs:
-        if len(refs) >= H3_MAX_REFS:
-            refs = refs[: H3_MAX_REFS - 1]
-        refs.append(last_name)
-        nxt["refs"] = refs
     if _has_ref_pack(nxt):
         nxt["h3_mode"] = "ref2va"
     elif nxt.get("last_frame_path") and not is_directory_like(nxt.get("last_frame_path")):
@@ -303,43 +342,78 @@ def gpu_vram_mb() -> int | None:
         return None
 
 
-def h3_resolution_profile(segment: dict, detected_vram_mb: int | None = None) -> dict[str, Any]:
-    """Generate 864×480 on ≥32GB cards. 24GB stays on 512×288. Never pick 1344×768."""
+def _align_dim(value: int, max_value: int) -> int:
+    aligned = max(32, min(max_value, int(value) // 32 * 32))
+    return max(32, aligned)
+
+
+def h3_resolution_profile(
+    segment: dict,
+    detected_vram_mb: int | None = None,
+    *,
+    oom_fallback: bool | None = None,
+) -> dict[str, Any]:
+    """Primary 1024×576 delivery-upscaled to 1280×720; OOM latch uses 864×480."""
+    use_fallback = bool(
+        oom_fallback
+        if oom_fallback is not None
+        else segment.get("h3_oom_fallback") or segment.get("h3_downgraded")
+    )
+    if use_fallback:
+        gen_w = H3_OOM_FALLBACK_WIDTH
+        gen_h = H3_OOM_FALLBACK_HEIGHT
+        tier = "oom_fallback_480p"
+        downgraded = True
+        reason = str(segment.get("h3_downgrade_reason") or "oom_fallback")
+    else:
+        gen_w = H3_GEN_WIDTH
+        gen_h = H3_GEN_HEIGHT
+        tier = "gen_576p"
+        downgraded = False
+        reason = "primary_1024x576"
     vram_mb = gpu_vram_mb() if detected_vram_mb is None else detected_vram_mb
-    native = vram_mb is not None and vram_mb >= H3_NATIVE_VRAM_MB
-    max_w = H3_NATIVE_WIDTH if native else H3_LOW_VRAM_WIDTH
-    max_h = H3_NATIVE_HEIGHT if native else H3_LOW_VRAM_HEIGHT
-    width = max(32, int(segment.get("width") or max_w))
-    height = max(32, int(segment.get("height") or max_h))
-    if width > max_w or height > max_h:
-        # Legacy 1344×768 (and any oversize) snaps to the tier canvas.
-        # Aspect-preserving scale from 1344×768 yields 832×480, which is not the
-        # community-measured 864×480 H3 size.
-        width, height = max_w, max_h
-    else:
-        width = max(32, min(max_w, width // 32 * 32))
-        height = max(32, min(max_h, height // 32 * 32))
-    downgraded = width < H3_NATIVE_WIDTH or height < H3_NATIVE_HEIGHT
-    if native:
-        reason = "vram_at_least_32gb"
-    elif vram_mb is None:
-        reason = "vram_unavailable_conservative_24gb_tier"
-    else:
-        reason = f"vram_{vram_mb}mb_below_32000mb"
+    width = _align_dim(int(segment.get("width") or gen_w), gen_w)
+    height = _align_dim(int(segment.get("height") or gen_h), gen_h)
+    if width > gen_w or height > gen_h:
+        width, height = gen_w, gen_h
     return {
+        "gen_width": width,
+        "gen_height": height,
         "width": width,
         "height": height,
+        "delivery_width": VIDEO_WIDTH,
+        "delivery_height": VIDEO_HEIGHT,
+        "head_chunks": H3_LOW_VRAM_HEAD_CHUNKS,
+        "chunks": H3_LOW_VRAM_FF_CHUNKS,
+        "seq_threshold": H3_LOW_VRAM_SEQ_THRESHOLD,
         "vram_mb": vram_mb,
-        "tier": "gen_480p" if native else "low_vram_24gb",
+        "tier": tier,
         "downgraded": downgraded,
         "reason": reason,
     }
 
 
-def h3_spatial_size(segment: dict) -> tuple[int, int]:
+def h3_spatial_size(segment: dict, *, oom_fallback: bool | None = None) -> tuple[int, int]:
     """MiniMax H3 dimensions aligned to its 32px latent tile grid."""
-    profile = h3_resolution_profile(segment)
+    profile = h3_resolution_profile(segment, oom_fallback=oom_fallback)
     return int(profile["width"]), int(profile["height"])
+
+
+def _low_vram_model_chain(unet_node: str = "1") -> dict[str, Any]:
+    return {
+        "lv_attn": {
+            "class_type": "MiniMaxLowVRAMAttention",
+            "inputs": {"model": [unet_node, 0], "head_chunks": H3_LOW_VRAM_HEAD_CHUNKS},
+        },
+        "lv_ff": {
+            "class_type": "MiniMaxChunkFeedForward",
+            "inputs": {
+                "model": ["lv_attn", 0],
+                "chunks": H3_LOW_VRAM_FF_CHUNKS,
+                "seq_threshold": H3_LOW_VRAM_SEQ_THRESHOLD,
+            },
+        },
+    }
 
 
 def native_h3_graph(segment: dict, mode: str) -> dict:
@@ -402,7 +476,7 @@ def native_h3_graph(segment: dict, mode: str) -> dict:
         "3": {"class_type": "VAELoader", "inputs": {"vae_name": H3_VIDEO_VAE}},
         "16": {
             "class_type": "MiniMaxH3SigmaShift",
-            "inputs": {"model": ["1", 0], "shift_video": 12.0, "shift_audio": 3.0},
+            "inputs": {"model": ["lv_ff", 0], "shift_video": 12.0, "shift_audio": 3.0},
         },
         "6": {"class_type": cond_type, "inputs": cond_inputs},
         "7": {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}},
@@ -440,6 +514,7 @@ def native_h3_graph(segment: dict, mode: str) -> dict:
             },
         },
     }
+    graph.update(_low_vram_model_chain())
     if mode == "ref2va":
         for i, filename in enumerate(ref_image_filenames(segment)):
             graph[f"r{i + 1}"] = {

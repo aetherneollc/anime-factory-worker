@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -68,6 +69,8 @@ from gpu_worker.h3 import (
     extract_last_frame,
     h3_resolution_profile,
     is_directory_like,
+    gpu_vram_mb,
+    is_h3_oom,
     prepare_workflow,
     ref_image_filenames,
     select_mode,
@@ -92,6 +95,7 @@ from gpu_worker.h3_session import (
     instrument_h3_session,
     model_load_count_for_modes,
     modes_for_shots,
+    plan_h3_mode_groups,
 )
 from gpu_worker.weights import ensure_h3_dits_for_shots, join_h3_weights
 from anime_factory.video_backend import (
@@ -1502,6 +1506,47 @@ def _stage_first_frame(shot: dict, root: Path) -> dict:
     return shot
 
 
+def _upload_h3_inputs(router: ComfyRouter, shot: dict, root: Path) -> None:
+    """Stage first frame and refs in Comfy before expensive sampling. Fail closed on upload errors."""
+    sid = str(shot.get("id") or "?")
+    first_name = shot.get("first_frame_path")
+    first_src = None
+    if first_name:
+        candidate = Path(str(first_name))
+        if candidate.is_file():
+            first_src = candidate
+        else:
+            kf = root / "episodes" / EP / "keyframes" / sid / "f1.png"
+            if kf.is_file():
+                first_src = kf
+            chained = root / "episodes" / EP / "keyframes" / sid / "chain_first.png"
+            if chained.is_file():
+                first_src = chained
+            input_hit = _comfy_input_dir() / Path(str(first_name)).name
+            if first_src is None and input_hit.is_file():
+                first_src = input_hit
+    if first_src and first_src.is_file():
+        router.upload_image(Path(str(first_name or first_src.name)).name, first_src.read_bytes())
+    for ref in list(shot.get("refs") or []):
+        src = _resolve_ref_file(root, str(ref))
+        if src is None:
+            staged = _comfy_input_dir() / Path(str(ref)).name
+            if staged.is_file():
+                src = staged
+        if src is None or not src.is_file():
+            raise RuntimeError(f"h3 upload missing ref for {sid}: {ref}")
+        router.upload_image(Path(str(ref)).name, src.read_bytes())
+    last = shot.get("last_frame_path")
+    if last and not is_directory_like(last):
+        last_path = Path(str(last))
+        if not last_path.is_file():
+            staged_last = _comfy_input_dir() / last_path.name
+            if staged_last.is_file():
+                last_path = staged_last
+        if last_path.is_file():
+            router.upload_image(last_path.name, last_path.read_bytes())
+
+
 def _submit_h3_gpu(
     router: ComfyRouter,
     shot: dict,
@@ -1527,39 +1572,7 @@ def _submit_h3_gpu(
             raise RuntimeError(f"ref2va {shot.get('id')} has no staged character/scene refs")
     elif is_directory_like(shot.get("first_frame_path")):
         raise RuntimeError(f"{mode} {shot.get('id')} missing first frame on disk")
-    first_name = shot.get("first_frame_path")
-    first_src = None
-    if first_name:
-        candidate = Path(str(first_name))
-        if candidate.is_file():
-            first_src = candidate
-        else:
-            kf = root / "episodes" / EP / "keyframes" / shot["id"] / "f1.png"
-            if kf.is_file():
-                first_src = kf
-            chained = root / "episodes" / EP / "keyframes" / shot["id"] / "chain_first.png"
-            if chained.is_file():
-                first_src = chained
-            input_hit = _comfy_input_dir() / Path(str(first_name)).name
-            if first_src is None and input_hit.is_file():
-                first_src = input_hit
-    if first_src and first_src.is_file():
-        try:
-            router.upload_image(Path(str(first_name or first_src.name)).name, first_src.read_bytes())
-        except Exception:
-            pass
-    for ref in list(shot.get("refs") or []):
-        src = _resolve_ref_file(root, str(ref))
-        if src is None:
-            staged = _comfy_input_dir() / Path(str(ref)).name
-            if staged.is_file():
-                src = staged
-        if src is None:
-            continue
-        try:
-            router.upload_image(Path(str(ref)).name, src.read_bytes())
-        except Exception:
-            pass
+    _upload_h3_inputs(router, shot, root)
     graph = prepare_workflow(shot)
     prompt_id = router.prompt(graph.get("prompt", graph), client_id=shot["id"])
     deadline = time.time() + float(os.environ.get("H3_SHOT_TIMEOUT_S") or 1200)
@@ -1607,10 +1620,7 @@ def _submit_h3_gpu(
     last_path = root / last_rel
     extract_last_frame(dest, last_path)
     shot["last_frame_path"] = str(last_path)
-    try:
-        router.upload_image(f"{shot['id']}_last.png", last_path.read_bytes())
-    except Exception:
-        pass
+    router.upload_image(f"{shot['id']}_last.png", last_path.read_bytes())
     return {"shot": shot["id"], "path": str(dest), "bytes": len(blob), "last_frame": shot.get("last_frame_path")}
 
 
@@ -1639,7 +1649,11 @@ def _h3_normalize_and_qc(
 ) -> tuple[str, str, Path | None]:
     sid = str(shot.get("id") or "")
     used_mode = select_mode(shot)
-    _normalize_h3_for_qc(dest, h3_resolution_profile(shot), progress=progress)
+    _normalize_h3_for_qc(
+        dest,
+        h3_resolution_profile(shot, oom_fallback=bool(shot.get("h3_oom_fallback"))),
+        progress=progress,
+    )
     print({"h3_done": sid, "bytes": dest.stat().st_size if dest.is_file() else 0}, flush=True)
     last_path = Path(str(shot.get("last_frame_path") or ""))
     if not last_path.is_file():
@@ -1774,18 +1788,19 @@ def _normalize_h3_for_qc(
     resolution: dict[str, Any],
     progress: ProgressCallback | None = None,
 ) -> None:
-    """Keep H3 picture at delivery 864×480 and strip Hailuo audio.
+    """Lanczos upscale gen canvas to 1280×720 delivery and strip Hailuo audio.
 
-    Production gen is already 864×480 (24GB stays 512×288, scaled up to 480p
-    only). Never lanczos to 720p / AnimeVideo-v3. Always strip H3 audio (`-an`)
+    H3 samples at 1024×576 (or 864×480 OOM fallback). Always strip H3 audio (`-an`)
     so Hailuo speech cannot leak into the CosyVoice2 mix.
     """
-    gen_w = int(resolution.get("width") or 0)
-    gen_h = int(resolution.get("height") or 0)
+    gen_w = int(resolution.get("gen_width") or resolution.get("width") or 0)
+    gen_h = int(resolution.get("gen_height") or resolution.get("height") or 0)
+    del_w = int(resolution.get("delivery_width") or VIDEO_WIDTH)
+    del_h = int(resolution.get("delivery_height") or VIDEO_HEIGHT)
     normalized = path.with_name(f"{path.stem}.delivery{path.suffix}")
     vf = "null"
-    if gen_w != VIDEO_WIDTH or gen_h != VIDEO_HEIGHT:
-        vf = f"scale={VIDEO_WIDTH}:{VIDEO_HEIGHT}:flags=lanczos"
+    if gen_w != del_w or gen_h != del_h:
+        vf = f"scale={del_w}:{del_h}:flags=lanczos"
     try:
         _run_checked(
             [
@@ -1801,9 +1816,9 @@ def _normalize_h3_for_qc(
                 "-c:v",
                 "libx264",
                 "-preset",
-                "slow",
+                "fast",
                 "-crf",
-                "17",
+                "18",
                 "-pix_fmt",
                 "yuv420p",
                 str(normalized),
@@ -1848,26 +1863,31 @@ def _keep_native_strip_audio(
 
 
 class CpuPostQueue:
-    """CPU ffprobe / encode / upload after GPU sampling, sqlite-safe sequential drain."""
+    """Single-thread background upload/QC while the next GPU shot samples."""
 
     def __init__(self) -> None:
-        self._jobs: list[Any] = []
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="h3-cpu-post")
+        self._futures: list[Future[Any]] = []
 
     def submit(self, fn, *args, **kwargs) -> None:
-        self._jobs.append((fn, args, kwargs))
+        self._futures.append(self._executor.submit(fn, *args, **kwargs))
 
     def drain(self) -> list[Any]:
         out: list[Any] = []
         errors: list[BaseException] = []
-        for fn, args, kwargs in self._jobs:
+        for future in self._futures:
             try:
-                out.append(fn(*args, **kwargs))
+                out.append(future.result())
             except BaseException as exc:  # noqa: BLE001 — collect then fail closed
                 errors.append(exc)
-        self._jobs.clear()
+        self._futures.clear()
         if errors:
             raise errors[0]
         return out
+
+    def close(self) -> None:
+        self.drain()
+        self._executor.shutdown(wait=True)
 
 
 def _db_execute(conn, sql: str, params: tuple = ()) -> None:
@@ -2195,6 +2215,9 @@ def _run_anim_h3(
         "delivery_height": VIDEO_HEIGHT,
         "video_backend": "h3",
     }
+    mode_groups = plan_h3_mode_groups(shots)
+    mode_fallback_latched: dict[str, bool] = {}
+    shot_metrics: list[dict[str, Any]] = []
     session_tracker = H3SessionTracker()
     prep_pool = H3PrepPool(lambda shot: _stage_first_frame(shot, root))
     cpu = CpuPostQueue()
@@ -2256,41 +2279,86 @@ def _run_anim_h3(
                 dest = root / rel
                 used_mode = select_mode(shot)
                 session_tracker.note_mode(used_mode)
+                use_fallback = bool(mode_fallback_latched.get(used_mode) or shot.get("h3_oom_fallback"))
+                if use_fallback:
+                    shot = dict(shot, h3_oom_fallback=True)
+                    shots[index] = shot
+                profile = h3_resolution_profile(shot, oom_fallback=use_fallback)
                 print(
                     {
                         "h3_submit": sid,
                         "mode": used_mode,
                         "backend": "h3",
                         "chain_index": shot.get("chain_index", 0),
+                        "gen_width": profile.get("gen_width"),
+                        "gen_height": profile.get("gen_height"),
+                        "downgraded": profile.get("downgraded"),
                     },
                     flush=True,
                 )
                 submit_error: BaseException | None = None
-                for submit_attempt in range(H3_MAX_RETRIES + 1):
+                oom_retried = False
+                sample_s = 0.0
+                for submit_attempt in range(2):
                     try:
+                        sample_t0 = time.monotonic()
                         _submit_h3_gpu(router, shot, root, dest, progress)
+                        sample_s = time.monotonic() - sample_t0
                         submit_error = None
                         break
                     except (BudgetExceeded, ProgressStalled, StartupTimeout):
                         raise
-                    except Exception as exc:  # noqa: BLE001 — retry the segment; do not DEALLOCATE
+                    except Exception as exc:  # noqa: BLE001 — OOM downgrade or fail closed
                         submit_error = exc
                         if recycle_failure_class(exc):
                             break
-                        print(
-                            {
-                                "h3_submit_retry": sid,
-                                "attempt": submit_attempt + 1,
-                                "backend": "h3",
-                                "error": str(exc)[:800],
-                            },
-                            flush=True,
-                        )
+                        if is_h3_oom(exc) and not oom_retried:
+                            router.free()
+                            oom_retried = True
+                            mode_fallback_latched[used_mode] = True
+                            shot = dict(
+                                shot,
+                                h3_oom_fallback=True,
+                                h3_downgrade_reason="oom_primary",
+                            )
+                            shots[index] = shot
+                            print(
+                                {
+                                    "h3_oom_downgrade": sid,
+                                    "mode": used_mode,
+                                    "attempt": submit_attempt + 1,
+                                    "backend": "h3",
+                                },
+                                flush=True,
+                            )
+                            continue
+                        if is_h3_oom(exc):
+                            raise RuntimeError(
+                                f"h3_fail_closed: oom_downshift_exhausted gen_480p fallback_tier 864x480 shot={sid}"
+                            ) from exc
+                        break
                 if submit_error is not None:
                     classified = recycle_failure_class(submit_error)
                     if classified:
                         raise RuntimeError(f"{classified}:{submit_error}") from submit_error
                     raise submit_error
+                final_profile = h3_resolution_profile(
+                    shot,
+                    oom_fallback=bool(shot.get("h3_oom_fallback")),
+                )
+                shot_metrics.append(
+                    {
+                        "id": sid,
+                        "mode": used_mode,
+                        "refs": list(shot.get("refs") or []),
+                        "gen_width": final_profile.get("gen_width"),
+                        "gen_height": final_profile.get("gen_height"),
+                        "downgraded": final_profile.get("downgraded"),
+                        "downgrade_reason": final_profile.get("reason"),
+                        "sample_s": round(sample_s, 3),
+                        "peak_vram_mb": gpu_vram_mb(),
+                    }
+                )
                 last_path = Path(str(shot.get("last_frame_path") or ""))
                 if not last_path.is_file():
                     last_path = _ensure_last_frame(root, shot, dest)
@@ -2371,6 +2439,8 @@ def _run_anim_h3(
                     pass
                 raise
             except Exception as exc:  # noqa: BLE001 — do not silent-truncate the episode
+                if str(exc).startswith("h3_fail_closed:"):
+                    raise
                 classified = recycle_failure_class(exc)
                 print(
                     {"h3_fail": sid, "error": str(exc)[:800], "failure_class": classified},
@@ -2382,6 +2452,10 @@ def _run_anim_h3(
         posted = cpu.drain()
         done.extend(posted)
     finally:
+        try:
+            cpu.close()
+        except Exception:
+            pass
         prep_pool.close()
     expected = model_load_count_for_modes(modes_for_shots(shots))
     actual = session_tracker.model_load_count
@@ -2392,6 +2466,7 @@ def _run_anim_h3(
         )
     instrument = instrument_h3_session(shots, warmed=actual > 0)
     instrument["model_load_count"] = actual
+    instrument["shot_metrics"] = shot_metrics
     print(json.dumps({"h3_session": instrument}, ensure_ascii=False), flush=True)
     return {
         "shots_total": len(shots),
@@ -2403,6 +2478,8 @@ def _run_anim_h3(
         "resolution": resolution,
         "model_load_count": actual,
         "h3_session": instrument,
+        "mode_groups": mode_groups,
+        "shot_metrics": shot_metrics,
         "gpu_done": not failed and (len(done) + len(skipped)) > 0,
     }
 

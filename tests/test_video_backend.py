@@ -536,11 +536,12 @@ def test_dockerfile_h3_only_no_compile():
     assert text.count("FROM nvidia/cuda") == 1
     assert "ARG MOSS_IMAGE=" in text
     assert "FROM ${MOSS_IMAGE} AS moss-sfx" in text
-    assert "12.8.1-runtime-ubuntu24.04" in text
+    assert "13.0.0-runtime-ubuntu24.04" in text
     assert "devel-ubuntu" not in text
-    assert "torch==2.8.0+cu128" in text
-    assert "torchvision==0.23.0+cu128" in text
-    assert "torchaudio==2.8.0+cu128" in text
+    assert "torch==2.13.0+cu130" in text
+    assert "torchvision==0.28.0+cu130" in text
+    assert "torchaudio==2.11.0+cu130" in text
+    assert "KJ_NODES_REF=d3cfe21625e5170126ce06fbfcfe1d88108688c3" in text
     assert "org.aetherneo.anime-factory.h3=\"true\"" in text
     assert "org.aetherneo.anime-factory.comfy=\"true\"" in text
     assert "org.aetherneo.anime-factory.image-gen=\"true\"" in text

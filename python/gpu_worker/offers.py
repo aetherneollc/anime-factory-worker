@@ -8,6 +8,8 @@ from typing import Any
 
 # H3 native path needs 32GB (gpu_worker.h3.H3_NATIVE_VRAM_MB). Vast /bundles/ wants dict filters.
 MIN_GPU_RAM_MB = 32000
+MIN_CPU_RAM_MB = 65536
+MIN_CUDA_VERSION = 13.0
 MIN_DURATION_DAYS = 3
 DEFAULT_LEASE_EPISODE_COUNT = 3
 DEFAULT_MAX_LEASE_USD = 40.0
@@ -34,7 +36,7 @@ REJECT_GPU_SKUS = ("v100", "cmp", "p40", "p100", "m40", "titan v", "mi25", "mi50
 
 DEFAULT_GPU_MODEL_POLICY = "5090"
 GPU_PROFILE_DEFS: tuple[tuple[str, str, str, bool], ...] = (
-    ("5090", "h3-comfy-cu128-sm120", "RTX 5090", True),
+    ("5090", "h3-comfy-cu130-sm120", "RTX 5090", True),
     ("4090_48", "h3-comfy-cu128-sm89", "RTX 4090 48GB", False),
 )
 
@@ -44,6 +46,8 @@ DEFAULT_SEARCH_FILTERS: dict[str, Any] = {
     "rented": {"eq": False},
     "num_gpus": {"eq": 1},
     "gpu_ram": {"gte": MIN_GPU_RAM_MB},
+    "cpu_ram": {"gte": MIN_CPU_RAM_MB},
+    "cuda_max_good": {"gte": MIN_CUDA_VERSION},
     "duration": {"gte": MIN_DURATION_DAYS},
     "reliability": {"gte": 0.95},
     "disk_space": {"gte": 200},
@@ -64,6 +68,22 @@ def search_payload(extra: dict[str, Any] | None = None) -> dict[str, Any]:
 
 def _gpu_name(offer: dict) -> str:
     return str(offer.get("gpu_name") or offer.get("gpu_name_long") or offer.get("gpu") or "")
+
+
+def _cpu_ram_mb(offer: dict) -> int:
+    raw = offer.get("cpu_ram") or offer.get("cpu_ram_mb") or 0
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _cuda_version(offer: dict) -> float:
+    raw = offer.get("cuda_max_good") or offer.get("cuda_vers") or offer.get("cuda_version") or 0
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _gpu_ram_mb(offer: dict) -> int:
@@ -294,6 +314,12 @@ def score_offer(
     }
     if _is_cn_geolocation(offer):
         return {**base, "reject_reason": "cn"}
+    cpu_ram = _cpu_ram_mb(offer)
+    if cpu_ram > 0 and cpu_ram < MIN_CPU_RAM_MB:
+        return {**base, "reject_reason": "cpu_ram", "cpu_ram": cpu_ram}
+    cuda_vers = _cuda_version(offer)
+    if cuda_vers > 0 and cuda_vers < MIN_CUDA_VERSION:
+        return {**base, "reject_reason": "cuda_version", "cuda_max_good": cuda_vers}
     if duration_days < MIN_DURATION_DAYS:
         return {**base, "reject_reason": "duration"}
     if inet_down <= 0:

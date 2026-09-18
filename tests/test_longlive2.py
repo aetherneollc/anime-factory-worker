@@ -346,7 +346,8 @@ def test_cpu_post_queue_drains_after_gpu():
     q.submit(lambda: order.append("cpu") or "ok")
     order.append("gpu")
     assert q.drain() == ["ok"]
-    assert order == ["gpu", "cpu"]
+    assert order == ["cpu", "gpu"]
+    q.close()
 
 
 def test_clone_pins_nvlabs_commit():

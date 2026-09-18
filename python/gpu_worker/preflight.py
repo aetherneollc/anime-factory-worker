@@ -42,6 +42,8 @@ REQUIRED_COMFY_NODES = frozenset(
         "MiniMaxH3ReferenceToVideo",
         "MiniMaxH3SigmaShift",
         "MiniMaxH3AddGuide",
+        "MiniMaxLowVRAMAttention",
+        "MiniMaxChunkFeedForward",
     }
 )
 
@@ -71,12 +73,13 @@ ABI_RECYCLE_MARKERS = (
 )
 
 EXPECTED_PYTHON = (3, 12)
-EXPECTED_TORCH = "2.8.0+cu128"
-EXPECTED_TORCHVISION = "0.23.0+cu128"
-EXPECTED_TORCHAUDIO = "2.8.0+cu128"
+EXPECTED_TORCH = "2.13.0+cu130"
+EXPECTED_TORCHVISION = "0.28.0+cu130"
+EXPECTED_TORCHAUDIO = "2.11.0+cu130"
 NVFP4_DTYPES = ("float4_e2m1fn_x2",)
 EXPECTED_FLASH_ATTN_PREFIX = "2.7.4"
 MIN_DRIVER_FOR_CUDA_128 = (570, 0)
+MIN_DRIVER_FOR_CUDA_130 = (580, 0)
 MIN_VRAM_MB = 32_000
 MIN_DISK_GB = 200.0
 DISK_FORMAT_SLACK_GB = 24.0
@@ -198,7 +201,7 @@ def _nvidia_smi_query() -> dict[str, Any] | None:
     }
 
 
-def _driver_supports_cuda_128(driver_version: str | None) -> bool:
+def _driver_supports_cuda(driver_version: str | None, minimum: tuple[int, int]) -> bool:
     if not driver_version:
         return False
     nums = re.findall(r"\d+", driver_version)
@@ -206,7 +209,23 @@ def _driver_supports_cuda_128(driver_version: str | None) -> bool:
         return False
     major = int(nums[0])
     minor = int(nums[1]) if len(nums) > 1 else 0
-    return (major, minor) >= MIN_DRIVER_FOR_CUDA_128
+    return (major, minor) >= minimum
+
+
+def _driver_supports_cuda_128(driver_version: str | None) -> bool:
+    return _driver_supports_cuda(driver_version, MIN_DRIVER_FOR_CUDA_128)
+
+
+def _driver_supports_cuda_130(driver_version: str | None) -> bool:
+    return _driver_supports_cuda(driver_version, MIN_DRIVER_FOR_CUDA_130)
+
+
+def _profile_driver_ok(profile_id: str, driver_version: str | None) -> bool:
+    if str(profile_id or "").startswith("h3-comfy-cu130"):
+        return _driver_supports_cuda_130(driver_version)
+    if str(profile_id or "").startswith("longlive"):
+        return _driver_supports_cuda_128(driver_version)
+    return _driver_supports_cuda_128(driver_version)
 
 
 def expected_onstart() -> str:
@@ -505,7 +524,7 @@ def collect_host_resources() -> dict[str, Any]:
         "sm": sm,
         "vram_mb": gpu.get("vram_mb"),
         "driver_version": gpu.get("driver_version"),
-        "cuda_driver_ok": _driver_supports_cuda_128(gpu.get("driver_version")),
+        "cuda_driver_ok": _driver_supports_cuda_130(gpu.get("driver_version")),
         "disk_free_gb": disk.get("disk_free_gb"),
         "disk_total_gb": disk.get("disk_total_gb"),
         "mem_available_gb": _mem_available_gb(),
@@ -544,12 +563,15 @@ def validate_profile(profile_id: str, host: dict[str, Any], stack: dict[str, Any
             f"VRAM {vram}MB below profile minimum {profile.min_vram_mb}MB",
             {"profile_id": profile_id, "vram_mb": vram},
         )
-    if not host.get("cuda_driver_ok"):
+    driver_ok = _profile_driver_ok(profile_id, host.get("driver_version"))
+    if not driver_ok:
+        min_driver = MIN_DRIVER_FOR_CUDA_130 if str(profile_id).startswith("h3-comfy-cu130") else MIN_DRIVER_FOR_CUDA_128
         raise PreflightFailure(
             "preflight_failed",
-            "driver_cuda128",
-            f"NVIDIA driver {host.get('driver_version')} does not meet CUDA 12.8 minimum",
-            {"profile_id": profile_id},
+            "driver_cuda",
+            f"NVIDIA driver {host.get('driver_version')} does not meet CUDA minimum "
+            f"{min_driver[0]}.{min_driver[1]}+ for profile {profile_id}",
+            {"profile_id": profile_id, "min_driver": f"{min_driver[0]}.{min_driver[1]}"},
         )
     disk = host.get("disk_total_gb")
     if disk is None:
@@ -668,6 +690,13 @@ def run_hardware_preflight(
                 nvfp4.get("error") or "nvfp4 runtime missing",
                 nvfp4,
             )
+        if not nvfp4.get("scaled_mm"):
+            raise PreflightFailure(
+                "capability_mismatch",
+                "nvfp4_kernel",
+                "NVFP4 scaled_mm kernel unavailable on this torch build",
+                nvfp4,
+            )
 
     validate_container_contract()
     validate_profile(profile_id, host, stack)
@@ -776,7 +805,7 @@ def select_profile_id() -> str:
         return explicit
     if select_video_backend() == "longlive":
         return "longlive-nvfp4-sm120"
-    return "h3-comfy-cu128-sm120"
+    return "h3-comfy-cu130-sm120"
 
 
 __all__ = [

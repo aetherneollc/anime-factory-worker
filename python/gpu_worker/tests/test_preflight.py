@@ -40,10 +40,11 @@ def _host(**overrides):
         "arch": "x86_64",
         "sm": "sm_120",
         "vram_mb": 32_640,
+        "driver_version": "580.65.06",
         "cuda_driver_ok": True,
         "disk_total_gb": 200,
         "disk_free_gb": 150,
-        "mem_available_gb": 32,
+        "mem_available_gb": 64,
     }
     host.update(overrides)
     return host
@@ -51,25 +52,26 @@ def _host(**overrides):
 
 def _stack(**overrides):
     stack = {
-        "torch": "2.8.0+cu128",
-        "torchvision": "0.23.0+cu128",
-        "torchaudio": "2.8.0+cu128",
+        "torch": "2.13.0+cu130",
+        "torchvision": "0.28.0+cu130",
+        "torchaudio": "2.11.0+cu130",
     }
     stack.update(overrides)
     return stack
 
 
 def test_capability_profiles_default_5090_and_longlive():
-    assert "h3-comfy-cu128-sm120" in CAPABILITY_PROFILES
+    assert "h3-comfy-cu130-sm120" in CAPABILITY_PROFILES
     assert "longlive-nvfp4-sm120" in CAPABILITY_PROFILES
     assert "sm_89" not in str(CAPABILITY_PROFILES)
-    h3 = resolve_capability_profile("h3-comfy-cu128-sm120")
+    h3 = resolve_capability_profile("h3-comfy-cu130-sm120")
     assert h3.supported_sm == ("sm_120",)
     assert h3.min_disk_gb == 200
+    assert h3.min_mem_gb == 64.0
     assert h3.require_flash_attn is False
-    assert h3.expected_torch == "2.8.0+cu128"
-    assert h3.expected_torchvision == "0.23.0+cu128"
-    assert h3.expected_torchaudio == "2.8.0+cu128"
+    assert h3.expected_torch == "2.13.0+cu130"
+    assert h3.expected_torchvision == "0.28.0+cu130"
+    assert h3.expected_torchaudio == "2.11.0+cu130"
     ll = resolve_capability_profile("longlive-nvfp4-sm120")
     assert ll.require_flash_attn is True
     assert ll.require_fouroversix is True
@@ -121,7 +123,7 @@ def test_select_profile_id_respects_video_backend(monkeypatch):
     monkeypatch.setenv("AF_VIDEO_BACKEND", "longlive")
     assert select_profile_id() == "longlive-nvfp4-sm120"
     monkeypatch.setenv("AF_VIDEO_BACKEND", "h3")
-    assert select_profile_id() == "h3-comfy-cu128-sm120"
+    assert select_profile_id() == "h3-comfy-cu130-sm120"
 
 
 def test_expected_image_digest_ignores_tags_and_reads_env(monkeypatch):
@@ -140,14 +142,14 @@ def test_expected_image_digest_ignores_tags_and_reads_env(monkeypatch):
 
 def test_validate_profile_rejects_low_vram():
     with pytest.raises(PreflightFailure) as exc:
-        validate_profile("h3-comfy-cu128-sm120", _host(vram_mb=24_000), _stack())
+        validate_profile("h3-comfy-cu130-sm120", _host(vram_mb=24_000), _stack())
     assert exc.value.failure_class == "capability_mismatch"
     assert exc.value.code == "vram_below_minimum"
 
 
 def test_validate_profile_allows_formatted_200gb_volume():
     validate_profile(
-        "h3-comfy-cu128-sm120",
+        "h3-comfy-cu130-sm120",
         _host(disk_total_gb=196, disk_free_gb=170),
         _stack(),
     )
@@ -156,7 +158,7 @@ def test_validate_profile_allows_formatted_200gb_volume():
 def test_validate_profile_rejects_truly_small_disk():
     with pytest.raises(PreflightFailure) as exc:
         validate_profile(
-            "h3-comfy-cu128-sm120",
+            "h3-comfy-cu130-sm120",
             _host(disk_total_gb=150, disk_free_gb=100),
             _stack(),
         )
@@ -164,7 +166,7 @@ def test_validate_profile_rejects_truly_small_disk():
 
 
 def test_run_hardware_preflight_smoke(monkeypatch):
-    monkeypatch.setenv("AF_GPU_PROFILE", "h3-comfy-cu128-sm120")
+    monkeypatch.setenv("AF_GPU_PROFILE", "h3-comfy-cu130-sm120")
     monkeypatch.delenv("AF_PRODUCTION_STACK", raising=False)
     monkeypatch.delenv("AF_COMFY_REQS_BAKED", raising=False)
     monkeypatch.delenv("AF_IMAGE_DIGEST", raising=False)
@@ -177,7 +179,7 @@ def test_run_hardware_preflight_smoke(monkeypatch):
         lambda: {
             "gpu_name": "NVIDIA GeForce RTX 5090",
             "vram_mb": 32640,
-            "driver_version": "570.86.10",
+            "driver_version": "580.65.06",
             "sm": "sm_120",
         },
     )
@@ -185,9 +187,9 @@ def test_run_hardware_preflight_smoke(monkeypatch):
         "gpu_worker.preflight.collect_stack_versions",
         lambda: {
             "python": "3.12.3",
-            "torch": "2.8.0+cu128",
-            "torchvision": "0.23.0+cu128",
-            "torchaudio": "2.8.0+cu128",
+            "torch": "2.13.0+cu130",
+            "torchvision": "0.28.0+cu130",
+            "torchaudio": "2.11.0+cu130",
         },
     )
     monkeypatch.setattr(
@@ -196,7 +198,7 @@ def test_run_hardware_preflight_smoke(monkeypatch):
     )
     monkeypatch.setattr(
         "gpu_worker.preflight.probe_nvfp4_runtime",
-        lambda: {"ok": True, "torch": "2.8.0+cu128", "dtype": "float4_e2m1fn_x2"},
+        lambda: {"ok": True, "torch": "2.13.0+cu130", "dtype": "float4_e2m1fn_x2", "scaled_mm": True},
     )
     monkeypatch.setattr(
         "gpu_worker.preflight.collect_host_resources",
@@ -205,17 +207,17 @@ def test_run_hardware_preflight_smoke(monkeypatch):
             "gpu_name": "NVIDIA GeForce RTX 5090",
             "sm": "sm_120",
             "vram_mb": 32640,
-            "driver_version": "570.86.10",
+            "driver_version": "580.65.06",
             "cuda_driver_ok": True,
             "disk_total_gb": 200,
             "disk_free_gb": 150,
-            "mem_available_gb": 48,
+            "mem_available_gb": 64,
             "comfy_dir": "/opt/ComfyUI",
         },
     )
     monkeypatch.setattr("gpu_worker.preflight.validate_container_contract", lambda: {"onstart": EXPECTED_ONSTART})
     out = run_hardware_preflight()
-    assert out["profile_id"] == "h3-comfy-cu128-sm120"
+    assert out["profile_id"] == "h3-comfy-cu130-sm120"
     assert out["preflight"]["ok"] is True
     assert out["host"]["sm"] == "sm_120"
     assert "adaptations" in out
@@ -234,6 +236,8 @@ def test_probe_comfy_nodes_requires_ipadapter_advanced(monkeypatch):
                 "MiniMaxH3ReferenceToVideo": {},
                 "MiniMaxH3SigmaShift": {},
                 "MiniMaxH3AddGuide": {},
+                "MiniMaxLowVRAMAttention": {},
+                "MiniMaxChunkFeedForward": {},
             }
         ),
     )
@@ -298,7 +302,7 @@ def test_probe_nvfp4_runtime_missing_and_present(monkeypatch):
 
 
 def test_run_hardware_preflight_rejects_missing_nvfp4(monkeypatch):
-    monkeypatch.setenv("AF_GPU_PROFILE", "h3-comfy-cu128-sm120")
+    monkeypatch.setenv("AF_GPU_PROFILE", "h3-comfy-cu130-sm120")
     monkeypatch.delenv("AF_PRODUCTION_STACK", raising=False)
     monkeypatch.delenv("AF_COMFY_REQS_BAKED", raising=False)
     monkeypatch.delenv("AF_IMAGE_DIGEST", raising=False)
@@ -313,11 +317,11 @@ def test_run_hardware_preflight_rejects_missing_nvfp4(monkeypatch):
             "gpu_name": "NVIDIA GeForce RTX 5090",
             "sm": "sm_120",
             "vram_mb": 32640,
-            "driver_version": "570.86.10",
+            "driver_version": "580.65.06",
             "cuda_driver_ok": True,
             "disk_total_gb": 200,
             "disk_free_gb": 150,
-            "mem_available_gb": 48,
+            "mem_available_gb": 64,
             "comfy_dir": "/opt/ComfyUI",
         },
     )
@@ -335,7 +339,7 @@ def test_run_hardware_preflight_rejects_missing_nvfp4(monkeypatch):
 
 def test_handshake_payload_json_serializable():
     payload = handshake_payload(
-        profile_id="h3-comfy-cu128-sm120",
+        profile_id="h3-comfy-cu130-sm120",
         host=_host(),
         stack=_stack(),
         adaptations=[{"action": "fix_workdir", "before": {}, "after": {}, "attempt": 1, "result": "ok"}],
@@ -455,14 +459,14 @@ def test_abi_unfixable_does_not_pip_upgrade(monkeypatch):
     assert calls == []
 
 
-def test_ensure_torchaudio_accepts_baked_28(monkeypatch):
+def test_ensure_torchaudio_accepts_baked_211(monkeypatch):
     import sys
     import types
 
     from gpu_worker import stack as stack_mod
 
     fake = types.ModuleType("torchaudio")
-    fake.__version__ = "2.8.0+cu128"
+    fake.__version__ = "2.11.0+cu130"
     monkeypatch.setitem(sys.modules, "torchaudio", fake)
     stack_mod.ensure_torchaudio()
 
@@ -510,7 +514,7 @@ def test_handshake_register_and_heartbeat_include_audit(monkeypatch):
     runtime = session.LeaseRuntime(instance_id="123")
     runtime.set_handshake(
         {
-            "profile_id": "h3-comfy-cu128-sm120",
+            "profile_id": "h3-comfy-cu130-sm120",
             "image_digest": digest,
             "host": {"sm": "sm_120", "onstart": EXPECTED_ONSTART},
             "stack": {"torch": "2.8.0+cu128"},
@@ -520,7 +524,7 @@ def test_handshake_register_and_heartbeat_include_audit(monkeypatch):
         }
     )
     fields = runtime.heartbeat_fields({})
-    assert fields["profile_id"] == "h3-comfy-cu128-sm120"
+    assert fields["profile_id"] == "h3-comfy-cu130-sm120"
     assert fields["image_digest"] == digest
     assert fields["adaptations"][0]["action"] == "fix_workdir"
     assert fields["preflight"]["ok"] is True
