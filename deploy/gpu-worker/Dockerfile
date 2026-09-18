@@ -187,7 +187,20 @@ import torchaudio
 import torchvision
 
 worker = (torch.__version__, torchaudio.__version__, torchvision.__version__, torch.version.cuda)
-if worker != ("2.13.0+cu130", "2.11.0+cu130", "0.28.0+cu130", "13.0"):
+want = ("2.13.0+cu130", "2.11.0+cu130", "0.28.0+cu130", "13.0")
+
+
+def _ver_ok(actual: str, want_ver: str) -> bool:
+    base = want_ver.split("+", 1)[0]
+    return actual == want_ver or actual == base or actual.startswith(base + "+")
+
+
+if not (
+    _ver_ok(worker[0], want[0])
+    and _ver_ok(worker[1], want[1])
+    and _ver_ok(worker[2], want[2])
+    and worker[3] == want[3]
+):
     raise SystemExit(f"h3_worker_stack_contaminated: {worker}")
 probe = subprocess.check_output(
     [

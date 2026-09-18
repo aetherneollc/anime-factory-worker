@@ -20,25 +20,26 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git patch ca-certificates \
-    && python -c "import sys; v=sys.version_info; assert (v.major, v.minor) == (3, 12), sys.version" \
-    && pip install --no-cache-dir ninja packaging wheel "setuptools>=77.0.3" \
-    && LONGLIVE_TORCH="${LONGLIVE_TORCH}" LONGLIVE_TORCHVISION="${LONGLIVE_TORCHVISION}" python - <<'PY' \
-    && rm -rf /var/lib/apt/lists/* /root/.cache /tmp/* /var/tmp/*
-import os
-import torch
-import torchvision
+    && apt-get install -y --no-install-recommends git patch ca-certificates ninja-build \
+    && rm -rf /var/lib/apt/lists/*
 
-want_torch = os.environ["LONGLIVE_TORCH"] + "+cu128"
-want_tv = os.environ["LONGLIVE_TORCHVISION"] + "+cu128"
-if torch.__version__ != want_torch:
-    raise SystemExit(f"torch {torch.__version__} != {want_torch}")
-if torchvision.__version__ != want_tv:
-    raise SystemExit(f"torchvision {torchvision.__version__} != {want_tv}")
+# Official devel already has torch; only need it for CUDAExtension ABI. Do not
+# require torchvision here — some pytorch images omit it from the devel tag.
+RUN python - <<'PY'
+import sys
+import torch
+
+print("python", sys.version.replace("\n", " "))
+print("torch", torch.__version__, "cuda", torch.version.cuda)
+if sys.version_info[:2] != (3, 12):
+    raise SystemExit(f"need Python 3.12.x, got {sys.version}")
+if not torch.__version__.startswith("2.10.0"):
+    raise SystemExit(f"torch {torch.__version__} != 2.10.0*")
 if torch.version.cuda != "12.8":
     raise SystemExit(f"torch CUDA {torch.version.cuda} != 12.8")
-print("kv-dequant torch", torch.__version__, "cuda", torch.version.cuda)
 PY
+
+RUN python -m pip install --no-cache-dir ninja packaging wheel "setuptools>=77.0.3"
 
 COPY deploy/gpu-worker/patches/kv_dequant_sm120a.patch /tmp/kv_dequant_sm120a.patch
 RUN git init /opt/LongLive \

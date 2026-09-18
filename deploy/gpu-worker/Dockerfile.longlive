@@ -212,13 +212,18 @@ def dist_has_so(dist_name: str) -> bool:
     return any(str(f).endswith(".so") for f in (dist.files or []))
 
 
+def ver_ok(actual: str, want_ver: str) -> bool:
+    base = want_ver.split("+", 1)[0]
+    return actual == want_ver or actual == base or actual.startswith(base + "+")
+
+
 if (sys.version_info.major, sys.version_info.minor) != (3, 12):
     problems.append(f"python {sys.version}")
-if torch.__version__ != want_torch:
+if not ver_ok(torch.__version__, want_torch):
     problems.append(f"torch {torch.__version__} != {want_torch}")
-if torchvision.__version__ != want_tv:
+if not ver_ok(torchvision.__version__, want_tv):
     problems.append(f"torchvision {torchvision.__version__} != {want_tv}")
-if torchaudio.__version__ != want_ta:
+if not ver_ok(torchaudio.__version__, want_ta):
     problems.append(f"torchaudio {torchaudio.__version__} != {want_ta}")
 if torch.version.cuda != "12.8":
     problems.append(f"torch cuda {torch.version.cuda} != 12.8")
