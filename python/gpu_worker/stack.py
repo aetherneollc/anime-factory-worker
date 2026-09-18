@@ -840,6 +840,9 @@ def wait_comfy_process(
 
 
 def start_comfy() -> subprocess.Popen | None:
+    if _longlive_owns_gpu:
+        print(json.dumps({"comfy": "refused_longlive_owns_gpu"}), flush=True)
+        return None
     main_py = COMFY_DIR / "main.py"
     if not main_py.is_file():
         print(json.dumps({"comfy": "missing", "dir": str(COMFY_DIR)}), flush=True)
@@ -858,6 +861,22 @@ _COMFY_LONGLIVE_PATTERNS = ("ComfyUI/main.py", "gpu_worker.router")
 # Driver + empty CUDA context on a 5090 is well under this; Animagine/Comfy is not.
 _VRAM_VACATE_MB = 2048
 _VRAM_VACATE_S = 30.0
+# While LongLive owns the card, refuse to bring Comfy back (health restart / stills).
+_longlive_owns_gpu = False
+
+
+def longlive_owns_gpu() -> bool:
+    return _longlive_owns_gpu
+
+
+def claim_gpu_for_longlive() -> None:
+    global _longlive_owns_gpu
+    _longlive_owns_gpu = True
+
+
+def release_gpu_from_longlive() -> None:
+    global _longlive_owns_gpu
+    _longlive_owns_gpu = False
 
 
 def _gpu_memory_used_mb() -> int | None:
@@ -916,6 +935,7 @@ def stop_comfy_for_longlive() -> dict:
             cuda.empty_cache()
     except Exception:  # noqa: BLE001 — LongLive can still try on a CPU test box
         pass
+    claim_gpu_for_longlive()
     print(
         json.dumps({"comfy": "stopped_for_longlive", "killed": killed, "vram_used_mb": used}),
         flush=True,

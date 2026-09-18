@@ -117,6 +117,15 @@ def test_pipeline_is_constructed_and_set_up_exactly_once(longlive_env, tmp_path)
     assert out["inference_calls"] == 2
 
 
+def test_low_vram_parks_t5_on_cpu_without_dynamic_swap(longlive_env, tmp_path):
+    takes = _takes(tmp_path)
+    dests = _dests(tmp_path, takes)
+    submit_longlive_batch(takes, dests)
+    log = longlive_env
+    assert log.get("dynamic_swap") in (None, [])
+    assert log.get("text_encoder_to") == ["cpu"]
+
+
 def test_every_take_samples_with_the_same_resident_pipeline(longlive_env, tmp_path):
     takes = _takes(tmp_path)
     dests = _dests(tmp_path, takes)

@@ -109,6 +109,17 @@ class _Vae:
         self.log["clear_cache"] = self.log.get("clear_cache", 0) + 1
 
 
+class _TextEncoder:
+    def __init__(self, log):
+        self.log = log
+        self.device = "cpu"
+
+    def to(self, device):
+        self.device = str(device)
+        self.log.setdefault("text_encoder_to", []).append(self.device)
+        return self
+
+
 class FakeCausalDiffusionInferencePipeline:
     """Counts constructions so a class import can never pass as a model load."""
 
@@ -118,7 +129,7 @@ class FakeCausalDiffusionInferencePipeline:
         self.config = config
         self.device = device
         self.generator = _Generator(log)
-        self.text_encoder = object()
+        self.text_encoder = _TextEncoder(log)
         self.vae = _Vae(log)
         log.setdefault("constructed", []).append(id(self))
         log.setdefault("constructed_cwds", []).append(str(Path.cwd()))

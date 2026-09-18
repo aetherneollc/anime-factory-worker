@@ -147,6 +147,12 @@ class LongLiveBatchRunner:
         del pipeline
         gc.collect()
         try:
+            from gpu_worker.stack import release_gpu_from_longlive
+
+            release_gpu_from_longlive()
+        except Exception:  # noqa: BLE001 — tests may stub stack
+            pass
+        try:
             import torch
 
             cuda = getattr(torch, "cuda", None)

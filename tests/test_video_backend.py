@@ -706,5 +706,10 @@ def test_longlive_fatal_error_matches_sigkill_not_exit1():
     assert is_longlive_fatal_error(err)
     assert is_longlive_fatal_error("longlive inference failed s001: exit -9")
     assert is_longlive_fatal_error(f"{FAIL_CLOSED}: fouroversix")
+    assert is_longlive_fatal_error(
+        "OutOfMemoryError:CUDA out of memory. Tried to allocate 1.30 GiB. "
+        "GPU 0 has a total capacity of 31.36 GiB of which 1.30 GiB is free."
+    )
+    assert is_longlive_fatal_error({"id": "take-01", "error": "CUDA out of memory"})
     assert not is_longlive_fatal_error("longlive inference failed s001: exit 1")
     assert not is_longlive_fatal_error(None)

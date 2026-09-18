@@ -135,6 +135,28 @@ def _official_working_directory():
         os.chdir(previous)
 
 
+def _park_text_encoder_on_cpu(pipe: Any, torch: Any) -> None:
+    """Keep UMT5 entirely in RAM on 32GB cards.
+
+    Official ``inference.py`` DynamicSwap-pages T5 onto CUDA during encode. On a
+    5090 that overlaps the NVFP4 sampler (observed 30.04 GiB in use, 1.30 GiB
+    alloc fail). Encode on CPU instead; sampling then owns the whole card.
+    """
+    enc = getattr(pipe, "text_encoder", None)
+    if enc is None:
+        return
+    to = getattr(enc, "to", None)
+    if callable(to):
+        to("cpu")
+    cuda = getattr(torch, "cuda", None)
+    if cuda is not None and callable(getattr(cuda, "empty_cache", None)):
+        try:
+            if not callable(getattr(cuda, "is_available", None)) or cuda.is_available():
+                cuda.empty_cache()
+        except Exception:  # noqa: BLE001 — CPU unit tests have a stub cuda
+            pass
+
+
 def build_pipeline(api: OfficialApi, config: Any, *, device: Any = None) -> tuple[Any, Any]:
     """Construct and set up the NVFP4 pipeline exactly once, per the official README."""
     torch = api.torch
@@ -149,7 +171,8 @@ def build_pipeline(api: OfficialApi, config: Any, *, device: Any = None) -> tupl
         pipe = api.CausalDiffusionInferencePipeline(config, device=dev)
         api.setup_nvfp4_pipeline(pipe, config, dev)
     if low_memory:
-        api.DynamicSwapInstaller.install_model(pipe.text_encoder, device=dev)
+        # Do not DynamicSwap T5 onto CUDA: that is the 32GB NVFP4 OOM.
+        _park_text_encoder_on_cpu(pipe, torch)
     pipe.generator.model.eval().requires_grad_(False)
     return pipe, dev
 
@@ -268,8 +291,14 @@ def sample_take(
             raise RuntimeError(f"{FAIL_CLOSED}: t2v take has an empty prompt")
         noise, prompts = api.prepare_single_prompt_inputs(config, caption, device)
         kwargs = {"noise": noise, "text_prompts": prompts}
-    with torch.inference_mode():
-        generated = pipeline.inference(**kwargs)
+    try:
+        with torch.inference_mode():
+            generated = pipeline.inference(**kwargs)
+    except Exception as exc:  # noqa: BLE001 — wrap CUDA OOM as fail-closed
+        compact = str(exc).lower().replace(" ", "")
+        if "outofmemory" in compact or "out of memory" in str(exc).lower():
+            raise RuntimeError(f"{FAIL_CLOSED}: CUDA OOM during LongLive sample: {exc}") from exc
+        raise
     # write_video is video-only; LongLive output stays silent.
     api.save_video(generated[0], str(dest), fps=LONGLIVE_OUTPUT_FPS)
     pipeline.vae.model.clear_cache()

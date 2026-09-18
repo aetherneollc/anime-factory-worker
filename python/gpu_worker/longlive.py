@@ -200,9 +200,9 @@ def _patch_wrapper_skip_wan_init() -> bool:
 def _patch_wrapper_t5_lowmem() -> bool:
     """UMT5 float32 on CPU is ~22GB and SIGKILLs a 32GB cgroup.
 
-    Keep bf16 on CPU (~11GB RAM) after Comfy is gone, and let DynamicSwap page
-    layers onto the GPU during encode. An earlier CUDA placement saved RAM but
-    parked ~11GB on the 32GB card, so NVFP4 sampling OOM'd around 28GiB allocated.
+    Keep bf16 on CPU (~11GB RAM) after Comfy is gone. Do not DynamicSwap T5
+    onto the 32GB card — paging layers during encode sat on top of NVFP4
+    (~30 GiB in use) and CUDA-OOM'd the sampler.
     """
     path = _wan_wrapper_path()
     if not path.is_file():
@@ -315,6 +315,8 @@ def is_longlive_fatal_error(exc: BaseException | str | None) -> bool:
     """Install/compile/OOM failures must fail closed — do not retry or re-lease."""
     if exc is None:
         return False
+    if isinstance(exc, dict):
+        exc = exc.get("error") or str(exc)
     code = getattr(exc, "returncode", None)
     if code in (-9, 9, 137):
         return True
@@ -324,6 +326,8 @@ def is_longlive_fatal_error(exc: BaseException | str | None) -> bool:
     if FAIL_CLOSED in compact or "sigkill" in compact or "signal_9" in compact:
         return True
     if "nvcc_is_not" in compact or "cuda_extension_missing" in compact:
+        return True
+    if "out_of_memory" in compact or "outofmemory" in compact or "cuda_oom" in compact:
         return True
     return bool(re.search(r"exit_9([^0-9]|$)", compact))
 

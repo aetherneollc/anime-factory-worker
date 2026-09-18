@@ -2194,6 +2194,21 @@ def test_stop_comfy_for_longlive_waits_until_vram_drops(monkeypatch):
     assert any(row[:2] == ["pkill", "-TERM"] for row in calls)
     assert any(row[:2] == ["pkill", "-KILL"] for row in calls)
     assert any("ComfyUI/main.py" in row for row in calls)
+    assert stack.longlive_owns_gpu() is True
+    stack.release_gpu_from_longlive()
+    assert stack.longlive_owns_gpu() is False
+
+
+def test_start_comfy_refuses_while_longlive_owns_gpu(monkeypatch):
+    monkeypatch.setattr(stack, "_port_open", lambda *_a, **_k: False)
+    started = []
+    monkeypatch.setattr(stack, "_start_comfy_logged", lambda *_a, **_k: started.append(True))
+    stack.claim_gpu_for_longlive()
+    try:
+        assert stack.start_comfy() is None
+        assert started == []
+    finally:
+        stack.release_gpu_from_longlive()
 
 
 def test_ensure_c_compiler_installs_python_dev_when_gcc_present(monkeypatch):
