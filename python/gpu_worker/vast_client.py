@@ -38,8 +38,12 @@ class VastClient:
         self.opener = opener
         settings = load_settings()
         # Explicit dry_run=False (one-shot produce / VAST_DRY_RUN=0) wins.
-        # Do not force dry-run when ANIME_FACTORY_LIVE_VAST=1.
-        self.dry_run = settings.vast_dry_run if dry_run is None else dry_run
+        # ANIME_FACTORY_LIVE_VAST=1 means this process may DELETE even if the
+        # image baked VAST_DRY_RUN=1.
+        if dry_run is None:
+            self.dry_run = False if settings.live_vast else settings.vast_dry_run
+        else:
+            self.dry_run = dry_run
         self.calls: list[tuple[str, str]] = []
 
     def _headers(self) -> dict[str, str]:

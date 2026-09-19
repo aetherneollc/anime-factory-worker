@@ -1,11 +1,8 @@
-"""Chain-head first frames only. Gate 3 at the entrance; missing assets bounce to derive.
+"""Chain-head composition frames and per-cut keyframe packages.
 
 chain_index > 0 never draws a still; first_frame is the previous segment last_frame.
-ref2va heads use character sheets as composition refs and do not mint f1.png.
-
-Keyframes are drawn from the **still** prompt (English, no camera direction) and
-validated as real PNGs at the requested size. The 3-byte `f1.png` files on disk
-are what the old `>= 1` byte check accepted.
+H3 v2: ref2va heads also mint composition f1.png plus per-cut f01/f02/... anchors.
+Prompts compose locked character identity + scene anchor + prop state + pose.
 """
 
 from __future__ import annotations
@@ -38,6 +35,12 @@ from anime_factory.visual_qc import (
 
 def keyframe_still_path(story_root: Path, episode_code: str, segment_id: str) -> Path:
     return Path(story_root) / "episodes" / episode_code / "keyframes" / segment_id / "f1.png"
+
+
+def cut_keyframe_path(story_root: Path, episode_code: str, segment_id: str, seq: int) -> Path:
+    from anime_factory.h3_storyboard import cut_keyframe_name
+
+    return Path(story_root) / "episodes" / episode_code / "keyframes" / segment_id / cut_keyframe_name(seq)
 
 
 def _file_ok(path: Path | None, *, allow_placeholder: bool = True) -> bool:
@@ -96,8 +99,6 @@ def sheet_file_on_disk(segment: dict, assets_index: dict, story_root: Path | Non
             is_qc_locked = None  # type: ignore[assignment]
         if is_qc_locked is not None and not is_qc_locked(root, scene_id=lid):
             return
-        if not lid:
-            return
         if locked_scene_file is not None:
             try:
                 candidates.append(Path(locked_scene_file(root, lid)))
@@ -147,6 +148,118 @@ def _has_first_frame_file(story_root: Path, episode_code: str, segment: dict) ->
     return _file_ok(inherited)
 
 
+def _identity_lock_text(segment: dict, story_root: Path | None) -> str:
+    cid = str(segment.get("character_id") or "").strip()
+    if not cid or story_root is None:
+        return ""
+    try:
+        from anime_factory.db import open_db
+
+        db_path = Path(story_root) / "story.sqlite"
+        if not db_path.is_file():
+            return ""
+        conn = open_db(db_path)
+        try:
+            row = conn.execute(
+                "SELECT identity_prompt FROM characters WHERE id = ?",
+                (cid,),
+            ).fetchone()
+            return str((row["identity_prompt"] if row else "") or "")
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _scene_anchor_text(segment: dict) -> str:
+    for key in ("scene_anchor", "setting", "location_prompt", "plate_prompt"):
+        text = str(segment.get(key) or "").strip()
+        if text:
+            return text
+    return str(segment.get("scene_id") or segment.get("location_id") or "").strip()
+
+
+def compose_cut_still_prompt(segment: dict, cut: dict, *, story_root: Path | None = None) -> str:
+    """Full character lock + scene anchor + prop state + current pose."""
+    parts: list[str] = []
+    identity = _identity_lock_text(segment, story_root)
+    if identity:
+        parts.append(identity)
+    scene = _scene_anchor_text(segment)
+    if scene:
+        parts.append(scene)
+    props = [str(p).strip() for p in (cut.get("props") or segment.get("props") or []) if str(p).strip()]
+    if props:
+        parts.append("props: " + ", ".join(props))
+    pose = str(cut.get("frame_prompt") or cut.get("staging") or cut.get("pose") or "").strip()
+    if pose:
+        parts.append(pose)
+    size = str(cut.get("size") or "MS").strip()
+    parts.append(f"framing {size}")
+    visual = ", ".join(p for p in parts if p)
+    return visual or shot_visual_prompt(segment)
+
+
+def _mint_still(
+    *,
+    dest: Path,
+    prompt: str,
+    label: str,
+    story_id: str,
+    seed_key: str,
+    client: KolorsClient,
+    period_md: str | None,
+    world_mode: str,
+    story_root: Path | None,
+) -> None:
+    assert_still_prompt_clean(prompt, label=label)
+    prefix, bible_negative = style_md_prefix(story_root)
+    positives, negatives = period_lists(period_md, world_mode)
+    styled = style_prompt(prompt, positives, prefix=prefix, kind="keyframe")
+    live = bool(getattr(client, "live", False))
+    require_clip = require_clip_for_client(client)
+    last_reasons: list[str] = []
+    written = False
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    for salt in QC_SEED_SALTS:
+        seed = locked_seed(f"{story_id}:{seed_key}", salt)
+        png = client.generate(
+            {
+                "model": IMAGE_MODEL,
+                "prompt": styled,
+                "negative_prompt": style_negative(negatives, base=bible_negative),
+                "seed": seed,
+                "image_size": STILL_IMAGE_SIZE,
+                "_styled": True,
+                "_kind": "keyframe",
+                "_label": label,
+            }
+        )
+        assert_still_blob(
+            png,
+            width=STILL_WIDTH,
+            height=STILL_HEIGHT,
+            label=label,
+            allow_placeholder=not live,
+        )
+        qc = score_still(
+            png,
+            kind="keyframe",
+            prompt=styled,
+            require_clip=require_clip,
+            allow_placeholder=not live,
+            seed=seed,
+            label=label,
+        )
+        if qc.passed:
+            dest.write_bytes(png)
+            written = True
+            break
+        last_reasons = list(qc.reasons)
+    if not written:
+        raise RuntimeError(f"keyframe QC failed after {len(QC_SEED_SALTS)} seeds for {label}: {last_reasons}")
+
+
 def assert_keyframe_files(
     story_root: Path,
     episode_code: str,
@@ -155,6 +268,7 @@ def assert_keyframe_files(
 ) -> None:
     """Refuse a succeeded keyframe stage when required stills are missing on disk."""
     missing_f1: list[str] = []
+    missing_cuts: list[str] = []
     missing_refs: list[str] = []
     index = assets_index or {"items": []}
     for segment in segments:
@@ -164,16 +278,26 @@ def assert_keyframe_files(
         if needs_first_frame_still(segment):
             if not _has_first_frame_file(story_root, episode_code, segment):
                 missing_f1.append(sid)
+            cuts = [c for c in (segment.get("cuts") or []) if isinstance(c, dict)]
+            for cut in cuts:
+                seq = int(cut.get("seq") or 0)
+                if seq <= 0:
+                    continue
+                path = cut_keyframe_path(story_root, episode_code, sid, seq)
+                if not _file_ok(path):
+                    missing_cuts.append(f"{sid}/f{seq:02d}")
             continue
         if is_chain_head(segment) and (
             str(segment.get("h3_mode") or "") == "ref2va" or str(segment.get("character_id") or "").strip()
         ):
             if sheet_file_on_disk(segment, index, story_root) is None:
                 missing_refs.append(sid)
-    if missing_f1 or missing_refs:
+    if missing_f1 or missing_cuts or missing_refs:
         parts = []
         if missing_f1:
-            parts.append(f"missing f1.png for fl2va {missing_f1}")
+            parts.append(f"missing f1.png for chain heads {missing_f1}")
+        if missing_cuts:
+            parts.append(f"missing per-cut keyframes {missing_cuts}")
         if missing_refs:
             parts.append(f"missing character sheets for ref2va {missing_refs}")
         raise RuntimeError("keyframe stage has 0 required files on disk: " + "; ".join(parts))
@@ -241,13 +365,16 @@ def ensure_keyframe(
     if visual_block:
         raise RuntimeError(visual_block[0].message)
 
+    if story_root is None:
+        raise RuntimeError(f"cannot mint or verify keyframe without story_root: {segment.get('id')}")
+
     if not needs_first_frame_still(segment):
         sheet = sheet_file_on_disk(segment, assets_index, story_root)
         if sheet is None:
             raise RuntimeError(
                 f"ref2va {segment.get('id')} has no character sheet or scene plate on disk; refusing fake f1.png"
             )
-        rel = sheet.relative_to(story_root).as_posix() if story_root is not None else sheet.name
+        rel = sheet.relative_to(story_root).as_posix()
         key = join_story(story_id, rel)
         conn.execute(
             "UPDATE segments SET keyframe_path = ?, status = 'prepared' WHERE id = ?",
@@ -256,68 +383,74 @@ def ensure_keyframe(
         conn.commit()
         return key
 
+    # Character-bearing heads still need locked sheets even while minting f1.
+    if str(segment.get("character_id") or "").strip() and segment.get("on_camera") is not False:
+        sheet = sheet_file_on_disk(segment, assets_index, story_root)
+        if sheet is None and str(segment.get("h3_mode") or "") == "ref2va":
+            raise RuntimeError(
+                f"ref2va {segment.get('id')} has no character sheet on disk; refusing composition-only f1.png"
+            )
+
     rel = f"episodes/{episode_code}/keyframes/{segment['id']}/f1.png"
     key = join_story(story_id, rel)
-    if story_root is None:
-        raise RuntimeError(f"cannot mint or verify keyframe without story_root: {rel}")
     dest = story_root / rel
     dest.parent.mkdir(parents=True, exist_ok=True)
     live = bool(getattr(client, "live", False))
-    require_clip = require_clip_for_client(client)
     if not _file_ok(dest, allow_placeholder=not live):
         visual = shot_visual_prompt(segment)
+        if not visual:
+            cuts = [c for c in (segment.get("cuts") or []) if isinstance(c, dict)]
+            if cuts:
+                visual = compose_cut_still_prompt(segment, cuts[0], story_root=story_root)
         if not visual:
             raise RuntimeError(
                 f"segment {segment.get('id')} has no first_frame_prompt; refusing to draw a keyframe "
                 "from the segment id"
             )
-        assert_still_prompt_clean(visual, label=str(segment.get("id") or "keyframe"))
-        prefix, bible_negative = style_md_prefix(story_root)
-        positives, negatives = period_lists(period_md, world_mode)
-        prompt = style_prompt(visual, positives, prefix=prefix, kind="keyframe")
-        last_reasons: list[str] = []
-        written = False
-        for salt in QC_SEED_SALTS:
-            seed = locked_seed(f"{story_id}:{segment['id']}", salt)
-            png = client.generate(
-                {
-                    "model": IMAGE_MODEL,
-                    "prompt": prompt,
-                    "negative_prompt": style_negative(negatives, base=bible_negative),
-                    "seed": seed,
-                    "image_size": STILL_IMAGE_SIZE,
-                    "_styled": True,
-                    "_kind": "keyframe",
-                    "_label": f"keyframe:{segment['id']}",
-                }
-            )
-            assert_still_blob(
-                png,
-                width=STILL_WIDTH,
-                height=STILL_HEIGHT,
-                label=f"keyframe {rel}",
-                allow_placeholder=not live,
-            )
-            qc = score_still(
-                png,
-                kind="keyframe",
-                prompt=prompt,
-                require_clip=require_clip,
-                allow_placeholder=not live,
-                seed=seed,
-                label=f"keyframe {rel}",
-            )
-            if qc.passed:
-                dest.write_bytes(png)
-                written = True
-                break
-            last_reasons = list(qc.reasons)
-        if not written:
-            raise RuntimeError(
-                f"keyframe QC failed after {len(QC_SEED_SALTS)} seeds for {segment.get('id')}: {last_reasons}"
-            )
+        _mint_still(
+            dest=dest,
+            prompt=visual,
+            label=f"keyframe {rel}",
+            story_id=story_id,
+            seed_key=str(segment["id"]),
+            client=client,
+            period_md=period_md,
+            world_mode=world_mode,
+            story_root=story_root,
+        )
     if not _file_ok(dest):
         raise RuntimeError(f"keyframe missing on disk after generate: {rel}")
+
+    try:
+        from anime_factory.h3_storyboard import ensure_cuts_for_segment
+
+        cuts = ensure_cuts_for_segment(segment)
+    except Exception:  # noqa: BLE001
+        cuts = [c for c in (segment.get("cuts") or []) if isinstance(c, dict)]
+    for cut in cuts:
+        seq = int(cut.get("seq") or 0)
+        if seq <= 0:
+            continue
+        cut_dest = cut_keyframe_path(story_root, episode_code, str(segment["id"]), seq)
+        if _file_ok(cut_dest, allow_placeholder=not live):
+            continue
+        cut_prompt = compose_cut_still_prompt(segment, cut, story_root=story_root)
+        _mint_still(
+            dest=cut_dest,
+            prompt=cut_prompt,
+            label=f"cut-keyframe {segment['id']}/f{seq:02d}",
+            story_id=story_id,
+            seed_key=f"{segment['id']}:cut{seq}",
+            client=client,
+            period_md=period_md,
+            world_mode=world_mode,
+            story_root=story_root,
+        )
+        cut["keyframe_path"] = join_story(
+            story_id,
+            f"episodes/{episode_code}/keyframes/{segment['id']}/f{seq:02d}.png",
+        )
+
     conn.execute(
         "UPDATE segments SET keyframe_path = ?, status = 'prepared' WHERE id = ?",
         (key, segment["id"]),

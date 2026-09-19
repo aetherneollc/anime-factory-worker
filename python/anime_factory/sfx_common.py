@@ -16,7 +16,7 @@ import os
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 from anime_factory.r2_paths import safe_cue_slug
 from anime_factory.tts import decode_pcm16_mono, encode_pcm16_mono, resample_pcm16_mono
@@ -30,18 +30,29 @@ MOSS_MODEL_REPO = "OpenMOSS-Team/MOSS-SoundEffect-v2.0"
 MOSS_SOURCE_COMMIT = "934d6826b084c46a0d033402174d5f8ac4ed2519"
 
 # Source/model policy string baked into every cue's cache identity. Bumping
-# the Freesound asset tier or the MOSS pin re-resolves every cue instead of
-# silently reusing renders produced under the old policy.
-SFX_SOURCE_POLICY = f"freesound-preview-hq+{MOSS_MODEL_REPO}@{MOSS_SOURCE_COMMIT}"
+# the Freesound asset tier, MOSS pin, or bus-aware QC gate re-resolves every
+# cue instead of silently reusing renders produced under the old policy
+# (e.g. quiet ambience beds falsely rejected as digital silence).
+SFX_SOURCE_POLICY = f"freesound-preview-hq+busqc-v2+{MOSS_MODEL_REPO}@{MOSS_SOURCE_COMMIT}"
 
 # Deterministic QC defaults. Freesound previews and MOSS renders are judged
 # the same way — a source must not get a QC pass it would not earn elsewhere.
+# Action SFX keep a strict silence gate; ambience beds use a lower bus-aware
+# floor so a real quiet classroom (~RMS 17.5) is not rejected as digital mute.
 SFX_SAMPLE_RATE = 44100
 MIN_SFX_SECONDS = 0.15
 MAX_SFX_SECONDS = 30.0
 MIN_SFX_RMS = 40.0
+MIN_AMBIENCE_RMS = 8.0
+MIN_AMBIENCE_ACTIVE_RMS = 10.0
+MIN_AMBIENCE_PEAK = 120
+AMBIENCE_SILENCE_FLOOR = 40
 MAX_CLIP_RATIO = 0.02
 CLIP_THRESHOLD = 32000
+# Loopable ambience sources are generated/fetched short, then crossfaded to
+# the scene bed length — keep generation targets bounded.
+AMBIENCE_SOURCE_MAX_SECONDS = 8.0
+AMBIENCE_LOOP_CROSSFADE_S = 0.25
 
 
 class SfxError(RuntimeError):
@@ -184,6 +195,46 @@ def _clip_ratio(samples: list[int]) -> float:
     return clipped / len(samples)
 
 
+def _active_samples(samples: Sequence[int], floor: int = AMBIENCE_SILENCE_FLOOR) -> list[int]:
+    return [int(s) for s in samples if abs(int(s)) >= int(floor)]
+
+
+def qc_thresholds_for_bus(bus: str) -> dict[str, float | bool]:
+    """Bus-aware silence / peak gates. Action SFX stay strict; ambience is quieter."""
+    if str(bus or "sfx") == "ambience":
+        return {
+            "min_rms": float(MIN_AMBIENCE_RMS),
+            "min_active_rms": float(MIN_AMBIENCE_ACTIVE_RMS),
+            "min_peak": float(MIN_AMBIENCE_PEAK),
+            "relax_duration": True,
+        }
+    return {
+        "min_rms": float(MIN_SFX_RMS),
+        "min_active_rms": float(MIN_SFX_RMS),
+        "min_peak": 0.0,
+        "relax_duration": False,
+    }
+
+
+def _is_digital_silence(samples: list[int], *, bus: str, min_rms: float) -> bool:
+    if not samples:
+        return True
+    rms = _wav_rms(samples)
+    peak = max((abs(s) for s in samples), default=0)
+    if str(bus or "sfx") != "ambience":
+        return rms < min_rms
+    # Overall energy already above the quiet-bed floor (classroom ~17.5) → pass,
+    # even when the peak sits under the active-sample gate used for sparse beds.
+    if rms >= MIN_AMBIENCE_RMS:
+        return False
+    active = _active_samples(samples)
+    if active:
+        active_rms = _wav_rms(active)
+        if active_rms >= MIN_AMBIENCE_ACTIVE_RMS:
+            return False
+    return peak < MIN_AMBIENCE_PEAK
+
+
 def run_audio_qc(
     wav_bytes: bytes,
     *,
@@ -191,9 +242,14 @@ def run_audio_qc(
     duration_tolerance: float = 0.6,
     min_seconds: float = MIN_SFX_SECONDS,
     max_seconds: float = MAX_SFX_SECONDS,
-    min_rms: float = MIN_SFX_RMS,
+    min_rms: float | None = None,
     max_clip_ratio: float = MAX_CLIP_RATIO,
+    bus: str = "sfx",
 ) -> SfxQCReport:
+    thresholds = qc_thresholds_for_bus(bus)
+    effective_min_rms = float(MIN_SFX_RMS if min_rms is None else min_rms)
+    if min_rms is None:
+        effective_min_rms = float(thresholds["min_rms"])
     rate, samples = decode_pcm16_mono(wav_bytes)
     issues: list[str] = []
     if not samples:
@@ -206,10 +262,12 @@ def run_audio_qc(
         issues.append("too_short")
     if duration > max_seconds:
         issues.append("too_long")
-    if target_duration and target_duration > 0:
+    # Ambience sources are loop-extended to the scene bed; do not fail a 3s
+    # Freesound loop for an 18s classroom bed duration target.
+    if target_duration and target_duration > 0 and not thresholds["relax_duration"]:
         if abs(duration - target_duration) > max(duration_tolerance, target_duration * 0.5):
             issues.append("duration_mismatch")
-    if rms < min_rms:
+    if _is_digital_silence(samples, bus=bus, min_rms=effective_min_rms):
         issues.append("silence")
     if clip_ratio > max_clip_ratio:
         issues.append("clipping")
@@ -229,13 +287,90 @@ def assert_audio_qc(
     label: str,
     target_duration: float | None = None,
     duration_tolerance: float = 0.6,
+    bus: str = "sfx",
 ) -> SfxQCReport:
-    report = run_audio_qc(wav_bytes, target_duration=target_duration, duration_tolerance=duration_tolerance)
+    report = run_audio_qc(
+        wav_bytes,
+        target_duration=target_duration,
+        duration_tolerance=duration_tolerance,
+        bus=bus,
+    )
     if not report.passed:
         if "malformed" in report.issues:
             raise MalformedAudioError(f"{label}: audio did not decode to usable PCM")
         raise SfxQCError(f"{label}: QC failed {list(report.issues)} (duration={report.duration:.2f}s, rms={report.rms:.1f})", list(report.issues))
     return report
+
+
+def loop_crossfade_wav(
+    wav_bytes: bytes,
+    target_duration_s: float,
+    *,
+    crossfade_s: float = AMBIENCE_LOOP_CROSSFADE_S,
+) -> bytes:
+    """Extend a short ambience stem to ``target_duration_s`` with loop crossfades.
+
+    Action SFX must not use this — cut-level onsets stay one-shot. Ambience beds
+    that are shorter than the scene/chain span are looped with a short overlap
+    so the join does not click.
+    """
+    rate, samples = decode_pcm16_mono(wav_bytes)
+    if not samples:
+        raise MalformedAudioError("cannot loop: audio did not decode to usable PCM")
+    target_n = max(1, int(round(float(target_duration_s) * float(rate or SFX_SAMPLE_RATE))))
+    if len(samples) >= target_n:
+        return encode_pcm16_mono(samples[:target_n], rate)
+    xf = max(0, min(int(round(float(crossfade_s) * float(rate))), len(samples) // 2))
+    out: list[int] = list(samples)
+    while len(out) < target_n:
+        if xf <= 0:
+            out.extend(samples)
+            continue
+        # Crossfade the next loop's head onto the current tail.
+        overlap = min(xf, len(out), len(samples))
+        for i in range(overlap):
+            w = (i + 1) / float(overlap)
+            idx = len(out) - overlap + i
+            out[idx] = int(round(out[idx] * (1.0 - w) + samples[i] * w))
+        out.extend(samples[overlap:])
+    return encode_pcm16_mono(out[:target_n], rate)
+
+
+def credit_line_from_provenance(prov: SfxProvenance | None) -> dict[str, Any] | None:
+    """One CC0/CC-BY attribution row for timeline / final evidence. Skip empty/MOSS-only."""
+    if prov is None:
+        return None
+    license_kind = classify_license(prov.license) if prov.license else ("moss" if prov.source == "moss" else "unknown")
+    if prov.source == "freesound":
+        creator = prov.creator or "unknown"
+        name_bit = f"Freesound #{prov.freesound_id}" if prov.freesound_id else "Freesound"
+        license_label = {"cc0": "CC0", "by": "CC-BY", "by-nc": "CC-BY-NC"}.get(license_kind, license_kind)
+        text = f'"{prov.query or "sfx"}" by {creator} ({name_bit}, {license_label})'
+        if prov.source_url:
+            text = f"{text} {prov.source_url}"
+        return {
+            "source": "freesound",
+            "license": prov.license,
+            "license_kind": license_kind,
+            "creator": creator,
+            "freesound_id": prov.freesound_id,
+            "source_url": prov.source_url,
+            "query": prov.query,
+            "text": text,
+            "requires_attribution": license_kind == "by",
+        }
+    if prov.source == "moss":
+        return {
+            "source": "moss",
+            "license": None,
+            "license_kind": "generated",
+            "model": prov.model,
+            "model_commit": prov.model_commit,
+            "query": prov.query,
+            "text": f"MOSS-SoundEffect ({prov.model or MOSS_MODEL_REPO}) — {prov.query or 'sfx'}",
+            "requires_attribution": False,
+        }
+    return None
 
 
 def resample_wav_bytes(wav_bytes: bytes, dst_rate: int = SFX_SAMPLE_RATE) -> bytes:

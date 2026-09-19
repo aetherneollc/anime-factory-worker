@@ -216,6 +216,8 @@ def incremental_qc_segment(
     segment: dict | None = None,
     prev_segment: dict | None = None,
     used_mode: str | None = None,
+    video_path: Path | str | None = None,
+    story_root: Path | str | None = None,
 ) -> str:
     d_verdict, d_details = deterministic_check(meta, duration, used_mode)
     record_qc(conn, episode_code, segment_id, "deterministic", d_verdict, d_details)
@@ -227,6 +229,51 @@ def incremental_qc_segment(
         merged["continuity"] = c_details
         if c_verdict != "pass" and v_verdict == "pass":
             v_verdict = c_verdict
+    if video_path and v_verdict == "pass":
+        try:
+            from anime_factory.video_visual_qc import score_video_visual, write_visual_qc_report
+
+            root = Path(story_root) if story_root else Path(video_path).parents[2]
+            sid = str(segment_id)
+            keyframe = root / "episodes" / episode_code / "keyframes" / sid / "f1.png"
+            char_lock = None
+            scene_lock = None
+            identity = ""
+            if segment:
+                cid = str(segment.get("character_id") or "").strip()
+                if cid:
+                    cand = root / "assets" / "characters" / cid / "sheet_front.png"
+                    if cand.is_file():
+                        char_lock = cand
+                plate = str(segment.get("plate_id") or segment.get("location_id") or "").strip()
+                if plate.startswith("plate_"):
+                    plate = plate[len("plate_") :]
+                if plate:
+                    cand = root / "assets" / "scenes" / plate / "plate_base.png"
+                    if cand.is_file():
+                        scene_lock = cand
+                identity = str(segment.get("identity_prompt") or segment.get("first_frame_prompt") or "")
+            result = score_video_visual(
+                Path(video_path),
+                segment=segment,
+                keyframe_path=keyframe if keyframe.is_file() else None,
+                character_lock_path=char_lock,
+                scene_lock_path=scene_lock,
+                identity_prompt=identity,
+                work_dir=Path(video_path).parent / "_visual_qc",
+                require_clip=False,
+            )
+            merged["video_visual"] = {
+                "verdict": result.verdict,
+                "reasons": result.reasons,
+                "scores": result.scores,
+                "retry_strategy": result.retry_strategy,
+            }
+            write_visual_qc_report(Path(video_path).parent / "visual_qc.json", result)
+            if result.verdict != "pass" and v_verdict == "pass":
+                v_verdict = result.verdict
+        except Exception as exc:  # noqa: BLE001 — visual QC is additive; never wipe deterministic pass silently
+            merged["video_visual_error"] = str(exc)[:400]
     record_qc(conn, episode_code, segment_id, "visual", v_verdict, merged)
     if d_verdict == "fail":
         return "fail"
@@ -244,12 +291,131 @@ def legacy_shot_version_path(segment_id: str, version: int) -> str:
 
 
 def existing_generation_file(root: Path, segment_id: str) -> Path | None:
+    """Legacy helper: first on-disk mp4. Prefer select_passing_generation for resume."""
     for version in range(1, 32):
         for rel in (shot_version_path(segment_id, version), legacy_shot_version_path(segment_id, version)):
             path = root / rel
             if path.is_file() and path.stat().st_size > 4096:
                 return path
     return None
+
+
+def _qc_score_total(details: Any) -> float:
+    if isinstance(details, dict):
+        scores = details.get("qc_scores") or details.get("scores") or details
+        if isinstance(scores, dict):
+            total = 0.0
+            for key in ("keyframe_sim", "character_sim", "scene_sim"):
+                try:
+                    total += float(scores.get(key) or 0)
+                except (TypeError, ValueError):
+                    pass
+            return total
+    return 0.0
+
+
+def select_passing_generation(
+    conn: sqlite3.Connection | None,
+    root: Path,
+    segment_id: str,
+) -> tuple[Path, int, str] | None:
+    """Resume only a QC-passing generation. Tie-break: QC score, then highest version.
+
+    Never auto-green the first mp4 found on disk.
+    """
+    candidates: list[tuple[float, int, Path, str]] = []
+    if conn is not None:
+        try:
+            rows = conn.execute(
+                """
+                SELECT version, path, qc_verdict, status
+                FROM generation_results
+                WHERE segment_id = ? AND qc_verdict = 'pass'
+                ORDER BY version DESC
+                """,
+                (segment_id,),
+            ).fetchall()
+        except Exception:  # noqa: BLE001 — older DBs may lack the table
+            rows = []
+        for row in rows:
+            rel = str(row["path"] or "")
+            # path may be stories/<id>/shots/... or shots/...
+            name = Path(rel).name
+            parent = Path(rel).parent.name
+            local_candidates = [
+                root / "shots" / segment_id / name,
+                root / rel,
+            ]
+            if parent == segment_id:
+                local_candidates.append(root / "shots" / segment_id / name)
+            # Also try relative after stories/<id>/
+            parts = Path(rel).parts
+            if "shots" in parts:
+                idx = parts.index("shots")
+                local_candidates.append(root.joinpath(*parts[idx:]))
+            path = next((p for p in local_candidates if p.is_file() and p.stat().st_size > 4096), None)
+            if path is None:
+                continue
+            version = int(row["version"] or 0)
+            score = 0.0
+            try:
+                qc_rows = conn.execute(
+                    """
+                    SELECT details_json FROM qc_reports
+                    WHERE segment_id = ? AND check_name = 'visual'
+                    ORDER BY created_at DESC LIMIT 4
+                    """,
+                    (segment_id,),
+                ).fetchall()
+                for qc_row in qc_rows:
+                    try:
+                        details = json.loads(qc_row["details_json"] or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        details = {}
+                    score = max(score, _qc_score_total(details))
+            except Exception:  # noqa: BLE001
+                score = 0.0
+            candidates.append((score, version, path, "pass"))
+        # Prefer approved_generation_id when present.
+        try:
+            approved = conn.execute(
+                "SELECT approved_generation_id, video_path, status FROM segments WHERE id = ?",
+                (segment_id,),
+            ).fetchone()
+        except Exception:  # noqa: BLE001
+            approved = None
+        if approved and approved["status"] == "completed" and approved["video_path"]:
+            rel = str(approved["video_path"])
+            parts = Path(rel).parts
+            path = None
+            if "shots" in parts:
+                idx = parts.index("shots")
+                cand = root.joinpath(*parts[idx:])
+                if cand.is_file() and cand.stat().st_size > 4096:
+                    path = cand
+            if path is not None:
+                # Ensure it is among passing candidates or promote if DB says completed+approved.
+                if not any(c[2] == path for c in candidates):
+                    # Only trust approved when generation_results also says pass when available.
+                    gid = str(approved["approved_generation_id"] or "")
+                    ok = True
+                    if gid:
+                        try:
+                            g_row = conn.execute(
+                                "SELECT qc_verdict FROM generation_results WHERE id = ?",
+                                (gid,),
+                            ).fetchone()
+                            if g_row is not None and str(g_row["qc_verdict"] or "") != "pass":
+                                ok = False
+                        except Exception:  # noqa: BLE001
+                            pass
+                    if ok:
+                        candidates.append((1e9, 999, path, "approved"))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda row: (row[0], row[1]), reverse=True)
+    best = candidates[0]
+    return best[2], best[1], best[3]
 
 
 def next_generation_path(root: Path | None, segment_id: str) -> tuple[int, str]:
@@ -294,13 +460,36 @@ def plan_repair(segment: dict, issues: list[str], attempt: int) -> dict:
     strategy = "change_seed"
     prompt = str(segment.get("h3_prompt") or "")
     new_prompt = prompt
+    joined = " ".join(issues)
     if "character_used_i2v" in issues or "missing_character_refs" in issues or "chain_dropped_refs" in issues:
         strategy = "restore_ref2va"
-    elif "chain_break" in issues:
+    elif "chain_break" in issues or "relink_last_frame" in joined:
         strategy = "relink_last_frame"
     elif "eyeline_jump" in issues:
         strategy = "flip_eyeline_prompt"
         new_prompt = f"{prompt}, hold established eyeline, do not cross the 180 line"
+    elif "generated_text" in joined or "logo" in joined or "reinforce_no_text" in joined:
+        strategy = "reinforce_no_text"
+        new_prompt = (
+            f"{prompt}, no readable text, no whiteboard, no blackboard writing, "
+            "no logos, no chinese characters on surfaces"
+        )
+    elif (
+        "identity" in joined
+        or "military" in joined
+        or "reinforce_identity" in joined
+        or "semantic_age" in joined
+        or "worker_uniform" in joined
+    ):
+        strategy = "reinforce_identity"
+        new_prompt = (
+            f"{prompt}, keep exact locked face age and navy worker uniform, "
+            "no military uniform, no epaulettes, no costume swap"
+        )
+    elif "keyframe" in joined or "restore_refs" in joined or "scene_mismatch" in joined:
+        strategy = "restore_refs"
+    elif attempt >= 1:
+        strategy = "change_seed"
     return {
         "strategy": strategy,
         "seed": seed,
@@ -373,8 +562,38 @@ def passing_index(conn: sqlite3.Connection, episode_code: str) -> dict[str, str]
 
 
 def mark_completed_passing(conn: sqlite3.Connection, segment_id: str, video_path: str) -> None:
-    conn.execute(
-        "UPDATE segments SET status = 'completed', video_path = ? WHERE id = ?",
-        (video_path, segment_id),
-    )
+    gid = None
+    try:
+        row = conn.execute(
+            """
+            SELECT id FROM generation_results
+            WHERE segment_id = ? AND qc_verdict = 'pass'
+            ORDER BY version DESC LIMIT 1
+            """,
+            (segment_id,),
+        ).fetchone()
+        if row:
+            gid = row["id"]
+    except Exception:  # noqa: BLE001
+        gid = None
+    if gid:
+        try:
+            conn.execute(
+                """
+                UPDATE segments
+                SET status = 'completed', video_path = ?, approved_generation_id = ?
+                WHERE id = ?
+                """,
+                (video_path, gid, segment_id),
+            )
+        except Exception:  # noqa: BLE001 — approved_generation_id may be absent
+            conn.execute(
+                "UPDATE segments SET status = 'completed', video_path = ? WHERE id = ?",
+                (video_path, segment_id),
+            )
+    else:
+        conn.execute(
+            "UPDATE segments SET status = 'completed', video_path = ? WHERE id = ?",
+            (video_path, segment_id),
+        )
     conn.commit()

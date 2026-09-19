@@ -42,6 +42,11 @@ QC_RECORD_KEYS = (
     "qc_attempts",
     "qc_scorer",
     "candidates",
+    "source_hash",
+    "identity_source_hash",
+    "scene_source_hash",
+    "prop_source_hash",
+    "lighting_source_hash",
 )
 
 
@@ -529,6 +534,83 @@ def mark_stale_visual_v1(story_root: Path | str | None) -> dict[str, Any]:
         rec["selected"] = None
         changed = True
     if changed and story_root is not None:
+        save_assets_index(story_root, payload, extra=_index_extra(story_root))
+    return payload
+
+
+def mark_stale_source_mismatch(
+    story_root: Path | str | None,
+    *,
+    character_id: str | None = None,
+    scene_id: str | None = None,
+    reason: str = "source_hash_mismatch",
+) -> dict[str, Any]:
+    """Clear selected lock when bible/cast source hash no longer matches."""
+    payload = load_assets_index(story_root)
+    rec = _target_record(payload, character_id=character_id, scene_id=scene_id)
+    if not rec.get("selected") and rec.get("qc_verdict") == "stale_source":
+        return payload
+    rec["qc_verdict"] = "stale_source"
+    rec["qc_reasons"] = list(rec.get("qc_reasons") or []) + [reason]
+    rec["selected"] = None
+    if story_root is not None:
+        save_assets_index(story_root, payload, extra=_index_extra(story_root))
+    return payload
+
+
+def sync_character_source_hash(
+    story_root: Path | str | None,
+    *,
+    character_id: str,
+    source_hash: str,
+    fail_closed_if_locked: bool = False,
+) -> dict[str, Any]:
+    """Stamp identity source hash. Mismatch marks stale; locked+mismatch can fail closed."""
+    from anime_factory.visual_qc import is_current_pass
+
+    payload = normalize_assets_index(load_assets_index(story_root))
+    rec = _target_record(payload, character_id=character_id, scene_id=None)
+    prev = str(rec.get("source_hash") or rec.get("identity_source_hash") or "").strip()
+    new = str(source_hash or "").strip()
+    rec["source_hash"] = new
+    rec["identity_source_hash"] = new
+    if prev and new and prev != new:
+        if fail_closed_if_locked and is_current_pass(rec):
+            raise ValueError(
+                f"locked character {character_id} source_hash changed ({prev} -> {new}); refuse silent rewrite"
+            )
+        rec["qc_verdict"] = "stale_source"
+        rec["qc_reasons"] = list(rec.get("qc_reasons") or []) + ["source_hash_mismatch"]
+        rec["selected"] = None
+    if story_root is not None:
+        save_assets_index(story_root, payload, extra=_index_extra(story_root))
+    return payload
+
+
+def sync_scene_source_hash(
+    story_root: Path | str | None,
+    *,
+    scene_id: str,
+    source_hash: str,
+    fail_closed_if_locked: bool = False,
+) -> dict[str, Any]:
+    from anime_factory.visual_qc import is_current_pass
+
+    payload = normalize_assets_index(load_assets_index(story_root))
+    rec = _target_record(payload, character_id=None, scene_id=scene_id)
+    prev = str(rec.get("source_hash") or rec.get("scene_source_hash") or "").strip()
+    new = str(source_hash or "").strip()
+    rec["source_hash"] = new
+    rec["scene_source_hash"] = new
+    if prev and new and prev != new:
+        if fail_closed_if_locked and is_current_pass(rec):
+            raise ValueError(
+                f"locked scene {scene_id} source_hash changed ({prev} -> {new}); refuse silent rewrite"
+            )
+        rec["qc_verdict"] = "stale_source"
+        rec["qc_reasons"] = list(rec.get("qc_reasons") or []) + ["source_hash_mismatch"]
+        rec["selected"] = None
+    if story_root is not None:
         save_assets_index(story_root, payload, extra=_index_extra(story_root))
     return payload
 

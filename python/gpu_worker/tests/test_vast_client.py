@@ -38,3 +38,10 @@ def test_lease_body_quotes_env_values_with_spaces():
     body = VastClient("fake", dry_run=True).lease_body(env={"FOO": "bar baz", "SKIP": "ok"})
     assert "-e FOO='bar baz'" in body["env"]
     assert "-e SKIP=ok" in body["env"]
+
+
+def test_vast_client_live_vast_disables_default_dry_run(monkeypatch):
+    monkeypatch.setenv("ANIME_FACTORY_LIVE_VAST", "1")
+    monkeypatch.setenv("VAST_DRY_RUN", "1")
+    client = VastClient("fake-key")
+    assert client.dry_run is False

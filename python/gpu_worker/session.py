@@ -52,6 +52,7 @@ from anime_factory.qc import (
     open_repair_task,
     plan_repair,
     record_generation_result,
+    select_passing_generation,
     shot_version_path,
 )
 from anime_factory.r2_client import download_prefix, put_file, upload_tree
@@ -85,7 +86,11 @@ from gpu_worker.longlive import (
 )
 from gpu_worker.longlive_batch import submit_longlive_batch
 from gpu_worker.preflight import RECYCLE_FAILURE_CLASSES, recycle_failure_class
-from gpu_worker.stack import stop_comfy_for_longlive
+from gpu_worker.stack import (
+    release_gpu_for_moss_sfx,
+    restore_gpu_after_moss_sfx,
+    stop_comfy_for_longlive,
+)
 from gpu_worker.stills import generate_still, unload_still_models
 from gpu_worker.vast_client import VastClient
 from gpu_worker.h3_session import (
@@ -231,6 +236,27 @@ def _env_number(name: str, default: float) -> float:
         return max(0.0, float(os.environ.get(name) or default))
     except (TypeError, ValueError):
         return default
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def self_destroy_dry_run() -> bool:
+    """Image default is VAST_DRY_RUN=1 / LIVE_VAST=0. A billed Vast box must still DELETE."""
+    if _env_flag("ANIME_FACTORY_LIVE_VAST"):
+        return False
+    if (os.environ.get("CONTAINER_API_KEY") or "").strip():
+        return False
+    return (os.environ.get("VAST_DRY_RUN") or "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
 
 
 class BudgetExceeded(RuntimeError):
@@ -880,12 +906,7 @@ def never_destroy_error(error: BaseException | str | None) -> str | None:
 
 def destroy_self(instance_id: str, reason: str, error: str | None = None) -> dict[str, Any]:
     """Destroy only this registered instance through boot.py's historical safety gate."""
-    dry_run = (os.environ.get("VAST_DRY_RUN") or "1").strip().lower() not in {
-        "0",
-        "false",
-        "no",
-        "off",
-    }
+    dry_run = self_destroy_dry_run()
     api_key = os.environ.get("CONTAINER_API_KEY") or os.environ.get("VAST_API_KEY") or ""
     if not instance_id:
         return {"ok": False, "destroyed": False, "error": "VAST_INSTANCE_ID missing"}
@@ -1711,6 +1732,8 @@ def _h3_normalize_and_qc(
         segment=shot,
         prev_segment=prev,
         used_mode=used_mode,
+        video_path=dest,
+        story_root=root,
     )
     try:
         record_generation_result(
@@ -1728,17 +1751,16 @@ def _h3_normalize_and_qc(
     return verdict, sid, last_path
 
 
-def _h3_upload_passing(
+def _h3_upload_files(
     story_id: str,
     root: Path,
-    conn,
     sid: str,
     dest: Path,
     rel: str,
     last_path: Path | None,
     progress: ProgressCallback | None = None,
-) -> str:
-    """R2 upload + sqlite flush after QC pass. Safe to queue while the next GPU shot runs."""
+) -> dict[str, Any]:
+    """Background-safe R2/file I/O only. Caller commits sqlite on the main thread."""
     upload = put_file(join_story(story_id, rel), dest, "video/mp4")
     if not _upload_ok(upload):
         raise RuntimeError(f"shot R2 upload failed: {sid}")
@@ -1751,11 +1773,39 @@ def _h3_upload_passing(
     )
     if not _upload_ok(last_upload):
         raise RuntimeError(f"shot last.png R2 upload failed: {sid}")
-    mark_completed_passing(conn, sid, join_story(story_id, rel))
-    _checkpoint_story(conn, story_id, root, progress=progress, upload=True)
     if progress:
         progress(f"shot_uploaded:{sid}")
+    return {"sid": sid, "rel": rel, "story_id": story_id}
+
+
+def _h3_commit_passing(
+    conn,
+    story_id: str,
+    root: Path,
+    upload_result: dict[str, Any],
+    progress: ProgressCallback | None = None,
+) -> str:
+    """Main-thread sqlite + checkpoint after background upload succeeds."""
+    sid = str(upload_result.get("sid") or "")
+    rel = str(upload_result.get("rel") or "")
+    mark_completed_passing(conn, sid, join_story(story_id, rel))
+    _checkpoint_story(conn, story_id, root, progress=progress, upload=True)
     return sid
+
+
+def _h3_upload_passing(
+    story_id: str,
+    root: Path,
+    conn,
+    sid: str,
+    dest: Path,
+    rel: str,
+    last_path: Path | None,
+    progress: ProgressCallback | None = None,
+) -> str:
+    """Compat wrapper: files then main-thread-style commit (avoid from worker threads)."""
+    uploaded = _h3_upload_files(story_id, root, sid, dest, rel, last_path, progress)
+    return _h3_commit_passing(conn, story_id, root, uploaded, progress=progress)
 
 
 def flush_gpu_artifacts(
@@ -2052,8 +2102,9 @@ def _run_anim_longlive(
                 elif shot.get("keyframe_source") == "prior_last_frame":
                     failed.append({"id": sid, "error": "pending_chain_missing_last_frame"})
                     continue
-            existing = existing_generation_file(root, sid)
-            if existing is not None:
+            selected = select_passing_generation(conn, root, sid)
+            if selected is not None:
+                existing, _version, _how = selected
                 skipped.append(sid)
                 rel = existing.relative_to(root).as_posix()
                 mark_completed_passing(conn, sid, join_story(story_id, rel))
@@ -2069,6 +2120,17 @@ def _run_anim_longlive(
                 except Exception:
                     pass
                 continue
+            # Do not auto-green a non-passing on-disk mp4 via existing_generation_file.
+            orphan = existing_generation_file(root, sid)
+            if orphan is not None:
+                print(
+                    {
+                        "resume_skip_orphan": sid,
+                        "path": str(orphan),
+                        "reason": "no_qc_pass_generation",
+                    },
+                    flush=True,
+                )
             shot = _prepare_longlive_shot(shot, root)
             shots[index] = shot
             first = Path(str(shot.get("first_frame_path") or ""))
@@ -2122,7 +2184,6 @@ def _run_anim_longlive(
             _longlive_cpu_post,
             story_id,
             root,
-            conn,
             take,
             src,
             last_path,
@@ -2148,7 +2209,11 @@ def _run_anim_longlive(
 
     posted: list[str] = []
     try:
-        posted = [sid for sid in cpu.drain() if sid]
+        packages = cpu.drain()
+        for package in packages:
+            if not isinstance(package, dict):
+                continue
+            posted.append(_longlive_commit_post(conn, story_id, root, package, progress=progress))
     except (BudgetExceeded, ProgressStalled, StartupTimeout):
         raise
     except Exception as exc:  # noqa: BLE001
@@ -2181,13 +2246,13 @@ def _run_anim_longlive(
 def _longlive_cpu_post(
     story_id: str,
     root: Path,
-    conn,
     take: dict[str, Any],
     dest: Path,
     last_path: Path | None,
     prev_segment: dict[str, Any] | None,
     progress: ProgressCallback | None,
-) -> str:
+) -> dict[str, Any]:
+    """Background file/normalize work only. Main thread commits sqlite after drain."""
     sid = str(take.get("id") or take.get("take_id") or "")
     rel = str(take.get("_rel") or dest.relative_to(root).as_posix())
     version = take.get("_version") or 1
@@ -2196,24 +2261,61 @@ def _longlive_cpu_post(
     from gpu_worker.longlive import select_longlive_mode as _ll_mode
 
     used_mode = _ll_mode(take)
+    upload = put_file(join_story(story_id, rel), dest, "video/mp4")
+    if not _upload_ok(upload):
+        raise RuntimeError(f"shot R2 upload failed: {sid}")
+    if last_path is not None and last_path.is_file() and last_path.stat().st_size >= 32:
+        last_upload = put_file(
+            join_story(story_id, f"episodes/{EP}/keyframes/{sid}/last.png"),
+            last_path,
+            "image/png",
+        )
+        if not _upload_ok(last_upload):
+            raise RuntimeError(f"shot last.png R2 upload failed: {sid}")
+    if progress:
+        progress(f"shot_uploaded:{sid}")
+    return {
+        "sid": sid,
+        "rel": rel,
+        "version": version,
+        "meta": meta,
+        "used_mode": used_mode,
+        "take": take,
+        "prev_segment": prev_segment,
+        "dest": str(dest),
+        "story_id": story_id,
+    }
+
+
+def _longlive_commit_post(
+    conn,
+    story_id: str,
+    root: Path,
+    package: dict[str, Any],
+    progress: ProgressCallback | None = None,
+) -> str:
+    sid = str(package.get("sid") or "")
+    take = dict(package.get("take") or {})
     verdict = incremental_qc_segment(
         conn,
         EP,
         sid,
-        meta,
+        dict(package.get("meta") or {}),
         float(take.get("duration") or 8.0),
         segment=take,
-        prev_segment=prev_segment,
-        used_mode=used_mode,
+        prev_segment=package.get("prev_segment"),
+        used_mode=str(package.get("used_mode") or ""),
+        video_path=package.get("dest"),
+        story_root=root,
     )
     try:
         record_generation_result(
             conn,
             sid,
-            version,
-            join_story(story_id, rel),
+            int(package.get("version") or 1),
+            join_story(story_id, str(package.get("rel") or "")),
             take.get("seed"),
-            used_mode,
+            package.get("used_mode"),
             "completed" if verdict == "pass" else "failed",
             verdict,
         )
@@ -2221,22 +2323,8 @@ def _longlive_cpu_post(
         pass
     if verdict != "pass":
         raise RuntimeError(f"{FAIL_CLOSED}: longlive qc {sid} verdict={verdict}")
-    upload = put_file(join_story(story_id, rel), dest, "video/mp4")
-    if not _upload_ok(upload):
-        raise RuntimeError(f"shot R2 upload failed: {sid}")
-    if last_path is None or not last_path.is_file() or last_path.stat().st_size < 32:
-        raise RuntimeError(f"shot last.png missing: {sid}")
-    last_upload = put_file(
-        join_story(story_id, f"episodes/{EP}/keyframes/{sid}/last.png"),
-        last_path,
-        "image/png",
-    )
-    if not _upload_ok(last_upload):
-        raise RuntimeError(f"shot last.png R2 upload failed: {sid}")
-    mark_completed_passing(conn, sid, join_story(story_id, rel))
+    mark_completed_passing(conn, sid, join_story(story_id, str(package.get("rel") or "")))
     _checkpoint_story(conn, story_id, root, progress=progress)
-    if progress:
-        progress(f"shot_uploaded:{sid}")
     return sid
 
 
@@ -2286,8 +2374,9 @@ def _run_anim_h3(
                     else:
                         failed.append({"id": sid, "error": "pending_chain_missing_last_frame"})
                         continue
-                existing = existing_generation_file(root, sid)
-                if existing is not None:
+                selected = select_passing_generation(conn, root, sid)
+                if selected is not None:
+                    existing, _version, _how = selected
                     skipped.append(sid)
                     rel = existing.relative_to(root).as_posix()
                     mark_completed_passing(conn, sid, join_story(story_id, rel))
@@ -2310,6 +2399,16 @@ def _run_anim_h3(
                     if next_shot is not None and can_prefetch_staging(next_shot):
                         prep_pool.schedule(next_shot)
                     continue
+                orphan = existing_generation_file(root, sid)
+                if orphan is not None:
+                    print(
+                        {
+                            "resume_skip_orphan": sid,
+                            "path": str(orphan),
+                            "reason": "no_qc_pass_generation",
+                        },
+                        flush=True,
+                    )
                 if router is None:
                     failed.append({"id": sid, "error": "no_comfy_router"})
                     continue
@@ -2432,6 +2531,20 @@ def _run_anim_h3(
                     attempt += 1
                     c_verdict, c_details = continuity_qc(prev, shot, used_mode)
                     issues = list((c_details.get("issues") or [])) or ["visual_retry"]
+                    try:
+                        from anime_factory.video_visual_qc import map_reasons_to_strategy
+
+                        report = dest.parent / "visual_qc.json"
+                        if report.is_file():
+                            payload = json.loads(report.read_text(encoding="utf-8"))
+                            reasons = list(payload.get("reasons") or [])
+                            if reasons:
+                                issues = list(dict.fromkeys([*issues, *reasons]))
+                            strategy_hint = payload.get("retry_strategy") or map_reasons_to_strategy(reasons)
+                            if strategy_hint and strategy_hint not in issues:
+                                issues.append(strategy_hint)
+                    except Exception:  # noqa: BLE001
+                        pass
                     repair = plan_repair(shot, issues, attempt)
                     open_repair_task(conn, sid, issues, attempt, shot.get("h3_prompt"), repair)
                     shot = dict(
@@ -2461,10 +2574,9 @@ def _run_anim_h3(
                     repaired.append(sid)
                 if verdict == "pass":
                     cpu.submit(
-                        _h3_upload_passing,
+                        _h3_upload_files,
                         story_id,
                         root,
-                        conn,
                         sid,
                         dest,
                         rel,
@@ -2492,8 +2604,12 @@ def _run_anim_h3(
                 if classified:
                     raise
                 failed.append({"id": sid, "error": str(exc)[:800]})
-        posted = cpu.drain()
-        done.extend(posted)
+        posted_uploads = cpu.drain()
+        for item in posted_uploads:
+            if isinstance(item, dict) and item.get("sid"):
+                done.append(_h3_commit_passing(conn, story_id, root, item, progress=progress))
+            elif item:
+                done.append(str(item))
     finally:
         try:
             cpu.close()
@@ -2701,6 +2817,18 @@ def run_compose(
             if sid:
                 clip_durations[sid] = shot["duration"]
         local = trimmed
+    # Backend-aware MOSS handoff: LongLive clears ownership + vacates leftovers;
+    # H3 stops Comfy without setting longlive_owns_gpu so Comfy can restore.
+    try:
+        video_backend = select_video_backend(root=root)
+    except Exception:  # noqa: BLE001 — compose can still proceed with H3 default
+        video_backend = "h3"
+    moss_handoff_done = {"done": False}
+
+    def _before_moss_sfx() -> None:
+        release_gpu_for_moss_sfx(backend=video_backend)
+        moss_handoff_done["done"] = True
+
     sfx_prepared = prepare_episode_sfx(
         shots,
         root,
@@ -2708,8 +2836,10 @@ def run_compose(
         story_id=story_id,
         conn=conn,
         clip_durations=clip_durations or None,
-        before_moss=stop_comfy_for_longlive,
+        before_moss=_before_moss_sfx,
     )
+    if moss_handoff_done["done"]:
+        restore_gpu_after_moss_sfx(backend=video_backend)
     mixed, timeline = compose_episode_audio(
         work,
         EP,
@@ -2733,7 +2863,39 @@ def run_compose(
         for key, result in sfx_results.items()
         if result.status == "resolved"
     ]
+    sfx_evidence = sfx_prepared.get("evidence") or {}
+    sfx_credits = sfx_prepared.get("credits") or sfx_evidence.get("credits") or []
     timeline_path = work / "audio" / "timeline.json"
+    evidence_path = work / "audio" / "sfx_evidence.json"
+    credits_path = work / "audio" / "sfx_credits.json"
+    evidence_path.parent.mkdir(parents=True, exist_ok=True)
+    evidence_payload = {
+        **sfx_evidence,
+        "credits": sfx_credits,
+        "resolved_cues": resolved_sources,
+        "missing": sfx_prepared.get("missing") or sfx_evidence.get("missing") or [],
+    }
+    evidence_path.write_text(json.dumps(evidence_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    credits_path.write_text(json.dumps(sfx_credits, ensure_ascii=False, indent=2), encoding="utf-8")
+    # Attach credits onto the timeline manifest when present so R2 evidence is one place.
+    if timeline_path.is_file():
+        try:
+            timeline_payload = json.loads(timeline_path.read_text(encoding="utf-8"))
+            if isinstance(timeline_payload, dict):
+                timeline_payload["sfx_credits"] = sfx_credits
+                timeline_payload["sfx_evidence"] = {
+                    "coverage": evidence_payload.get("coverage"),
+                    "cue_total": evidence_payload.get("cue_total"),
+                    "cue_resolved": evidence_payload.get("cue_resolved"),
+                    "cue_missing": evidence_payload.get("cue_missing"),
+                    "missing": evidence_payload.get("missing"),
+                    "sources": evidence_payload.get("sources"),
+                }
+                timeline_path.write_text(
+                    json.dumps(timeline_payload, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+        except (OSError, ValueError):
+            pass
     concat = work / "concat.txt"
     concat.write_text("".join(f"file '{p}'\n" for p in local), encoding="utf-8")
     plan: ComposePlan = build_compose_plan(work, EP, local, langs=langs, require_audio=True)
@@ -2745,6 +2907,7 @@ def run_compose(
     uploads = []
     final_keys = []
     subtitle_keys = []
+    evidence_keys = []
     failed_uploads = []
     for lang in langs:
         for suffix, content_type in (
@@ -2770,12 +2933,30 @@ def run_compose(
                     progress(f"r2_uploaded:{key}")
             else:
                 failed_uploads.append(key)
+    for local_name, rel_suffix, content_type in (
+        ("timeline.json", f"episodes/{EP}/audio/timeline.json", "application/json"),
+        ("sfx_evidence.json", f"episodes/{EP}/audio/sfx_evidence.json", "application/json"),
+        ("sfx_credits.json", f"episodes/{EP}/audio/sfx_credits.json", "application/json"),
+    ):
+        artifact = work / "audio" / local_name
+        if not artifact.is_file():
+            continue
+        key = join_story(story_id, rel_suffix)
+        uploaded = put_file(key, artifact, content_type)
+        uploads.append(uploaded)
+        if isinstance(uploaded, dict) and uploaded.get("ok"):
+            evidence_keys.append(key)
+            if progress:
+                progress(f"r2_uploaded:{key}")
+        else:
+            failed_uploads.append(key)
     if failed_uploads:
         raise RuntimeError(f"compose R2 upload failed: {failed_uploads}")
     return {
         "uploaded": uploads,
         "final_keys": final_keys,
         "subtitle_keys": subtitle_keys,
+        "evidence_keys": evidence_keys,
         "n_shots": len(local),
         "mixed_wavs": mixed,
         "sfx": {
@@ -2785,6 +2966,10 @@ def run_compose(
             "sfx_clip_count": len(sfx_prepared.get("sfx_clips") or []),
             "ambience_clip_count": len(sfx_prepared.get("ambience_clips") or []),
             "resolved_cues": resolved_sources,
+            "credits": sfx_credits,
+            "coverage": evidence_payload.get("coverage"),
+            "missing": evidence_payload.get("missing") or [],
+            "evidence_path": evidence_path.relative_to(work).as_posix(),
         },
     }
 
@@ -3435,7 +3620,7 @@ def run_gpu_batch(
             "report_errors": report_errors,
             "limit": None,
             "stop_checkpoint": None,
-            "destroy_reason": None,
+            "destroy_reason": "success",
             "destroy_error": None,
             "skip_cycle": True,
         }
@@ -3636,10 +3821,11 @@ def run_gpu_batch(
         destroy_error = None
     elif budget_stop:
         destroy_reason = "explicit_abort"
-    else:
-        # Remaining H3 work keeps the box. Compose-complete waits for idle_ttl, not an
-        # immediate DELETE — one Comfy 400 must not deallocate Vast.
+    elif remaining_any or not all_done:
+        # Remaining H3 work keeps the box. One Comfy 400 must not deallocate Vast.
         destroy_reason = None
+    else:
+        destroy_reason = "success"
     return {
         "batch_id": batch_id,
         "story_id": story_id,

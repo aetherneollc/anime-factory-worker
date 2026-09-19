@@ -256,6 +256,8 @@ def test_canary_env_sets_required_keys():
     assert env["AF_GPU_PROFILE"] == gc.CANARY_H3_PROFILE
     assert "AF_VIDEO_BACKEND_LOCKED" not in env
     assert env["VAST_ALLOW_REPLACE"] == "0"
+    assert env["VAST_DRY_RUN"] == "0"
+    assert env["ANIME_FACTORY_LIVE_VAST"] == "1"
     assert env["AF_EXPECTED_IMAGE_DIGEST"] == DIGEST
     assert env["AF_REPORTED_IMAGE_DIGEST"] == DIGEST
     assert env["AF_SKIP_PRE_GPU"] == "1"

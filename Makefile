@@ -7,7 +7,7 @@ MOSS_CHECK_IMAGE := nvidia/cuda:12.8.1-runtime-ubuntu24.04
 KV_DEQUANT_CHECK_IMAGE := nvidia/cuda:12.8.1-runtime-ubuntu24.04
 
 pytest:
-	PYTHONPATH=python $(PYTEST) tests python/gpu_worker/tests -q
+	PYTHONPATH=python $(PYTEST) tests python/tests python/gpu_worker/tests -q
 
 test: pytest
 

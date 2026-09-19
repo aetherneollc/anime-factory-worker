@@ -247,10 +247,48 @@ def test_explicit_sfx_and_ambience_fields_derive_cues_with_onsets():
     assert glass["cue"].tags == ("glass",)
     assert amb["cue"].bus == "ambience"
     assert amb["cue"].shared is True
-    assert amb["cue"].duration_target == 6.0  # spans its shot by default
+    assert amb["cue"].duration_target == 6.0  # loopable source bounded to shot/bed
+    assert amb["kind"] == "ambience_bed"
+    assert amb["bed_duration_s"] == 6.0
 
 
-def test_malformed_explicit_entry_raises_spec_error():
+def test_scene_ambience_merges_consecutive_same_scene_into_one_bed():
+    shots = [
+        {
+            "id": "c01",
+            "duration": 4.0,
+            "scene_id": "classroom",
+            "ambience": "quiet classroom room tone",
+            "sfx": [{"query": "key jingle", "key": "keys", "offset_s": 1.0, "duration_s": 0.5}],
+        },
+        {
+            "id": "c02",
+            "duration": 4.0,
+            "scene_id": "classroom",
+            "ambience": "quiet classroom room tone",
+        },
+        {
+            "id": "r01",
+            "duration": 3.0,
+            "scene_id": "rooftop",
+            "ambience": "windy rooftop night",
+        },
+    ]
+    derived = explicit_cues_from_shots(shots, "EP001")
+    sfx = [d for d in derived if d["kind"] == "sfx"]
+    beds = [d for d in derived if d["kind"] == "ambience_bed"]
+    assert len(sfx) == 1
+    assert sfx[0]["onset_s"] == 1.0  # precise cut onset inside first shot
+    assert sfx[0]["cue"].cue_key == "keys"
+    assert len(beds) == 2
+    classroom, rooftop = beds
+    assert classroom["onset_s"] == 0.0
+    assert classroom["bed_duration_s"] == 8.0
+    assert classroom["shot_ids"] == ["c01", "c02"]
+    assert classroom["cue"].cue_key == "classroom_ambience"
+    assert rooftop["onset_s"] == 8.0
+    assert rooftop["bed_duration_s"] == 3.0
+    assert rooftop["cue"].cue_key == "rooftop_ambience"
     with pytest.raises(SfxCueSpecError):
         explicit_cues_from_shots([{"id": "s001", "duration": 8.0, "sfx": [{"tags": ["x"]}]}], "EP001")
 

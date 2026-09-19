@@ -566,10 +566,14 @@ def is_chain_head(segment: dict) -> bool:
 
 
 def needs_first_frame_still(segment: dict) -> bool:
-    """Only fl2va chain heads mint/require a Flux still. ref2va heads use character sheets."""
+    """Chain heads mint a composition f1 still. ref2va also needs the temporal keyframe."""
     if not is_chain_head(segment):
         return False
-    return choose_h3_mode(segment) in {"fl2va_first", "fl2va_first_last"}
+    mode = choose_h3_mode(segment)
+    if mode in {"fl2va_first", "fl2va_first_last", "ref2va"}:
+        return True
+    # Character-bearing heads always need a composition anchor for H3 v2.
+    return bool(str(segment.get("character_id") or "").strip()) and segment.get("on_camera") is not False
 
 
 def expand_shots_to_segments(shots: list[dict], max_s: float | None = None) -> list[dict[str, Any]]:
@@ -610,7 +614,30 @@ def expand_shots_to_segments(shots: list[dict], max_s: float | None = None) -> l
                 seg["h3_mode"] = choose_h3_mode({**shot, "chain_index": 0})
                 seg.setdefault("status", "prepared")
             cuts = list(seg.get("cuts") or [])
-            if cuts:
+            if cuts and n == 1:
+                # Preserve multi-cut storyboard when the take already fits the backend cap.
+                stored = []
+                for j, cut in enumerate(cuts, start=1):
+                    if not isinstance(cut, dict):
+                        continue
+                    row = dict(cut)
+                    row["seq"] = int(row.get("seq") or j)
+                    stored.append(row)
+                if stored:
+                    total = sum(float(c.get("seconds") or 0) for c in stored) or float(seg["duration"])
+                    scaled = []
+                    for row in stored:
+                        share = float(row.get("seconds") or 0)
+                        if total > 0 and abs(total - float(seg["duration"])) > 0.05:
+                            share = float(seg["duration"]) * (share / total)
+                        row = dict(row)
+                        row["seconds"] = round(max(0.1, share), 2)
+                        scaled.append(row)
+                    if scaled:
+                        head_sum = sum(c["seconds"] for c in scaled[:-1])
+                        scaled[-1]["seconds"] = round(max(0.1, float(seg["duration"]) - head_sum), 2)
+                    seg["cuts"] = scaled
+            elif cuts:
                 head = dict(cuts[0])
                 head["seconds"] = seg["duration"]
                 head["seq"] = 1

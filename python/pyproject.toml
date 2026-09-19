@@ -18,5 +18,5 @@ where = ["."]
 include = ["anime_factory*", "gpu_worker*"]
 
 [tool.pytest.ini_options]
-testpaths = ["../tests", "gpu_worker/tests"]
+testpaths = ["../tests", "tests", "gpu_worker/tests"]
 pythonpath = ["."]

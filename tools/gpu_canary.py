@@ -278,6 +278,7 @@ def build_canary_env(*, image_digest: str, story_id: str, backend: str = "h3") -
         "AF_IMAGE_CAPABILITY": video_backend,
         "VAST_ALLOW_REPLACE": "0",
         "VAST_DRY_RUN": "0",
+        "ANIME_FACTORY_LIVE_VAST": "1",
         "AF_EXPECTED_IMAGE_DIGEST": image_digest,
         "AF_REPORTED_IMAGE_DIGEST": image_digest,
         "AF_GPU_PROFILE": profile,

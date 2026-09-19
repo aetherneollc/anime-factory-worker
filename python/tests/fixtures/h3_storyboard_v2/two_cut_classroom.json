@@ -1,0 +1,44 @@
+{
+  "cast": [
+    {
+      "id": "zhou",
+      "name": "周伯",
+      "age": 60,
+      "identity_prompt": "1boy, 60 y/o, short grey hair, brown eyes, navy blue worker uniform jacket, lean elderly build, no military uniform, no epaulettes"
+    }
+  ],
+  "shots": [
+    {
+      "id": "EP001-01",
+      "duration": 8,
+      "scene_id": "classroom",
+      "character_id": "zhou",
+      "on_camera": true,
+      "refs": ["char_zhou_sheet", "plate_classroom"],
+      "cuts": [
+        {
+          "seq": 1,
+          "seconds": 4,
+          "size": "MS",
+          "camera": "Static Shot",
+          "characters": ["zhou"],
+          "frame_prompt": "60 y/o janitor in navy blue worker uniform jacket holds keys in classroom doorway",
+          "beat_ids": ["b1"],
+          "text_policy": "no_generated_text"
+        },
+        {
+          "seq": 2,
+          "seconds": 4,
+          "size": "CU",
+          "camera": "Push In",
+          "characters": ["zhou"],
+          "props": ["keys"],
+          "frame_prompt": "close on weathered hands turning the classroom brass key",
+          "beat_ids": ["b2"],
+          "text_policy": "no_generated_text"
+        }
+      ]
+    }
+  ],
+  "expected_prompt_substr": "navy blue worker uniform"
+}

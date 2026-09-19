@@ -188,7 +188,13 @@ def resolve_via_moss(client: MossSoundEffectClient, cue: SfxCue, root: Path) -> 
     duration = float(cue.duration_target or 2.0)
     tmp_out = cache_root / f"_gen_{safe_cue_slug(cue.cue_key)}.wav"
     wav = client.generate(cue, tmp_out)
-    assert_audio_qc(wav, label=f"{cue.cue_key}:moss", target_duration=cue.duration_target, duration_tolerance=cue.duration_tolerance)
+    assert_audio_qc(
+        wav,
+        label=f"{cue.cue_key}:moss",
+        target_duration=cue.duration_target,
+        duration_tolerance=cue.duration_tolerance,
+        bus=cue.bus,
+    )
     digest = content_hash(wav)
     local_path = cache_write(cache_root, digest, wav)
     try:

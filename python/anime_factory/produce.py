@@ -1387,6 +1387,7 @@ def _try_one_lease(stage_flags: dict[str, str]) -> dict[str, Any]:
         "AF_START_COMFY": "1",
         "ANIME_FACTORY_GPU_STILLS": "1",
         "VAST_DRY_RUN": "0",
+        "ANIME_FACTORY_LIVE_VAST": "1",
         "VAST_ALLOW_REPLACE": "0",
         "COMFYUI_BASE_URL": "http://127.0.0.1:8199",
         "R2_ENDPOINT": os.environ.get("R2_ENDPOINT") or "",

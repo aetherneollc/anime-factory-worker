@@ -880,7 +880,12 @@ def main() -> int:
                                     runtime.mark_idle()
                                 print(json.dumps({"episode": episode}, ensure_ascii=False), flush=True)
                                 if once:
-                                    return 0 if not episode.get("remaining") else 1
+                                    pending_destroy = {
+                                        "reason": "success" if not episode.get("remaining") else "explicit_abort",
+                                        "error": None if not episode.get("remaining") else "anim incomplete",
+                                        "exit_code": 0 if not episode.get("remaining") else 1,
+                                        "last_attempt": 0.0,
+                                    }
 
                 except (BudgetExceeded, ProgressStalled, StartupTimeout) as exc:
                     pending_destroy = {

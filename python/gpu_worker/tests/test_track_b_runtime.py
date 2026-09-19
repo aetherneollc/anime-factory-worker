@@ -1305,7 +1305,7 @@ def test_batch_runs_every_episode_and_reports(monkeypatch):
         "stories/story-1/episodes/EP001/final/EP001.zh.srt"
     ]
     assert summary["episodes_done"] == 2
-    assert summary["destroy_reason"] is None
+    assert summary["destroy_reason"] == "success"
     assert runtime.status == "idle"
 
 
@@ -1559,6 +1559,7 @@ def test_archived_or_remaining_zero_marks_idle_without_skip_cycle(monkeypatch):
     first = session.run_gpu_batch(batch, runtime, report=lambda _body: {"ok": True})
     assert calls == ["EP001"]
     assert first["skip_cycle"] is False
+    assert first["destroy_reason"] == "success"
     assert runtime.status == "idle"
     idle_since = runtime.idle_since
     now[0] = 160.0
@@ -1567,6 +1568,7 @@ def test_archived_or_remaining_zero_marks_idle_without_skip_cycle(monkeypatch):
     second = session.run_gpu_batch(batch, runtime, report=lambda _body: {"ok": True})
     assert calls == ["EP001"]
     assert second["skip_cycle"] is True
+    assert second["destroy_reason"] == "success"
     assert runtime.status == "idle"
     assert runtime.idle_since == idle_since
     now[0] = 220.0
@@ -1763,7 +1765,7 @@ def test_compose_uploads_video_and_subtitles_to_episode_prefix(tmp_path, monkeyp
         "stories/story-1/episodes/EP001/final/EP001.zh.srt",
         "stories/story-1/episodes/EP001/final/EP001.ja.srt",
     ]
-    assert uploaded == [
+    assert uploaded[:4] == [
         (
             "stories/story-1/episodes/EP001/final/EP001.zh.mp4",
             "video/mp4",
@@ -1781,6 +1783,17 @@ def test_compose_uploads_video_and_subtitles_to_episode_prefix(tmp_path, monkeyp
             "application/x-subrip",
         ),
     ]
+    assert (
+        "stories/story-1/episodes/EP001/audio/sfx_evidence.json",
+        "application/json",
+    ) in uploaded
+    assert (
+        "stories/story-1/episodes/EP001/audio/sfx_credits.json",
+        "application/json",
+    ) in uploaded
+    assert "stories/story-1/episodes/EP001/audio/sfx_evidence.json" in (
+        result.get("evidence_keys") or []
+    )
 
 
 def _compose_harness(tmp_path, monkeypatch, pairs, shots):
@@ -1958,6 +1971,9 @@ def test_run_compose_integrates_prepare_episode_sfx_into_compose_audio(tmp_path,
 
     def prepare_stub(passed_shots, passed_root, episode_code, **kwargs):
         prepare_args.append((passed_shots, passed_root, episode_code, kwargs))
+        before = kwargs.get("before_moss")
+        if callable(before):
+            before()
         return fake_sfx
 
     compose_calls: list[dict] = []
@@ -1970,6 +1986,19 @@ def test_run_compose_integrates_prepare_episode_sfx_into_compose_audio(tmp_path,
         )
         return ({"zh": str(work / "audio" / "master.zh.wav")}, timeline)
 
+    handoff_calls: list[dict] = []
+    restore_calls: list[dict] = []
+    monkeypatch.setattr(session, "select_video_backend", lambda **_k: "h3")
+    monkeypatch.setattr(
+        session,
+        "release_gpu_for_moss_sfx",
+        lambda **kwargs: handoff_calls.append(kwargs) or {"ok": True},
+    )
+    monkeypatch.setattr(
+        session,
+        "restore_gpu_after_moss_sfx",
+        lambda **kwargs: restore_calls.append(kwargs) or {"ok": True, "restored": False},
+    )
     monkeypatch.setattr(session, "prepare_episode_sfx", prepare_stub)
     monkeypatch.setattr(session, "compose_episode_audio", compose_stub)
 
@@ -1983,6 +2012,10 @@ def test_run_compose_integrates_prepare_episode_sfx_into_compose_audio(tmp_path,
     assert kw.get("story_id") == "story-1"
     assert "clip_durations" in kw
     assert callable(kw.get("before_moss"))
+    # H3 compose must not hand MOSS the LongLive claim path.
+    assert kw.get("before_moss") is not session.stop_comfy_for_longlive
+    assert handoff_calls == [{"backend": "h3"}]
+    assert restore_calls == [{"backend": "h3"}]
 
     assert len(compose_calls) == 1
     ck = compose_calls[0]["kwargs"]
@@ -2170,6 +2203,8 @@ def test_shorts_library_outputs_use_episode_r2_prefix(tmp_path, monkeypatch):
 
 def test_destroy_self_obeys_historical_safety_gate(monkeypatch):
     monkeypatch.setenv("VAST_DRY_RUN", "1")
+    monkeypatch.setenv("ANIME_FACTORY_LIVE_VAST", "0")
+    monkeypatch.delenv("CONTAINER_API_KEY", raising=False)
     allowed = session.destroy_self("123", "success")
     assert allowed["ok"] is True
     assert allowed["dry_run"] is True
@@ -2202,6 +2237,42 @@ def test_destroy_self_uses_vast_instance_key(monkeypatch):
     assert result["ok"] is True
     assert result["destroyed"] is True
     assert seen == {"api_key": "instance-key", "dry_run": False}
+
+
+def test_destroy_self_live_vast_overrides_image_dry_run(monkeypatch):
+    seen = {}
+
+    class Client:
+        def __init__(self, api_key, dry_run):
+            seen["api_key"] = api_key
+            seen["dry_run"] = dry_run
+
+    monkeypatch.setenv("VAST_DRY_RUN", "1")
+    monkeypatch.setenv("ANIME_FACTORY_LIVE_VAST", "1")
+    monkeypatch.setenv("VAST_API_KEY", "lease-key")
+    monkeypatch.delenv("CONTAINER_API_KEY", raising=False)
+    monkeypatch.setattr(session, "VastClient", Client)
+    monkeypatch.setattr(
+        session,
+        "destroy_if_allowed",
+        lambda client, lease, reason, ids, error=None: {
+            "success": True,
+            "id": lease.instance_id,
+        },
+    )
+    result = session.destroy_self("51548736", "success")
+    assert result["ok"] is True
+    assert result["destroyed"] is True
+    assert result["dry_run"] is False
+    assert seen == {"api_key": "lease-key", "dry_run": False}
+
+
+def test_self_destroy_dry_run_false_on_container_key(monkeypatch):
+    monkeypatch.setenv("VAST_DRY_RUN", "1")
+    monkeypatch.setenv("ANIME_FACTORY_LIVE_VAST", "0")
+    monkeypatch.setenv("CONTAINER_API_KEY", "instance-key")
+    monkeypatch.delenv("VAST_API_KEY", raising=False)
+    assert session.self_destroy_dry_run() is False
 
 
 def test_filtered_comfy_requirements_skip_torch_family(tmp_path):
@@ -2242,6 +2313,44 @@ def test_stop_comfy_for_longlive_waits_until_vram_drops(monkeypatch):
     assert any("ComfyUI/main.py" in row for row in calls)
     assert stack.longlive_owns_gpu() is True
     stack.release_gpu_from_longlive()
+    assert stack.longlive_owns_gpu() is False
+
+
+def test_release_gpu_for_moss_sfx_h3_does_not_claim_longlive(monkeypatch):
+    calls = []
+    monkeypatch.setattr(stack.subprocess, "run", lambda args, **_k: calls.append(list(args)) or SimpleNamespace(returncode=0))
+    monkeypatch.setattr(stack, "_gpu_memory_used_mb", lambda: 200)
+    monkeypatch.setattr(stack.time, "sleep", lambda _s: None)
+    stack.release_gpu_from_longlive()
+    out = stack.release_gpu_for_moss_sfx(backend="h3")
+    assert out["ok"] is True
+    assert out["claimed_longlive"] is False
+    assert out["backend"] == "h3"
+    assert stack.longlive_owns_gpu() is False
+    assert any("ComfyUI/main.py" in row for row in calls)
+
+
+def test_release_gpu_for_moss_sfx_longlive_clears_ownership(monkeypatch):
+    monkeypatch.setattr(stack.subprocess, "run", lambda args, **_k: SimpleNamespace(returncode=0))
+    monkeypatch.setattr(stack, "_gpu_memory_used_mb", lambda: 100)
+    monkeypatch.setattr(stack.time, "sleep", lambda _s: None)
+    stack.claim_gpu_for_longlive()
+    assert stack.longlive_owns_gpu() is True
+    out = stack.release_gpu_for_moss_sfx(backend="longlive")
+    assert out["ok"] is True
+    assert stack.longlive_owns_gpu() is False
+    assert out["claimed_longlive"] is False
+
+
+def test_restore_gpu_after_moss_sfx_h3_allows_comfy_restart(monkeypatch):
+    started = []
+    monkeypatch.setattr(stack, "_port_open", lambda *_a, **_k: False)
+    monkeypatch.setattr(stack, "start_comfy", lambda: started.append("comfy") or SimpleNamespace())
+    stack.claim_gpu_for_longlive()  # simulate a bad prior handoff
+    out = stack.restore_gpu_after_moss_sfx(backend="h3")
+    assert out["ok"] is True
+    assert out["restored"] is True
+    assert started == ["comfy"]
     assert stack.longlive_owns_gpu() is False
 
 

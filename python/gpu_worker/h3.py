@@ -176,15 +176,29 @@ def image_filename(value: Any) -> str | None:
 
 
 def ref_image_filenames(segment: dict) -> list[str]:
-    """Basenames for LoadImage nodes. One file per sheet; never a dummy f1.png."""
+    """Basenames for LoadImage nodes. Prefer reference_manifest order when present."""
     chain_tail = int(segment.get("chain_index") or 0) > 0 or bool(segment.get("chain_source_last_frame"))
     chain_first = image_filename(segment.get("first_frame_path")) if chain_tail else None
     names: list[str] = []
-    for raw in list(segment.get("refs") or [])[:H3_MAX_REFS]:
+    manifest = segment.get("reference_manifest")
+    if isinstance(manifest, dict) and manifest.get("refs"):
+        ordered = list(manifest.get("refs") or [])
+    else:
+        try:
+            from anime_factory.h3_storyboard import build_reference_manifest
+
+            ordered = list(build_reference_manifest(segment).get("refs") or [])
+        except Exception:  # noqa: BLE001
+            ordered = list(segment.get("refs") or [])
+    for raw in ordered[:H3_MAX_REFS]:
         name = image_filename(raw)
         if not name:
+            # Keep logical tokens like char_*_sheet for downstream binders.
+            text = str(raw or "").strip()
+            if text:
+                names.append(text)
             continue
-        if "." not in name:
+        if "." not in name and not name.endswith("_sheet") and not name.startswith("plate_"):
             name = f"{name}.png"
         if chain_tail and chain_first and name == chain_first:
             continue
@@ -284,26 +298,32 @@ def _camera_motion_clause(cam: str) -> str:
 
 
 def segment_prompt(segment: dict) -> str:
-    prompt = ""
-    for key in ("h3_prompt", "first_frame_prompt", "line", "action", "prompt"):
-        val = segment.get(key)
-        if isinstance(val, dict):
-            val = val.get("zh") or val.get("en") or val.get("ja")
-        if val and str(val).strip():
-            prompt = str(val).strip()
-            break
-    if not prompt:
-        prompt = DEFAULT_H3_PROMPT
-    if int(segment.get("chain_index") or 0) > 0 or segment.get("chain_source_last_frame"):
-        if CONTINUE_PROMPT not in prompt:
-            prompt = f"{CONTINUE_PROMPT}. {prompt}"
-    cam = "Static Shot"
-    cuts = segment.get("cuts") or []
-    if cuts and isinstance(cuts[0], dict) and cuts[0].get("camera"):
-        cam = str(cuts[0]["camera"])
-    elif segment.get("camera"):
-        cam = str(segment["camera"])
-    return f"{prompt}, camera: {cam}, {_camera_motion_clause(cam)}, {MOTION_KEEP_ALIVE}"
+    """Compile picture prompt from cuts/manifest. Never pollute with dialogue `line`."""
+    try:
+        from anime_factory.h3_storyboard import compile_picture_prompt
+
+        return compile_picture_prompt(segment)
+    except Exception:  # noqa: BLE001 — fall back for minimal unit stubs
+        prompt = ""
+        for key in ("h3_prompt", "first_frame_prompt", "action", "prompt"):
+            val = segment.get(key)
+            if isinstance(val, dict):
+                val = val.get("zh") or val.get("en") or val.get("ja")
+            if val and str(val).strip():
+                prompt = str(val).strip()
+                break
+        if not prompt:
+            prompt = DEFAULT_H3_PROMPT
+        if int(segment.get("chain_index") or 0) > 0 or segment.get("chain_source_last_frame"):
+            if CONTINUE_PROMPT not in prompt:
+                prompt = f"{CONTINUE_PROMPT}. {prompt}"
+        cam = "Static Shot"
+        cuts = segment.get("cuts") or []
+        if cuts and isinstance(cuts[0], dict) and cuts[0].get("camera"):
+            cam = str(cuts[0]["camera"])
+        elif segment.get("camera"):
+            cam = str(segment["camera"])
+        return f"{prompt}, camera: {cam}, {_camera_motion_clause(cam)}, {MOTION_KEEP_ALIVE}"
 
 
 def gpu_vram_mb() -> int | None:

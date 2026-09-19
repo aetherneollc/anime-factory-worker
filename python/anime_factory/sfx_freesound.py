@@ -330,6 +330,7 @@ def resolve_via_freesound(
                 label=f"{cue.cue_key}:fs{candidate.freesound_id}",
                 target_duration=cue.duration_target,
                 duration_tolerance=cue.duration_tolerance,
+                bus=cue.bus,
             )
         except (SfxQCError, MalformedAudioError, FreesoundNetworkError, FreesoundHostPolicyError) as exc:
             log.warning("freesound candidate rejected cue=%s fs_id=%s reason=%s", cue.cue_key, candidate.freesound_id, exc)

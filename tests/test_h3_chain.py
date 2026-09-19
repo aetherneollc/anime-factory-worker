@@ -221,8 +221,10 @@ def test_ref2va_graph_loads_sheets_not_dummy_f1():
     assert "audio" not in graph["14"]["inputs"]
 
 
-def test_ref2va_head_uses_sheet_and_skips_flux(tmp_path):
+def test_ref2va_head_mints_composition_f1_and_keeps_sheet(tmp_path, monkeypatch):
+    """H3 v2: ref2va chain heads mint composition f1 (+ cut anchors) while still requiring sheets."""
     from anime_factory.asset_lock import lock_after_qc
+    from anime_factory.visual_qc import VisualQcResult
     from tests.clip_fakes import pass_qc
 
     sheet = tmp_path / "assets" / "characters" / "ke" / "sheet_front.png"
@@ -233,12 +235,20 @@ def test_ref2va_head_uses_sheet_and_skips_flux(tmp_path):
 
     def gpu_gen(payload):
         payloads.append(payload)
-        return synthetic_still_png(1440, 800, tag=str(payload.get("seed")))
+        from anime_factory.models import STILL_HEIGHT, STILL_WIDTH
+
+        return synthetic_still_png(STILL_WIDTH, STILL_HEIGHT, tag=str(payload.get("seed")))
 
     conn = open_db(tmp_path / "s.sqlite")
     migrate(conn)
     from anime_factory.design import KolorsClient
+    from anime_factory import keyframe as kf
 
+    monkeypatch.setattr(
+        kf,
+        "score_still",
+        lambda *_a, **_k: VisualQcResult(verdict="pass", reasons=[], scores={}, kind="keyframe"),
+    )
     client = KolorsClient(["k"], live=True, gpu_generate=gpu_gen)
     key = ensure_keyframe(
         conn,
@@ -250,6 +260,17 @@ def test_ref2va_head_uses_sheet_and_skips_flux(tmp_path):
             "h3_mode": "ref2va",
             "character_id": "ke",
             "refs": ["char_ke_sheet"],
+            "first_frame_prompt": "1girl, young adult, black hair, brown eyes, grey hoodie, medium shot in store",
+            "cuts": [
+                {
+                    "seq": 1,
+                    "seconds": 8,
+                    "size": "MS",
+                    "camera": "Static Shot",
+                    "characters": ["ke"],
+                    "frame_prompt": "1girl grey hoodie standing at store counter",
+                }
+            ],
         },
         {},
         {"items": [{"id": "char_ke_sheet", "path": "assets/characters/ke/sheet_front.png"}]},
@@ -259,9 +280,11 @@ def test_ref2va_head_uses_sheet_and_skips_flux(tmp_path):
         "fiction",
         tmp_path,
     )
-    assert payloads == []
-    assert "sheet_front.png" in key
-    assert not (tmp_path / "episodes" / "EP001" / "keyframes" / "s001" / "f1.png").exists()
+    assert payloads, "ref2va head must mint composition stills in H3 v2"
+    assert key.endswith("f1.png")
+    assert (tmp_path / "episodes" / "EP001" / "keyframes" / "s001" / "f1.png").exists()
+    assert (tmp_path / "episodes" / "EP001" / "keyframes" / "s001" / "f01.png").exists()
+    assert sheet.is_file()
 
 
 def test_keyframe_stage_fails_when_fl2va_files_missing(tmp_path):

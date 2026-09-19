@@ -126,20 +126,34 @@ _HAIR_RE = re.compile(
 )
 _EYES_RE = re.compile(r"\b(eyes?|iris|heterochromia|eye color)\b", re.I)
 _CLOTHING_RE = re.compile(
-    r"\b(raincoat|jacket|coat|uniform|dress|shirt|hoodie|skirt|armor|suit|clothes|clothing|robe|vest|sweater|blouse|trousers|pants|scarf|harness|boots|shoes|build|frame|physique|slim|athletic)\b",
+    r"\b(raincoat|jacket|coat|uniform|dress|shirt|hoodie|skirt|armor|suit|clothes|clothing|"
+    r"robe|vest|sweater|blouse|trousers|pants|scarf|harness|boots|shoes|overalls|apron|"
+    r"coveralls|smock|workwear|build|frame|physique|slim|athletic)\b",
     re.I,
 )
 _CLOTHING_COLOR_RE = re.compile(
-    r"\b(navy|black|white|ivory|charcoal|orange|grey|gray|brown|red|blue|green|pink|purple|gold|silver|tan|beige|khaki|dark|light)\s+"
-    r"(?:(?:rescue|safety|utility|hooded|wool|zip-up|zipped|denim|leather|canvas|straight-leg|cropped|oversized|padded|plain|quilted)\s+)*"
-    r"(raincoat|jacket|coat|hoodie|shirt|dress|uniform|armor|suit|robe|pants|trousers|sweater|blouse|vest|scarf|harness|boots|shoes)\b",
+    r"\b("
+    r"navy(?:\s+blue)?|dark\s+blue|light\s+blue|black|white|ivory|charcoal|orange|grey|gray|"
+    r"brown|red|blue|green|pink|purple|gold|silver|tan|beige|khaki|dark|light"
+    r")\s+"
+    r"(?:(?:rescue|safety|utility|worker|janitor|cleaning|maintenance|hooded|wool|zip-up|zipped|"
+    r"denim|leather|canvas|straight-leg|cropped|oversized|padded|plain|quilted|work)\s+)*"
+    r"(?:(?:worker|janitor|cleaning|maintenance|school|rescue|safety|utility)\s+)*"
+    r"(raincoat|jacket|coat|hoodie|shirt|dress|uniform|armor|suit|robe|pants|trousers|"
+    r"sweater|blouse|vest|scarf|harness|boots|shoes|overalls|apron|coveralls|smock|workwear)\b",
     re.I,
 )
 _JACKET_RE = re.compile(r"\b(jacket)\b", re.I)
 _SHIRT_RE = re.compile(r"\b(shirt|blouse|sweater)\b", re.I)
-_SELF_LAYER_RE = re.compile(r"\b(hoodie|coat|dress|uniform|armor|suit|robe)\b", re.I)
+_SELF_LAYER_RE = re.compile(r"\b(hoodie|coat|dress|uniform|armor|suit|robe|overalls|apron|coveralls|smock)\b", re.I)
 _AGE_RE = re.compile(
-    r"\b(\d{1,2}\s*y/o|teen|young adult|adult|elderly|child|adolescent|middle.?aged|mid-?\d{2}s)\b",
+    r"\b(\d{1,2}\s*y/o|\d{1,2}\s*years?\s*old|teen|young adult|adult|elderly|child|adolescent|"
+    r"middle.?aged|mid-?\d{2}s|senior)\b",
+    re.I,
+)
+_AGE_NUMBER_RE = re.compile(r"\b(\d{1,2})\s*(?:y/o|years?\s*old)\b", re.I)
+_EXCLUSION_RE = re.compile(
+    r"\b(?:no|without|not)\s+([a-z0-9][\w\s\-/]{0,40}?)(?=,|$|\.)",
     re.I,
 )
 _ID_ONLY_RE = re.compile(r"^[a-z0-9_]+$", re.I)
@@ -211,6 +225,38 @@ def _gender_tag_from_fields(identity: str, gender: str | None = None) -> str:
     return ""
 
 
+def parse_identity_age(identity: str | None, default: int | None = None) -> int | None:
+    """Extract numeric age from identity text. Prefer explicit N y/o over band defaults."""
+    text = str(identity or "")
+    hit = _AGE_NUMBER_RE.search(text)
+    if hit:
+        return int(hit.group(1))
+    low = text.lower()
+    if "elderly" in low or "senior" in low:
+        return 70
+    if "child" in low:
+        return 10
+    if "teen" in low or "adolescent" in low:
+        return 16
+    if "young adult" in low:
+        return 22
+    if "middle" in low and "aged" in low:
+        return 45
+    if "adult" in low:
+        return 30
+    return default
+
+
+def identity_exclusions(identity: str | None) -> list[str]:
+    """Preserve negative wardrobe constraints such as 'no military uniform/epaulettes'."""
+    out: list[str] = []
+    for match in _EXCLUSION_RE.finditer(str(identity or "")):
+        phrase = match.group(0).strip().rstrip(".,;")
+        if phrase and phrase.lower() not in {x.lower() for x in out}:
+            out.append(phrase)
+    return out
+
+
 def validate_character_identity(
     identity: str | None,
     *,
@@ -243,10 +289,19 @@ def validate_character_identity(
         missing.append("eyes")
     if not _CLOTHING_RE.search(raw):
         missing.append("fixed clothing/body")
-    if not _CLOTHING_COLOR_RE.search(raw):
+    has_named_uniform = bool(
+        re.search(
+            r"\b(school|worker|janitor|cleaning|maintenance|utility|rescue|safety)\s+uniform\b",
+            raw,
+            re.I,
+        )
+    )
+    if not _CLOTHING_COLOR_RE.search(raw) and not has_named_uniform:
         missing.append("clothing color")
     if _JACKET_RE.search(raw) and not _SHIRT_RE.search(raw) and not _SELF_LAYER_RE.search(raw):
-        missing.append("jacket/shirt layer")
+        # Occupational "worker uniform jacket" is a self-layer; don't demand a shirt under it.
+        if not re.search(r"\b(worker|janitor|cleaning|maintenance|utility)\s+uniform\b", raw, re.I):
+            missing.append("jacket/shirt layer")
     if missing:
         raise CharacterIdentityError(
             f"{label}: character identity missing {', '.join(missing)}: {raw[:160]}"
@@ -257,11 +312,12 @@ def validate_character_identity(
     if gender_tag == "1boy" and "male focus" not in lowered_out:
         raw = re.sub(r"\b1boy\b", "1boy, male focus", raw, count=1, flags=re.I)
     if re.search(r"\bnavy\b", raw, re.I) and re.search(r"\bjacket\b", raw, re.I):
-        if "navy jacket" not in raw.lower():
+        if "navy jacket" not in raw.lower() and "navy blue" not in raw.lower():
             raw = f"{raw}, navy jacket, dark blue jacket"
     if re.search(r"\bblack\b", raw, re.I) and re.search(r"\b(trousers|pants)\b", raw, re.I):
         if "black pants" not in raw.lower():
             raw = f"{raw}, black pants, black trousers"
+    # Keep exclusion clauses intact (military uniform bans, etc.).
     return raw[:IDENTITY_PROMPT_MAX_CHARS]
 
 
@@ -1922,7 +1978,16 @@ def _board_payloads(story_root: Path | None) -> list[dict]:
         out.extend(data.get("shots") or [])
         for extra in data.get("cast") or []:
             if isinstance(extra, dict) and extra.get("id"):
-                out.append({"character_id": extra.get("id"), "name": extra.get("name"), "identity_prompt": extra.get("identity_prompt")})
+                out.append(
+                    {
+                        "character_id": extra.get("id"),
+                        "name": extra.get("name"),
+                        "identity_prompt": extra.get("identity_prompt"),
+                        "age": extra.get("age"),
+                        "gender": extra.get("gender"),
+                        "exclusions": extra.get("exclusions"),
+                    }
+                )
         for extra in data.get("locations") or []:
             if isinstance(extra, dict) and extra.get("id"):
                 out.append(
@@ -1984,12 +2049,19 @@ def character_ids_needed(story_root: Path | None) -> set[str]:
 
 
 def seed_cast_from_story_root(conn: sqlite3.Connection, story_root: Path | None) -> dict[str, int]:
-    """Hosted board/wiki often never land in sqlite. Design must still draw sheets."""
+    """Hosted board/wiki often never land in sqlite. Design must still draw sheets.
+
+    script.json.cast / approved bible is authoritative until the first QC lock.
+    Existing sqlite rows are updated when the source identity/age hash changes;
+    locked assets are marked stale via asset_lock instead of silent skip.
+    """
     if story_root is None:
         return {"characters": 0, "locations": 0}
     root = Path(story_root)
     names: dict[str, str] = {}
     identities: dict[str, str] = {}
+    ages: dict[str, int] = {}
+    exclusions_map: dict[str, list[str]] = {}
     loc_names: dict[str, str] = {}
     loc_plates: dict[str, str] = {}
     loc_meta: dict[str, dict[str, str]] = {}
@@ -2031,15 +2103,31 @@ def seed_cast_from_story_root(conn: sqlite3.Connection, story_root: Path | None)
             # identity_prompt / first_frame_prompt only: h3_prompt is Chinese camera
             # direction and would become the sheet's visual lock.
             visual = str(row.get("identity_prompt") or row.get("first_frame_prompt") or "").strip()
-            if visual and cid not in identities:
+            if visual:
                 try:
                     identities[cid] = validate_character_identity(
                         visual[:IDENTITY_PROMPT_MAX_CHARS],
                         character_id=cid,
                         name=names[cid],
+                        gender=str(row.get("gender") or "") or None,
                     )
                 except CharacterIdentityError:
-                    pass
+                    if cid not in identities:
+                        pass
+            declared_age = row.get("age")
+            try:
+                if declared_age is not None and str(declared_age).strip() != "":
+                    ages[cid] = int(declared_age)
+            except (TypeError, ValueError):
+                pass
+            parsed = parse_identity_age(identities.get(cid) or visual)
+            if parsed is not None:
+                ages.setdefault(cid, parsed)
+            excl = row.get("exclusions")
+            if isinstance(excl, list):
+                exclusions_map[cid] = [str(x).strip() for x in excl if str(x).strip()]
+            else:
+                exclusions_map.setdefault(cid, identity_exclusions(identities.get(cid) or visual))
         lid = str(row.get("location_id") or "").strip()
         if lid:
             display = str(row.get("display_name") or "").strip()
@@ -2069,10 +2157,15 @@ def seed_cast_from_story_root(conn: sqlite3.Connection, story_root: Path | None)
         if plate:
             loc_plates[lid] = plate
     inserted_chars = 0
+    updated_chars = 0
+    try:
+        from anime_factory.asset_lock import is_qc_locked, sync_character_source_hash
+        from anime_factory.h3_storyboard import character_source_hash
+    except ImportError:
+        is_qc_locked = None  # type: ignore[assignment]
+        sync_character_source_hash = None  # type: ignore[assignment]
+        character_source_hash = None  # type: ignore[assignment]
     for cid, name in names.items():
-        existing = conn.execute("SELECT id FROM characters WHERE id = ?", (cid,)).fetchone()
-        if existing:
-            continue
         raw_identity = identities.get(cid) or ""
         if not raw_identity:
             continue
@@ -2080,19 +2173,87 @@ def seed_cast_from_story_root(conn: sqlite3.Connection, story_root: Path | None)
             prompt = validate_character_identity(raw_identity, character_id=cid, name=name)
         except CharacterIdentityError:
             continue
+        age = ages.get(cid)
+        if age is None:
+            age = parse_identity_age(prompt, default=None)
+        if age is None:
+            age = 30  # band default only when no numeric/band cue exists
+        existing = conn.execute(
+            "SELECT id, identity_prompt, age, name FROM characters WHERE id = ?",
+            (cid,),
+        ).fetchone()
+        if existing:
+            old_prompt = str(existing["identity_prompt"] or "")
+            old_age = int(existing["age"] or 0)
+            if old_prompt == prompt and old_age == int(age) and str(existing["name"] or "") == name:
+                if sync_character_source_hash is not None and character_source_hash is not None:
+                    sync_character_source_hash(
+                        root,
+                        character_id=cid,
+                        source_hash=character_source_hash(
+                            identity_prompt=prompt,
+                            age=age,
+                            name=name,
+                            exclusions=exclusions_map.get(cid) or identity_exclusions(prompt),
+                        ),
+                        fail_closed_if_locked=False,
+                    )
+                continue
+            locked = bool(is_qc_locked(root, character_id=cid)) if is_qc_locked else False
+            if locked and sync_character_source_hash is not None and character_source_hash is not None:
+                sync_character_source_hash(
+                    root,
+                    character_id=cid,
+                    source_hash=character_source_hash(
+                        identity_prompt=prompt,
+                        age=age,
+                        name=name,
+                        exclusions=exclusions_map.get(cid) or identity_exclusions(prompt),
+                    ),
+                    fail_closed_if_locked=True,
+                )
+                continue
+            conn.execute(
+                "UPDATE characters SET name = ?, identity_prompt = ?, age = ? WHERE id = ?",
+                (name, prompt, int(age), cid),
+            )
+            updated_chars += 1
+            if sync_character_source_hash is not None and character_source_hash is not None:
+                sync_character_source_hash(
+                    root,
+                    character_id=cid,
+                    source_hash=character_source_hash(
+                        identity_prompt=prompt,
+                        age=age,
+                        name=name,
+                        exclusions=exclusions_map.get(cid) or identity_exclusions(prompt),
+                    ),
+                    fail_closed_if_locked=False,
+                )
+            continue
         conn.execute(
             """
             INSERT INTO characters (id, name, identity_prompt, age, alive, seed)
-            VALUES (?, ?, ?, 24, 1, ?)
+            VALUES (?, ?, ?, ?, 1, ?)
             """,
-            (cid, name, prompt, locked_seed(cid)),
+            (cid, name, prompt, int(age), locked_seed(cid)),
         )
         inserted_chars += 1
+        if sync_character_source_hash is not None and character_source_hash is not None:
+            sync_character_source_hash(
+                root,
+                character_id=cid,
+                source_hash=character_source_hash(
+                    identity_prompt=prompt,
+                    age=age,
+                    name=name,
+                    exclusions=exclusions_map.get(cid) or identity_exclusions(prompt),
+                ),
+                fail_closed_if_locked=False,
+            )
     inserted_locs = 0
     for lid, name in loc_names.items():
-        existing = conn.execute("SELECT id FROM locations WHERE id = ?", (lid,)).fetchone()
-        if existing:
-            continue
+        existing = conn.execute("SELECT id, plate_prompt FROM locations WHERE id = ?", (lid,)).fetchone()
         meta = loc_meta.get(lid) or {}
         display = str(meta.get("display_name") or "").strip()
         english = str(meta.get("english_name") or name or lid).strip()
@@ -2101,6 +2262,13 @@ def seed_cast_from_story_root(conn: sqlite3.Connection, story_root: Path | None)
         if display and english and display != english:
             aka = json.dumps({"display_name": display, "english_name": english}, ensure_ascii=False)
         plate = str(loc_plates.get(lid) or "").strip() or None
+        if existing:
+            if plate and str(existing["plate_prompt"] or "") != plate:
+                conn.execute(
+                    "UPDATE locations SET name = ?, aka_json = ?, plate_prompt = ? WHERE id = ?",
+                    (stored_name, aka, plate, lid),
+                )
+            continue
         conn.execute(
             """
             INSERT INTO locations (id, name, aka_json, type, plate_prompt)
@@ -2109,9 +2277,9 @@ def seed_cast_from_story_root(conn: sqlite3.Connection, story_root: Path | None)
             (lid, stored_name, aka, plate),
         )
         inserted_locs += 1
-    if inserted_chars or inserted_locs:
+    if inserted_chars or updated_chars or inserted_locs:
         conn.commit()
-    return {"characters": inserted_chars, "locations": inserted_locs}
+    return {"characters": inserted_chars + updated_chars, "locations": inserted_locs}
 
 
 def library_from_db(

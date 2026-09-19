@@ -1007,14 +1007,11 @@ def _wait_gpu_memory_below(limit_mb: int, timeout_s: float) -> int | None:
         last = _gpu_memory_used_mb()
 
 
-def stop_comfy_for_longlive() -> dict:
-    """Vacate Comfy/router so LongLive can own the 32GB card.
+def vacate_comfy_gpu(*, claim_longlive: bool = False) -> dict:
+    """Kill Comfy/router and wait for VRAM headroom.
 
-    Stills (Animagine via Comfy) run first; video is the last heavy visual GPU
-    step. Unloading Flux VRAM is not enough: leftover Comfy plus UMT5 used to
-    SIGKILL a 32GB cgroup, and a fire-and-forget pkill left the NVFP4 sampler
-    competing for the same 32GB. MOSS SFX still needs GPU after LongLive
-    ``release_model``.
+    Shared by LongLive anim (which then claims the card) and compose-time MOSS
+    SFX (which must NOT claim `longlive_owns_gpu`, or H3 cannot restore Comfy).
     """
     killed: list[str] = []
     for sig in ("-TERM", "-KILL"):
@@ -1032,14 +1029,85 @@ def stop_comfy_for_longlive() -> dict:
         cuda = getattr(torch, "cuda", None)
         if cuda is not None and callable(getattr(cuda, "is_available", None)) and cuda.is_available():
             cuda.empty_cache()
-    except Exception:  # noqa: BLE001 — LongLive can still try on a CPU test box
+    except Exception:  # noqa: BLE001 — LongLive/MOSS can still try on a CPU test box
         pass
-    claim_gpu_for_longlive()
+    if claim_longlive:
+        claim_gpu_for_longlive()
+    return {"ok": True, "killed": killed, "vram_used_mb": used, "claimed_longlive": bool(claim_longlive)}
+
+
+def stop_comfy_for_longlive() -> dict:
+    """Vacate Comfy/router so LongLive can own the 32GB card.
+
+    Stills (Animagine via Comfy) run first; video is the last heavy visual GPU
+    step. Unloading Flux VRAM is not enough: leftover Comfy plus UMT5 used to
+    SIGKILL a 32GB cgroup, and a fire-and-forget pkill left the NVFP4 sampler
+    competing for the same 32GB. MOSS SFX still needs GPU after LongLive
+    ``release_model`` — use ``vacate_comfy_gpu(claim_longlive=False)`` there so
+    H3 compose does not leave ``longlive_owns_gpu`` stuck true.
+    """
+    out = vacate_comfy_gpu(claim_longlive=True)
     print(
-        json.dumps({"comfy": "stopped_for_longlive", "killed": killed, "vram_used_mb": used}),
+        json.dumps(
+            {
+                "comfy": "stopped_for_longlive",
+                "killed": out.get("killed"),
+                "vram_used_mb": out.get("vram_used_mb"),
+            }
+        ),
         flush=True,
     )
-    return {"ok": True, "killed": killed, "vram_used_mb": used}
+    return out
+
+
+def release_gpu_for_moss_sfx(*, backend: str = "h3") -> dict:
+    """Backend-aware handoff before MOSS-SoundEffect on the shared compose path.
+
+    - LongLive: clear the ownership flag (resident runner already released after
+      the batch) and vacate any leftover Comfy without re-claiming the card.
+    - H3: stop/release Comfy only — never set ``longlive_owns_gpu``.
+    """
+    backend_name = str(backend or "h3").strip().lower() or "h3"
+    if backend_name == "longlive":
+        release_gpu_from_longlive()
+    out = vacate_comfy_gpu(claim_longlive=False)
+    print(
+        json.dumps(
+            {
+                "comfy": "vacated_for_moss_sfx",
+                "backend": backend_name,
+                "killed": out.get("killed"),
+                "vram_used_mb": out.get("vram_used_mb"),
+                "longlive_owns_gpu": longlive_owns_gpu(),
+            }
+        ),
+        flush=True,
+    )
+    return {**out, "backend": backend_name}
+
+
+def restore_gpu_after_moss_sfx(*, backend: str = "h3") -> dict:
+    """Allow the visual stack to return after MOSS (H3 restarts Comfy; LongLive stays clear)."""
+    backend_name = str(backend or "h3").strip().lower() or "h3"
+    if backend_name == "longlive":
+        release_gpu_from_longlive()
+        print(json.dumps({"comfy": "moss_sfx_done", "backend": "longlive", "restored": False}), flush=True)
+        return {"ok": True, "backend": "longlive", "restored": False}
+    # H3: ownership must stay false so start_comfy is allowed.
+    release_gpu_from_longlive()
+    restarted = False
+    try:
+        if not _port_open("127.0.0.1", 8188):
+            proc = start_comfy()
+            restarted = proc is not None or _port_open("127.0.0.1", 8188)
+    except Exception as exc:  # noqa: BLE001 — compose artifacts already written
+        print(json.dumps({"comfy": "restore_after_moss_failed", "error": type(exc).__name__}), flush=True)
+        return {"ok": False, "backend": "h3", "restored": False, "error": type(exc).__name__}
+    print(
+        json.dumps({"comfy": "moss_sfx_done", "backend": "h3", "restored": restarted}),
+        flush=True,
+    )
+    return {"ok": True, "backend": "h3", "restored": restarted}
 
 
 def start_router() -> subprocess.Popen | None:
