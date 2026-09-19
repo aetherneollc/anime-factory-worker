@@ -390,6 +390,38 @@ def test_recycle_forbidden_host_rates_and_destroys(monkeypatch):
     assert out["teardown"]["destroyed"] is True
 
 
+def test_recycle_faulty_host_rates_preflight_and_skips_job_logic(monkeypatch):
+    rated = []
+    destroyed = []
+
+    class FakeClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def report_machine(self, machine_id, problem, message, rating=1):
+            rated.append((machine_id, problem, rating, message))
+            return {"ok": True}
+
+    monkeypatch.setenv("VAST_MACHINE_ID", "991")
+    monkeypatch.setattr(session, "VastClient", FakeClient)
+    monkeypatch.setattr(
+        session,
+        "destroy_self",
+        lambda instance_id, reason, error=None: destroyed.append((instance_id, reason, error))
+        or {"ok": True, "destroyed": True},
+    )
+    preflight = session.recycle_faulty_host("50508410", "preflight_failed:disk_low")
+    assert rated[0][0] == "991"
+    assert rated[0][1] == "hardware"
+    assert rated[0][2] == 1
+    assert preflight["teardown"]["destroyed"] is True
+    idle = session.teardown_for_reason("50508410", "idle_ttl")
+    assert idle.get("rated") is None
+    assert ("50508410", "idle_ttl", None) in destroyed
+    qc = session.teardown_for_reason("50508410", "success")
+    assert qc.get("rated") is None
+
+
 def test_main_fail_fast_on_control_plane_403_without_comfy(monkeypatch):
     destroyed = []
     booted = []

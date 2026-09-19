@@ -85,7 +85,12 @@ from gpu_worker.longlive import (
     submit_longlive,
 )
 from gpu_worker.longlive_batch import submit_longlive_batch
-from gpu_worker.preflight import RECYCLE_FAILURE_CLASSES, recycle_failure_class
+from gpu_worker.preflight import (
+    RECYCLE_FAILURE_CLASSES,
+    host_fault_problem,
+    is_host_fault,
+    recycle_failure_class,
+)
 from gpu_worker.stack import (
     release_gpu_for_moss_sfx,
     restore_gpu_after_moss_sfx,
@@ -962,23 +967,47 @@ def destroy_self(instance_id: str, reason: str, error: str | None = None) -> dic
     }
 
 
-def recycle_forbidden_host(instance_id: str, error: str) -> dict[str, Any]:
-    """HTTP 403 from secrets/control plane: rate the Vast host poorly, then destroy this box."""
+def recycle_faulty_host(
+    instance_id: str,
+    error: str,
+    problem: str | None = None,
+) -> dict[str, Any]:
+    """Any host-level fault: best-effort Vast rating 1, then immediate destroy."""
     mid = (os.environ.get("VAST_MACHINE_ID") or os.environ.get("MACHINE_ID") or "").strip()
     rated: dict[str, Any] = {"skipped": True, "reason": "machine_id missing"}
+    label = problem or host_fault_problem(error)
     if mid:
         api_key = os.environ.get("CONTAINER_API_KEY") or os.environ.get("VAST_API_KEY") or ""
         try:
             rated = VastClient(api_key=api_key).report_machine(
                 mid,
-                "network",
-                error or "control_plane_403:HTTP 403",
+                label,
+                error or "host_fault",
                 rating=1,
             )
         except Exception as exc:  # noqa: BLE001 — never skip destroy
             rated = {"ok": False, "error": f"{type(exc).__name__}:{exc}"}
     teardown = destroy_self(instance_id, "explicit_abort", error=error)
     return {"rated": rated, "teardown": teardown}
+
+
+def recycle_forbidden_host(instance_id: str, error: str) -> dict[str, Any]:
+    """Control-plane / secrets 403: rate as network, then destroy."""
+    return recycle_faulty_host(instance_id, error, problem="network")
+
+
+def teardown_for_reason(
+    instance_id: str,
+    reason: str,
+    error: str | None = None,
+) -> dict[str, Any]:
+    """Rate+destroy host faults; destroy-without-rating for success/idle/cancel."""
+    if is_host_fault(reason, error):
+        recycled = recycle_faulty_host(instance_id, error or reason)
+        teardown = dict(recycled.get("teardown") or {})
+        teardown["rated"] = recycled.get("rated")
+        return teardown
+    return destroy_self(instance_id, reason, error=error)
 
 
 def persist_boot_failure(payload: dict[str, Any], story_id: str | None = None) -> dict[str, Any]:
@@ -3834,8 +3863,11 @@ def run_gpu_batch(
     recycle_stop = stop_limit in RECYCLE_FAILURE_CLASSES
     if report_errors:
         destroy_reason = None
-    elif longlive_closed or recycle_stop:
-        # Stop GPU 0% pip-retry / SIGKILL loops. Scheduler cooldown must not re-lease.
+    elif recycle_stop:
+        destroy_reason = "explicit_abort"
+        destroy_error = stop_limit
+    elif longlive_closed:
+        # Code bug, not a bad host — destroy without Vast rating.
         destroy_reason = "explicit_abort"
         destroy_error = None
     elif budget_stop:

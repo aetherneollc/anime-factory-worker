@@ -17,6 +17,9 @@ from gpu_worker.preflight import (
     MIN_DISK_GB,
     PreflightFailure,
     handshake_payload,
+    host_fault_problem,
+    is_host_fault,
+    is_job_logic_destroy,
     probe_comfy_nodes,
     probe_nvfp4_runtime,
     production_stack_locked,
@@ -278,6 +281,40 @@ def test_recycle_failure_class_maps_stable_codes():
     assert recycle_failure_class("install_failure: font_setup_failed") is None
     assert recycle_failure_class("control_plane_403:HTTP 403") == "control_plane_403"
     assert recycle_failure_class("host_secrets_403:unexpected HTTP 403") == "host_secrets_403"
+
+
+def test_is_host_fault_excludes_job_logic_and_code_bugs():
+    for reason in (
+        "pull_stuck:tls",
+        "control_plane_403:HTTP 403",
+        "preflight_failed:disk_low",
+        "capability_mismatch:cuda",
+        "comfy_startup_failed:exit_1",
+        "weight_pull_timeout",
+        "heartbeat_expired_boot_grace",
+        "tunnel_down_heartbeat_expired",
+    ):
+        assert is_host_fault(reason) is True
+    assert host_fault_problem("control_plane_403:HTTP 403") == "network"
+    assert host_fault_problem("preflight_failed:disk_low") == "hardware"
+    assert host_fault_problem("comfy_startup_failed:exit_1") == "software"
+    for reason in (
+        "success",
+        "idle_ttl",
+        "orphan_no_live_batch",
+        "story_abort",
+        "ui_destroy_all",
+        "user_cancel",
+        "qc_fail:board",
+        "longlive_fail_closed:fouroversix",
+        "h3_fail_closed:oom_downshift_exhausted",
+    ):
+        assert is_host_fault(reason) is False
+    assert is_host_fault("explicit_abort", "preflight_failed:disk_low") is True
+    assert is_host_fault("explicit_abort", "progress_stalled") is False
+    assert is_host_fault("idle_ttl", "preflight_failed:leftover") is False
+    assert is_job_logic_destroy("orphan_no_live_batch") is True
+    assert is_job_logic_destroy("preflight_failed:x") is False
 
 
 def test_probe_nvfp4_runtime_missing_and_present(monkeypatch):

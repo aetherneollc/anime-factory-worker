@@ -59,6 +59,39 @@ RECYCLE_FAILURE_CLASSES = frozenset(
     }
 )
 
+# Extra host-fault markers seen on Studio reclaim (pull/HB/SSH), not only boot classes.
+HOST_FAULT_MARKERS = frozenset(
+    {
+        *RECYCLE_FAILURE_CLASSES,
+        "pull_stuck",
+        "secrets_403",
+        "heartbeat_expired",
+        "tunnel_down",
+        "boot_fail",
+        "image_machine_repeat",
+        "disk_low",
+        "mem_low",
+        "ssh_dead",
+        "running_but_no_ssh",
+        "python_boot",
+    }
+)
+
+# Destroy-without-rating: success, idle leftover, operator cancel, content QC.
+JOB_LOGIC_DESTROY_MARKERS = frozenset(
+    {
+        "success",
+        "idle_ttl",
+        "orphan_no_live_batch",
+        "story_abort",
+        "ui_destroy",
+        "ui_destroy_all",
+        "user_cancel",
+        "qc_fail",
+        "content_qc",
+    }
+)
+
 # Deterministic wheel/driver ABI failures that must recycle, not wait or pip-upgrade.
 ABI_RECYCLE_MARKERS = (
     "undefined_symbol",
@@ -148,6 +181,65 @@ def recycle_failure_class(error: BaseException | str | None) -> str | None:
     if any(marker in text for marker in ABI_RECYCLE_MARKERS):
         return "capability_mismatch"
     return None
+
+
+def is_job_logic_destroy(reason: str | None = None, error: str | None = None) -> bool:
+    text = f"{reason or ''} {error or ''}".lower()
+    if not text.strip():
+        return False
+    return any(marker in text for marker in JOB_LOGIC_DESTROY_MARKERS)
+
+
+def is_code_bug_fail_closed(reason: str | None = None, error: str | None = None) -> bool:
+    text = f"{reason or ''} {error or ''}".lower().replace("×", "x")
+    return any(
+        marker in text
+        for marker in (
+            "longlive_fail_closed",
+            "h3_fail_closed",
+            "fouroversix",
+            "oom_downshift_exhausted",
+        )
+    )
+
+
+def is_host_fault(reason: str | None = None, error: str | None = None) -> bool:
+    """True only for a broken Vast host/stack — not QC, idle-after-done, or user cancel."""
+    reason_text = str(reason or "").lower()
+    if reason_text and any(marker in reason_text for marker in JOB_LOGIC_DESTROY_MARKERS):
+        return False
+    if is_code_bug_fail_closed(reason, error):
+        return False
+    blob = f"{reason or ''} {error or ''}".lower()
+    if not blob.strip():
+        return False
+    if recycle_failure_class(blob):
+        return True
+    return any(marker in blob for marker in HOST_FAULT_MARKERS)
+
+
+def host_fault_problem(reason: str | None = None, error: str | None = None) -> str:
+    text = f"{reason or ''} {error or ''}".lower()
+    if any(
+        marker in text
+        for marker in (
+            "403",
+            "tls",
+            "pull_stuck",
+            "secrets",
+            "network",
+            "weight_pull",
+            "ghcr",
+            "hf.co",
+        )
+    ):
+        return "network"
+    if any(
+        marker in text
+        for marker in ("disk", "mem_low", "cuda", "preflight", "capability", "ssh")
+    ):
+        return "hardware"
+    return "software"
 
 
 def boot_log_tail(max_chars: int = 4096) -> str:
@@ -817,6 +909,8 @@ __all__ = [
     "MIN_DISK_GB",
     "PREFLIGHT_TIMEOUT_S",
     "RECYCLE_FAILURE_CLASSES",
+    "HOST_FAULT_MARKERS",
+    "JOB_LOGIC_DESTROY_MARKERS",
     "REQUIRED_COMFY_NODES",
     "WEIGHT_PULL_TIMEOUT_S",
     "PreflightFailure",
@@ -830,6 +924,9 @@ __all__ = [
     "probe_comfy_nodes",
     "production_stack_locked",
     "recycle_failure_class",
+    "is_host_fault",
+    "is_job_logic_destroy",
+    "host_fault_problem",
     "run_hardware_preflight",
     "select_profile_id",
     "validate_container_contract",

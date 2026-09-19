@@ -216,9 +216,9 @@ def main() -> int:
         StartupTimeout,
         WeightPullTimeout,
         best_effort_upload_checkpoint,
-        destroy_self,
         persist_boot_failure,
         recycle_forbidden_host,
+        teardown_for_reason,
         gpu_cycle_idle_reason,
         hourly_rate_from_work,
         lease_age_seconds_from_work,
@@ -324,7 +324,7 @@ def main() -> int:
             )
         except Exception:  # noqa: BLE001 — never skip destroy
             pass
-        teardown = destroy_self(
+        teardown = teardown_for_reason(
             instance_id,
             "explicit_abort",
             error=runtime.last_error,
@@ -383,7 +383,7 @@ def main() -> int:
                 )
             except Exception as upload_exc:  # noqa: BLE001 — never skip destroy
                 boot_upload = {"ok": False, "error": f"{type(upload_exc).__name__}:{upload_exc}"}
-            teardown = destroy_self(instance_id, "explicit_abort", error=str(exc))
+            teardown = teardown_for_reason(instance_id, "explicit_abort", error=str(exc))
             print(
                 json.dumps(
                     {
@@ -474,7 +474,7 @@ def main() -> int:
                         "ok": False,
                         "error": f"{type(upload_exc).__name__}:{upload_exc}",
                     }
-                teardown = destroy_self(
+                teardown = teardown_for_reason(
                     instance_id,
                     "explicit_abort",
                     error=runtime.last_error,
@@ -662,7 +662,7 @@ def main() -> int:
                         heartbeat_fields=runtime.heartbeat_fields(tunnel),
                         register=False,
                     )
-                    teardown = destroy_self(
+                    teardown = teardown_for_reason(
                         instance_id,
                         str(pending_destroy["reason"]),
                         error=pending_destroy.get("error"),
