@@ -1162,6 +1162,36 @@ def _board_shots(root: Path) -> list[dict]:
     return []
 
 
+def _scene_plate_file(root: Path, shot: dict) -> Path | None:
+    lid = str(shot.get("location_id") or shot.get("scene_id") or "").strip()
+    if not lid:
+        return None
+    for name in ("plate_base.png", "plate.png"):
+        path = root / "assets" / "scenes" / lid / name
+        if path.is_file():
+            return path
+    return None
+
+
+def _reuse_scene_plate_as_fl2va_keyframe(root: Path, shot: dict) -> bool:
+    """Establishing fl2va heads should use the locked loc plate, not a new Flux still."""
+    from anime_factory.design import still_file_ok
+    from anime_factory.keyframe import keyframe_file_ok
+
+    sid = str(shot.get("id") or "").strip()
+    if not sid:
+        return False
+    kf = root / "episodes" / EP / "keyframes" / sid / "f1.png"
+    if keyframe_file_ok(kf):
+        return True
+    plate = _scene_plate_file(root, shot)
+    if plate is None or not still_file_ok(plate):
+        return False
+    kf.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(plate, kf)
+    return keyframe_file_ok(kf)
+
+
 def generate_missing_stills(
     story_id: str,
     root: Path,
@@ -1248,7 +1278,7 @@ def generate_missing_stills(
 
             kf = root / "episodes" / EP / "keyframes" / shot["id"] / "f1.png"
             # A 3-byte f1.png used to satisfy `>= 1` and skip the redraw.
-            if keyframe_file_ok(kf):
+            if keyframe_file_ok(kf) or _reuse_scene_plate_as_fl2va_keyframe(root, shot):
                 continue
         try:
             ensure_keyframe(conn, story_id, EP, shot, geo, assets_index, lib.get("specs") or {}, client, None, "fiction", root)

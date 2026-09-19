@@ -1680,6 +1680,18 @@ def test_run_gpu_episode_compose_error_keeps_remaining_and_does_not_finish(tmp_p
     assert not any(stage == "compose" and status == "succeeded" for stage, status, _err in jobs)
 
 
+def test_reuse_scene_plate_as_fl2va_keyframe(tmp_path, monkeypatch):
+    monkeypatch.setattr(session, "EP", "EP001")
+    plate = tmp_path / "assets" / "scenes" / "loc_dorm" / "plate_base.png"
+    plate.parent.mkdir(parents=True)
+    plate.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 12_000)
+    shot = {"id": "s001", "location_id": "loc_dorm", "h3_mode": "fl2va_first"}
+    assert session._reuse_scene_plate_as_fl2va_keyframe(tmp_path, shot) is True
+    kf = tmp_path / "episodes" / "EP001" / "keyframes" / "s001" / "f1.png"
+    assert kf.is_file()
+    assert kf.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+
+
 def test_heartbeat_reports_tunnel_down_only_after_startup():
     runtime = session.LeaseRuntime(instance_id="123")
     runtime.begin_startup()
