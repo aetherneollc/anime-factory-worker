@@ -64,8 +64,9 @@ INSTANCE_RESOLVE_MAX_ATTEMPTS = 5
 INSTANCE_RESOLVE_RETRY_S = 2.0
 DELETE_CONFIRM_MAX_ATTEMPTS = 5
 V1_GONE_STREAK = 3
-# Live canary: one lease per invocation — no auto re-lease after instance_gone.
-CANARY_GONE_RETRIES = 0
+# After instance_gone / OCI create failure, try a different machine. Cap is
+# still $1; spent USD accumulates across retries.
+CANARY_GONE_RETRIES = 2
 # Match packages/cf-control seasons.ts PULL_STUCK_MS — Vast `loading` is docker pull.
 CANARY_PULL_STATES = frozenset({"loading", "creating", "created", "pending"})
 CANARY_PULL_STALL_S = 12 * 60
@@ -74,10 +75,18 @@ CANARY_PULL_MAX_S = 30 * 60
 CANARY_PULL_ERROR_RE = re.compile(
     r"tls handshake|net/http:\s*tls|\beof\b|i/o timeout|context deadline|"
     r"error pulling|failed to pull|image pull|connection reset|"
-    r"connection refused|no such host|denied|not found|unavailable",
+    r"connection refused|no such host|denied|not found|unavailable|"
+    r"oci runtime|runtime create failed|failed to create shim|"
+    r"failed to create task|nvidia-container",
+    re.I,
+)
+CANARY_OCI_ERROR_RE = re.compile(
+    r"oci runtime|runtime create failed|failed to create shim|"
+    r"failed to create task|nvidia-container",
     re.I,
 )
 CANARY_RETRY_POLL_REASONS = frozenset({"instance_gone"})
+CANARY_EXCLUDE_TTL_S = 24 * 3600
 
 ISOLATED_ENV_FORBIDDEN_KEYS = frozenset(
     {
@@ -564,6 +573,63 @@ def offer_machine_id(offer: dict | None) -> str:
     return str(offer.get("machine_id") or offer.get("machineId") or "").strip()
 
 
+def canary_exclude_path() -> Path:
+    raw = (os.environ.get("GPU_CANARY_EXCLUDE_MACHINES") or "").strip()
+    if raw:
+        return Path(raw)
+    return Path.home() / ".cache" / "anime-factory" / "canary-exclude-machines.json"
+
+
+def load_excluded_machines(*, now: float | None = None) -> set[str]:
+    stamp = time.time() if now is None else now
+    path = canary_exclude_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return set()
+    if not isinstance(data, dict):
+        return set()
+    kept: set[str] = set()
+    for mid, ts in data.items():
+        try:
+            stamped = float(ts)
+        except (TypeError, ValueError):
+            continue
+        key = str(mid).strip()
+        if key and stamp - stamped < CANARY_EXCLUDE_TTL_S:
+            kept.add(key)
+    return kept
+
+
+def persist_excluded_machines(ids: set[str], *, now: float | None = None) -> None:
+    stamp = time.time() if now is None else now
+    path = canary_exclude_path()
+    existing: dict[str, float] = {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            for mid, ts in raw.items():
+                try:
+                    existing[str(mid).strip()] = float(ts)
+                except (TypeError, ValueError):
+                    continue
+    except (OSError, json.JSONDecodeError, TypeError):
+        existing = {}
+    out: dict[str, float] = {}
+    for mid, ts in existing.items():
+        if mid in ids and stamp - ts < CANARY_EXCLUDE_TTL_S:
+            out[mid] = ts
+    for mid in ids:
+        key = str(mid).strip()
+        if key and key not in out:
+            out[key] = stamp
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(out, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        return
+
+
 def is_pull_state(state: str | None) -> bool:
     return str(state or "").strip().lower() in CANARY_PULL_STATES
 
@@ -666,6 +732,7 @@ class CanaryWatchdog:
             key = self.config.api_key or os.environ.get("VAST_API_KEY") or ""
             # Real POST /bundles/ search even in CLI dry-run; run() never PUTs unless --live.
             self.client = VastClient(api_key=key, dry_run=False)
+        self._exclude_machine_ids.update(load_excluded_machines())
 
     def validate_config(self) -> tuple[str, str]:
         if self.config.live:
@@ -741,12 +808,15 @@ class CanaryWatchdog:
         return self._spent_usd + self._estimate_running_cost(offer, elapsed_h)
 
     def _note_excluded_machine(self, offer: dict, v1_row: dict | None = None, extra: dict | None = None) -> None:
+        before = set(self._exclude_machine_ids)
         for src in (v1_row, extra, offer):
             if not isinstance(src, dict):
                 continue
             mid = v1_machine_id(src) or offer_machine_id(src)
             if mid:
                 self._exclude_machine_ids.add(mid)
+        if self._exclude_machine_ids != before:
+            persist_excluded_machines(self._exclude_machine_ids)
 
     def _pull_stuck_outcome(
         self,
@@ -772,10 +842,11 @@ class CanaryWatchdog:
             self._pull_msg_changed_at = now
         if msg and CANARY_PULL_ERROR_RE.search(msg):
             self._note_excluded_machine(offer, v1_row, last_payload)
+            kind = "oci" if CANARY_OCI_ERROR_RE.search(msg) else "tls"
             return {
                 "status": "failed",
                 "reason": "instance_gone",
-                "pull_stuck": "tls",
+                "pull_stuck": kind,
                 "status_msg": msg,
                 "machine_id": v1_machine_id(v1_row) or offer_machine_id(offer),
                 "last": last_payload,
@@ -1171,6 +1242,7 @@ class CanaryWatchdog:
                 outcome.update(leased)
                 retry_host = False
                 if leased.get("action") == "stale_offer":
+                    self._note_excluded_machine(chosen)
                     retry_host = gone_tries < CANARY_GONE_RETRIES and not self._abort
                     if not retry_host:
                         if gone_tries:
@@ -1215,9 +1287,8 @@ class CanaryWatchdog:
                         outcome["final_status"] = "aborted"
                         outcome["reason"] = "sigint"
                         return outcome
-                    if poll.get("machine_id"):
-                        self._exclude_machine_ids.add(str(poll["machine_id"]))
-                    self._note_excluded_machine(chosen, extra=poll.get("last") if isinstance(poll.get("last"), dict) else None)
+                    extra = poll if isinstance(poll, dict) else None
+                    self._note_excluded_machine(chosen, extra=extra)
                 offer_id = str(leased.get("offer_id") or chosen.get("id") or "")
                 if offer_id:
                     self._exclude_offer_ids.add(offer_id)

@@ -18,6 +18,11 @@ if str(_REPO / "python") not in sys.path:
 import gpu_canary as gc
 from gpu_worker.vast_client import VastClient, VastSafetyError
 
+
+@pytest.fixture(autouse=True)
+def _isolate_canary_exclude_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("GPU_CANARY_EXCLUDE_MACHINES", str(tmp_path / "exclude.json"))
+
 DIGEST = "sha256:" + ("c" * 64)
 HEX64 = "c" * 64
 IMAGE_REF = f"docker.io/aetherneo/anime-factory-gpu@{DIGEST.split(':', 1)[1]}"
@@ -840,13 +845,13 @@ def test_main_loads_dotenv_before_reading_env(monkeypatch, tmp_path, capsys):
     assert "hf_dotenv_secret_token" not in out
 
 
-def test_instance_gone_does_not_re_lease(monkeypatch):
+def test_instance_gone_re_leases_other_machine(monkeypatch):
     monkeypatch.setenv("VAST_API_KEY", "k-test")
     monkeypatch.setenv("VAST_ALLOW_REPLACE", "0")
     monkeypatch.setattr(gc, "r2_live_preflight", lambda *_a, **_k: {"ok": True, "reason": "ready"})
     leases: list[str] = []
 
-    class NoRetryWatchdog(gc.CanaryWatchdog):
+    class RetryWatchdog(gc.CanaryWatchdog):
         def lease_selected(self, offer, *, image_ref, lease_env):
             oid = str(offer.get("id"))
             leases.append(oid)
@@ -854,15 +859,18 @@ def test_instance_gone_does_not_re_lease(monkeypatch):
             return {"action": "leased", "offer_id": oid, "instance_id": f"inst-{oid}"}
 
         def poll_until_done(self, offer):
-            return {"status": "failed", "reason": "instance_gone"}
+            mid = str(offer.get("machine_id") or "")
+            if str(offer.get("id")) == "offer-a":
+                return {"status": "failed", "reason": "instance_gone", "machine_id": mid}
+            return {"status": "success", "reason": "r2_canary", "machine_id": mid}
 
         def destroy_registered(self):
             self._instance_id = None
             return {"ok": True, "already_gone": True}
 
     offers = [
-        _eligible(id="offer-a", dph_total=0.4),
-        _eligible(id="offer-b", dph_total=0.55, inet_down=500),
+        _eligible(id="offer-a", dph_total=0.4, machine_id=111),
+        _eligible(id="offer-b", dph_total=0.55, inet_down=500, machine_id=222),
     ]
 
     def opener(req):
@@ -871,15 +879,17 @@ def test_instance_gone_does_not_re_lease(monkeypatch):
         return {"instances": []}
 
     client = VastClient("fake", opener=opener, dry_run=False)
-    wd = NoRetryWatchdog(
+    wd = RetryWatchdog(
         _cfg(live=True, confirm=gc.LIVE_CONFIRM_PHRASE, api_key="k-test"),
         client=client,
     )
     out = wd.run()
-    assert leases == ["offer-a"]
-    assert out["final_status"] == "failed"
-    assert out["poll"]["reason"] == "instance_gone"
-    assert "gone_retries" not in out
+    assert leases == ["offer-a", "offer-b"]
+    assert out["final_status"] == "success"
+    assert out["poll"]["reason"] == "r2_canary"
+    assert out["gone_retries"] == 1
+    assert "111" in wd._exclude_machine_ids
+    assert "222" not in wd._exclude_machine_ids
 
 
 class _FakeClock:
@@ -1046,6 +1056,60 @@ def test_poll_tls_status_msg_fails_immediately():
     assert out["pull_stuck"] == "tls"
 
 
+def test_poll_oci_runtime_fails_immediately():
+    clock = _FakeClock()
+
+    def opener(req):
+        if req.get_method() == "GET" and "/instances/inst-p" in req.full_url:
+            return {"instances": None}
+        if "/api/v1/instances" in req.full_url:
+            return {
+                "instances": [
+                    {
+                        "id": "inst-p",
+                        "actual_status": "created",
+                        "status_msg": (
+                            "Error response from daemon: failed to create task for container: "
+                            "failed to create shim task: OCI runtime create failed"
+                        ),
+                        "machine_id": "55796",
+                    }
+                ]
+            }
+        return {}
+
+    client = VastClient("fake", opener=opener, dry_run=False)
+    wd = gc.CanaryWatchdog(
+        _cfg(poll_interval_s=10.0, max_wall_s=3600.0),
+        client=client,
+        sleep=clock.advance,
+        clock=clock,
+    )
+    wd._started_at = 0.0
+    wd._register_instance("inst-p")
+    wd.r2_checker = lambda sid, ep: False
+    out = wd.poll_until_done(_eligible(dph_total=0.48, machine_id=55796))
+    assert out["status"] == "failed"
+    assert out["reason"] == "instance_gone"
+    assert out["pull_stuck"] == "oci"
+    assert "55796" in wd._exclude_machine_ids
+    assert clock.t < 60
+
+
+def test_excluded_machines_persist_across_watchdogs(tmp_path, monkeypatch):
+    cache = tmp_path / "machines.json"
+    monkeypatch.setenv("GPU_CANARY_EXCLUDE_MACHINES", str(cache))
+    now = 1_700_000_000.0
+    gc.persist_excluded_machines({"55796", "45511"}, now=now)
+    loaded = gc.load_excluded_machines(now=now + 60)
+    assert loaded == {"55796", "45511"}
+    expired = gc.load_excluded_machines(now=now + gc.CANARY_EXCLUDE_TTL_S + 1)
+    assert expired == set()
+    monkeypatch.setattr(gc.time, "time", lambda: now + 60)
+    wd = gc.CanaryWatchdog(_cfg(), client=VastClient("fake", dry_run=True))
+    assert "55796" in wd._exclude_machine_ids
+
+
 def test_poll_progress_includes_status_msg(capsys):
     def opener(req):
         if req.get_method() == "GET" and "/instances/inst-p" in req.full_url:
@@ -1113,8 +1177,7 @@ def test_destroy_failure_does_not_re_lease(monkeypatch):
     out = wd.run()
     assert leases == ["offer-a"]
     assert out["final_status"] == "failed"
-    assert out["poll"]["reason"] == "instance_gone"
-    assert out.get("reason") != "destroy_failed_before_retry"
+    assert out["reason"] == "destroy_failed_before_retry"
 
 
 def test_sigint_does_not_put_another_ask(monkeypatch):
