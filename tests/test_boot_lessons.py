@@ -407,10 +407,11 @@ def test_anime_sdxl_stills_workflow_fill_and_gpu_client():
 
 
 def test_lease_body_onstart_starts_agent():
-    """jupyter/ssh runtypes replace the image ENTRYPOINT; onstart must start af-start."""
+    """ssh runtype replaces the image ENTRYPOINT; onstart must start af-start."""
     body = VastClient("fake", dry_run=True).lease_body()
     assert body["onstart"] == "/usr/local/bin/af-start"
-    assert "jupyter" in str(body.get("runtype") or "")
+    assert "ssh" in str(body.get("runtype") or "")
+    assert "jupyter" not in str(body.get("runtype") or "")
     assert body["image"].endswith("anime-factory-gpu:main")
     assert body["disk"] == 200
 

@@ -69,6 +69,8 @@ Thumbs.db
 *~
 .idea/
 .vscode/
+# Accidental `KEY=150` shell redirects
+=[0-9]*
 
 # Documentation (explicitly excluded from this public worker repo)
 *.md

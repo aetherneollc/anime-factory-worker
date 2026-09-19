@@ -209,6 +209,18 @@ DEFAULT_STARTUP_TIMEOUT_MINUTES = 150.0
 PREFLIGHT_TIMEOUT_SECONDS = 120.0
 COMFY_STARTUP_TIMEOUT_SECONDS = 600.0
 WEIGHT_PULL_TIMEOUT_SECONDS = 3600.0
+# Hardware preflight is 2 minutes. These stages run after nvidia-smi and include
+# pip/fonts — they must not inherit PreflightTimeout or the box self-destroys.
+STARTUP_SETUP_STAGES = frozenset(
+    {
+        "torch",
+        "compiler",
+        "comfy_requirements",
+        "fonts",
+        "compatibility_patches",
+        "comfy_torch_probe",
+    }
+)
 WATCHDOG_INTERVAL_SECONDS = 10 * 60.0
 WATCHDOG_STALE_CHECKS = 3
 STARTUP_WATCHDOG_STALE_CHECKS = 15
@@ -579,7 +591,8 @@ class LeaseRuntime:
             self.record_startup_stage(stage)
             if stage == "preflight":
                 self.set_startup_subphase("preflight")
-            elif stage.startswith("weights"):
+            elif stage.startswith("weights") or stage in STARTUP_SETUP_STAGES:
+                # torch/fonts/pip after hardware preflight are not the 2-minute nvidia-smi window.
                 self.set_startup_subphase("weights")
             elif stage.startswith("start_comfy") or stage.startswith("wait_comfy") or stage == "comfy_probe":
                 self.set_startup_subphase("comfy")

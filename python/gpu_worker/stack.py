@@ -1218,6 +1218,8 @@ def boot_gpu_stack(progress: Callable[[str], None] | None = None) -> dict:
             pass
         raise
     if progress:
+        # Leave the 2-minute preflight bucket before pip/fonts/weight pull.
+        progress("startup_stage:weights:setup")
         progress("startup_stage:torch")
     try:
         ensure_torch()

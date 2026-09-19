@@ -90,8 +90,9 @@ class VastClient:
             "image": image,
             "disk": disk_gb,
             "label": "anime-factory-gpu",
-            # jupyter/ssh replace the image ENTRYPOINT — onstart must start the agent.
-            "runtype": "args jupyter ssh",
+            # ssh replaces ENTRYPOINT — onstart must start the agent. jupyter wrapping
+            # rebuilds a sidecar and injects CDI gpu=N, which 1-GPU hosts reject as gpu=1.
+            "runtype": "args ssh",
             "onstart": "/usr/local/bin/af-start",
             "python_utf8": True,
             "lang": "en",

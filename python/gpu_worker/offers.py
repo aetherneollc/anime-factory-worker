@@ -66,6 +66,10 @@ def search_payload(extra: dict[str, Any] | None = None) -> dict[str, Any]:
     return payload
 
 
+def _gpu_frac(offer: dict) -> float:
+    return _offer_num(offer, "gpu_frac", "gpu_fraction")
+
+
 def _gpu_name(offer: dict) -> str:
     return str(offer.get("gpu_name") or offer.get("gpu_name_long") or offer.get("gpu") or "")
 
@@ -320,6 +324,9 @@ def score_offer(
     cuda_vers = _cuda_version(offer)
     if cuda_vers > 0 and cuda_vers < MIN_CUDA_VERSION:
         return {**base, "reject_reason": "cuda_version", "cuda_max_good": cuda_vers}
+    gpu_frac = _gpu_frac(offer)
+    if gpu_frac == gpu_frac and 0 < gpu_frac < 1:
+        return {**base, "reject_reason": "gpu_frac", "gpu_frac": gpu_frac}
     if duration_days < MIN_DURATION_DAYS:
         return {**base, "reject_reason": "duration"}
     if inet_down <= 0:

@@ -108,3 +108,11 @@ def test_trap_heuristic_imputes_when_cheap_and_fast():
     assert scored["usd_per_gb"] == 0.08
     assert scored["egress_usd"] == (WEIGHTS_GB + UPLOAD_GB_PER_EP * 3) * 0.08
     assert scored["expected_total_usd"] == scored["lease_h"] * scored["dph_total"] + scored["egress_usd"]
+
+
+def test_rejects_fractional_gpu():
+    shared = _eligible(id="half", dph_total=0.64, gpu_frac=0.5)
+    full = _eligible(id="full", dph_total=0.64, gpu_frac=1.0)
+    assert score_offer(shared)["reject_reason"] == "gpu_frac"
+    assert score_offer(full).get("reject_reason") is None
+    assert pick_one_offer([shared, full])["id"] == "full"

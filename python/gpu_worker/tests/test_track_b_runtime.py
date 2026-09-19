@@ -686,6 +686,25 @@ def test_startup_subphase_preflight_timeout_is_two_minutes():
     assert isinstance(stop, session.PreflightTimeout)
 
 
+def test_torch_and_fonts_leave_two_minute_preflight_bucket():
+    now = [0.0]
+    runtime = session.LeaseRuntime(
+        instance_id="123",
+        started_at=0.0,
+        clock=lambda: now[0],
+    )
+    runtime.begin_startup()
+    runtime.observe_progress("startup_stage:preflight")
+    now[0] = 30.0
+    runtime.observe_progress("startup_stage:torch")
+    now[0] = 121.0
+    assert runtime.limit_reached() is None
+    runtime.observe_progress("startup_stage:fonts")
+    now[0] = 180.0
+    assert runtime.limit_reached() is None
+    assert runtime.startup_subphase == "weights"
+
+
 def test_startup_subphase_comfy_timeout_is_ten_minutes():
     now = [0.0]
     runtime = session.LeaseRuntime(
@@ -789,6 +808,7 @@ def test_stack_boot_reports_startup_stages_and_font_verification(monkeypatch):
     assert result["fonts"]["verified"] is True
     assert result["startup_downloaded_bytes"] == 1024
     assert "startup_stage:preflight" in events
+    assert "startup_stage:weights:setup" in events
     assert "startup_stage:fonts" in events
     assert "startup_stage:weights:stills" in events
     assert "startup_stage:comfy_torch_probe" in events
