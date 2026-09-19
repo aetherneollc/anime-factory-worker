@@ -788,6 +788,7 @@ _COMFY_TORCH_PROBE_SCRIPT = r"""
 import os
 import sys
 
+# Last argv is the ComfyUI directory, not main.py — os.chdir cannot take a file.
 comfy_dir = sys.argv[-1]
 flags = sys.argv[1:-1]
 sys.argv = ["main.py", *flags]
@@ -815,11 +816,12 @@ def probe_comfy_torch_import(
 ) -> dict[str, Any]:
     """Fail closed before Comfy main.py if the cuda_malloc→torch path SIGSEGVs."""
     launch = comfy_launch_args(main_py)
-    comfy = str(launch[1])
+    main_path = Path(launch[1])
+    comfy_root = str(main_path.parent)
     flags = launch[2:]
     try:
         proc = subprocess.run(
-            [sys.executable, "-c", _COMFY_TORCH_PROBE_SCRIPT, *flags, comfy],
+            [sys.executable, "-c", _COMFY_TORCH_PROBE_SCRIPT, *flags, comfy_root],
             env=comfy_subprocess_env(),
             capture_output=True,
             text=True,

@@ -525,6 +525,32 @@ def test_comfy_launch_args_disable_cuda_malloc(monkeypatch):
     assert "--disable-pinned-memory" in args
 
 
+def test_probe_comfy_torch_import_chdirs_to_comfy_dir(tmp_path, monkeypatch):
+    """Vast 51523076: probe chdir'd to main.py (NotADirectoryError) after weights."""
+    from gpu_worker import stack
+
+    seen = {}
+
+    class _Proc:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    def fake_run(args, **_k):
+        seen["args"] = list(args)
+        return _Proc()
+
+    comfy = tmp_path / "ComfyUI"
+    comfy.mkdir()
+    (comfy / "main.py").write_text("#\n", encoding="utf-8")
+    monkeypatch.setattr(stack, "COMFY_DIR", comfy)
+    monkeypatch.setattr(stack.subprocess, "run", fake_run)
+    out = stack.probe_comfy_torch_import(comfy / "main.py")
+    assert out["ok"] is True
+    assert seen["args"][-1] == str(comfy)
+    assert seen["args"][-1] != str(comfy / "main.py")
+
+
 def test_probe_comfy_torch_import_maps_sigsegv_to_preflight(monkeypatch):
     from gpu_worker import stack
     from gpu_worker.preflight import PreflightFailure
