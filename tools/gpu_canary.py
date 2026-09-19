@@ -70,14 +70,21 @@ CANARY_GONE_RETRIES = 2
 # Match packages/cf-control seasons.ts PULL_STUCK_MS — Vast `loading` is docker pull.
 CANARY_PULL_STATES = frozenset({"loading", "creating", "created", "pending"})
 CANARY_PULL_STALL_S = 12 * 60
-# 7.2GB Hub pull at ~40Mbps is ~25 min; do not kill a host still printing layer progress.
-CANARY_PULL_MAX_S = 30 * 60
+# 7.2GB Hub pull at ~40Mbps is ~25 min, plus Vast ssh-wrap apt; do not kill a host still progressing.
+CANARY_PULL_MAX_S = 45 * 60
 CANARY_PULL_ERROR_RE = re.compile(
     r"tls handshake|net/http:\s*tls|\beof\b|i/o timeout|context deadline|"
     r"error pulling|failed to pull|image pull|connection reset|"
-    r"connection refused|no such host|denied|not found|unavailable|"
+    r"connection refused|no such host|unauthorized|authentication required|"
+    r"pull(?:ing)? denied|access denied|manifest unknown|repository not found|"
+    r"service unavailable|registry.*unavailable|"
     r"oci runtime|runtime create failed|failed to create shim|"
     r"failed to create task|nvidia-container",
+    re.I,
+)
+# Vast ssh/jupyter wrap prints apt postinst noise ("policy-rc.d denied") while still booting.
+CANARY_WRAP_NOISE_RE = re.compile(
+    r"policy-rc\.d denied|#\d+\s+\d|Creating SSH|Setting up polkitd|invoke-rc\.d",
     re.I,
 )
 CANARY_OCI_ERROR_RE = re.compile(
@@ -840,7 +847,7 @@ class CanaryWatchdog:
         if msg != self._pull_msg:
             self._pull_msg = msg
             self._pull_msg_changed_at = now
-        if msg and CANARY_PULL_ERROR_RE.search(msg):
+        if msg and CANARY_PULL_ERROR_RE.search(msg) and not CANARY_WRAP_NOISE_RE.search(msg):
             self._note_excluded_machine(offer, v1_row, last_payload)
             kind = "oci" if CANARY_OCI_ERROR_RE.search(msg) else "tls"
             return {

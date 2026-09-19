@@ -1056,6 +1056,45 @@ def test_poll_tls_status_msg_fails_immediately():
     assert out["pull_stuck"] == "tls"
 
 
+def test_poll_policy_rc_denied_is_not_pull_error():
+    clock = _FakeClock()
+    msg = (
+        "#7 26.30 invoke-rc.d: policy-rc.d denied execution of reload.\n"
+        "#7 26.39 start-stop-daemon: unable to stat /usr/libexec/polkitd "
+        "(No such file or directory)"
+    )
+
+    def opener(req):
+        if req.get_method() == "GET" and "/instances/inst-p" in req.full_url:
+            return {"instances": None}
+        if "/api/v1/instances" in req.full_url:
+            return {
+                "instances": [
+                    {
+                        "id": "inst-p",
+                        "actual_status": "loading",
+                        "status_msg": msg,
+                        "machine_id": "m-wrap",
+                    }
+                ]
+            }
+        return {}
+
+    client = VastClient("fake", opener=opener, dry_run=False)
+    wd = gc.CanaryWatchdog(
+        _cfg(poll_interval_s=10.0, max_wall_s=30.0),
+        client=client,
+        sleep=clock.advance,
+        clock=clock,
+    )
+    wd._started_at = 0.0
+    wd._register_instance("inst-p")
+    wd.r2_checker = lambda sid, ep: False
+    out = wd.poll_until_done(_eligible(dph_total=0.48))
+    assert out["status"] == "timeout"
+    assert out.get("pull_stuck") is None
+
+
 def test_poll_oci_runtime_fails_immediately():
     clock = _FakeClock()
 
