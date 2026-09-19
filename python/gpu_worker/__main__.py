@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sys
 import threading
 import time
@@ -197,9 +198,39 @@ def maybe_pm_control() -> object | None:
     return control
 
 
+def _install_sigbus_guard(instance_id: str) -> None:
+    """Main-thread SIGBUS: log, destroy without rating, do not return.
+
+    A background-thread fault is not catchable here (the kernel delivers
+    SIGBUS to the thread that mapped the short file). That path is closed by
+    refusing xet and incomplete safetensors before mmap.
+    """
+
+    def _handler(signum, frame) -> None:  # noqa: ARG001
+        import faulthandler
+
+        try:
+            faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            from gpu_worker.weights import report_mmap_fault
+
+            report_mmap_fault(instance_id)
+        except Exception:  # noqa: BLE001
+            print({"sigbus": True, "failure_class": "weight_mmap_failed"}, flush=True)
+        os._exit(128 + int(signum or 7))
+
+    try:
+        signal.signal(signal.SIGBUS, _handler)
+    except (ValueError, OSError):
+        return
+
+
 def main() -> int:
     lease_started = time.monotonic()
     instance_id = _instance_id()
+    _install_sigbus_guard(instance_id)
     start_comfy_enabled = _env_bool("AF_START_COMFY", False)
     stack_info: dict = {}
     from gpu_worker.stack import COMFY_DIR, boot_gpu_stack, current_tunnel_status

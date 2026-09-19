@@ -260,7 +260,8 @@ ENV PYTHONPATH=/app/python \
     MOSS_SFX_WEIGHTS_DIR=/work/.model-cache/moss-sfx \
     MOSS_SFX_DEVICE=cuda:0 \
     TORCHDYNAMO_DISABLE=1 \
-    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    HF_HUB_DISABLE_XET=1
 
 LABEL org.aetherneo.anime-factory.comfy="true" \
       org.aetherneo.anime-factory.h3="true" \

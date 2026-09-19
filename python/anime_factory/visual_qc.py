@@ -261,6 +261,11 @@ class OpenClipScorer:
                 f"{CLIP_MODEL_ID} weights missing locally "
                 "(set AF_VISUAL_QC_CLIP_WEIGHTS or AF_VISUAL_QC_CLIP_DIR; runtime download is forbidden)"
             )
+        from gpu_worker.weights import safetensors_mmap_unsafe
+
+        unsafe = safetensors_mmap_unsafe(weight)
+        if unsafe:
+            raise ClipScorerUnavailable(unsafe)
         try:
             import open_clip
             import torch

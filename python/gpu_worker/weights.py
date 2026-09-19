@@ -20,13 +20,21 @@ env vars; it must never silently download weights at runtime.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
+import struct
 import threading
 from pathlib import Path
 from typing import Callable
 
 from anime_factory.models import IMAGE_CKPT, IMAGE_MODEL
+
+# hf_xet reconstructs safetensors with mmap. A short reconstruction (header
+# committed, data past EOF) raises SIGBUS and kills af-start — no Python
+# traceback, heartbeat gone, Comfy left up. Must be set before huggingface_hub
+# is imported; the Hub reads this flag at import time.
+os.environ["HF_HUB_DISABLE_XET"] = "1"
 
 # HuggingFace repos / files Comfy 生图 + H3 need. First boot may download.
 # Comfy-Org/MiniMax-H3 ships pruned DiT as int8_convrot / fp8_scaled / bf16 only
@@ -192,6 +200,7 @@ def _hub_kwargs() -> dict:
 
 def _hf_file(repo: str, filename: str, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
+    os.environ["HF_HUB_DISABLE_XET"] = "1"
     from huggingface_hub import hf_hub_download
 
     # Repo-relative names (diffusion_models/foo.safetensors) must land on dest.
@@ -209,6 +218,79 @@ def _hf_file(repo: str, filename: str, dest: Path) -> None:
             src.unlink()
         except OSError:
             pass
+    reason = safetensors_mmap_unsafe(dest)
+    if reason:
+        try:
+            dest.unlink()
+        except OSError:
+            pass
+        raise RuntimeError(reason)
+
+
+def safetensors_mmap_unsafe(path: Path) -> str | None:
+    """Reason a safetensors mmap would SIGBUS, or None if the header fits.
+
+    Hub writes the JSON header first. ``data_offsets`` past EOF is the crash
+    class from instance 51618093: design's Comfy prompt had already succeeded,
+    the background H3 pull was still reconstructing, and SIGBUS took down
+    ``af-start`` without a traceback.
+    """
+    if path.suffix != ".safetensors":
+        return None
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        return f"safetensors unreadable: {path}: {exc}"
+    if size < 8:
+        return None
+    try:
+        with path.open("rb") as handle:
+            header_len = struct.unpack("<Q", handle.read(8))[0]
+            if header_len <= 0 or header_len > 100_000_000 or 8 + header_len > size:
+                return None
+            raw = handle.read(header_len)
+        header = json.loads(raw)
+    except (OSError, struct.error, json.JSONDecodeError, UnicodeDecodeError, OverflowError, ValueError):
+        return None
+    if not isinstance(header, dict):
+        return None
+    end = 0
+    for key, meta in header.items():
+        if key == "__metadata__" or not isinstance(meta, dict):
+            continue
+        offsets = meta.get("data_offsets")
+        if not isinstance(offsets, (list, tuple)) or len(offsets) != 2:
+            continue
+        try:
+            tensor_end = int(offsets[1])
+        except (TypeError, ValueError):
+            continue
+        if tensor_end > end:
+            end = tensor_end
+    declared = 8 + int(header_len) + end
+    if size < declared:
+        return (
+            f"truncated safetensors {path}: file={size} header_span={declared} "
+            "(refusing mmap; Hub download was incomplete)"
+        )
+    return None
+
+
+def report_mmap_fault(instance_id: str) -> dict:
+    """Log SIGBUS and destroy this box without a host rating.
+
+    The fault is a truncated weight or sqlite page in our process, not a bad
+    Vast card. ``explicit_abort`` is allowed by the destroy gate and is not a
+    host-fault marker, so the machine is not scored 1.
+    """
+    error = (
+        "weight_mmap_failed:SIGBUS truncated safetensors or sqlite page; "
+        "refusing silent process death"
+    )
+    print({"sigbus": True, "failure_class": "weight_mmap_failed", "error": error}, flush=True)
+    from gpu_worker.session import teardown_for_reason
+
+    return teardown_for_reason(instance_id, "explicit_abort", error=error)
 
 
 def _file_meets_contract(dest: Path, item: dict[str, str] | None = None) -> bool:
@@ -216,6 +298,8 @@ def _file_meets_contract(dest: Path, item: dict[str, str] | None = None) -> bool
         return False
     size = dest.stat().st_size
     if size <= 0:
+        return False
+    if safetensors_mmap_unsafe(dest):
         return False
     if item:
         min_bytes = item.get("min_bytes")
@@ -514,6 +598,10 @@ def start_h3_weights_background(
                 ensure_h3_weights(root, progress=progress, modes=modes if modes is not None else set())
             except BaseException as exc:  # noqa: BLE001 — join_h3_weights re-raises
                 _h3_error = exc
+                print(
+                    {"h3_weights_error": f"{type(exc).__name__}:{exc}"[:500]},
+                    flush=True,
+                )
             finally:
                 _h3_done.set()
 

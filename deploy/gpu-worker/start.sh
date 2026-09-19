@@ -19,4 +19,7 @@ export ANIME_FACTORY_GPU_STILLS="${ANIME_FACTORY_GPU_STILLS:-1}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 # Preflight validate_container_contract requires /work before weight pull.
 mkdir -p "${AF_WORK_DIR:-/work}"
+# Before Python imports huggingface_hub. Xet mmap of a short safetensors
+# reconstruction SIGBUS-kills this process (see weights.safetensors_mmap_unsafe).
+export HF_HUB_DISABLE_XET=1
 exec python -m gpu_worker

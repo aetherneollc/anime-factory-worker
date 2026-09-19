@@ -74,6 +74,10 @@ def open_db(path: str | Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
+    # Default mmap_size is build-dependent. A second connection (keyframe
+    # identity lookup) plus wal_checkpoint(TRUNCATE) SIGBUS if the live file
+    # is mapped. Reads then raise SQLITE_CORRUPT instead of killing af-start.
+    conn.execute("PRAGMA mmap_size = 0")
     return conn
 
 
