@@ -76,6 +76,25 @@ def test_pre_gpu_artifacts_ready(tmp_path):
     )
     # Board + spoken line + dialogue wav is enough to lease/生图; H3 weights are not a gate.
     assert pre_gpu_artifacts_ready(tmp_path, "EP001") is True
+    (ep / "audio" / "tts_manifest.json").write_text(
+        '{"n_tts": 0, "deferred": true, "reason": "gpu box will synthesize"}',
+        encoding="utf-8",
+    )
+    assert pre_gpu_artifacts_ready(tmp_path, "EP001") is False
+
+
+def test_pre_gpu_artifacts_ready_silent_h3_canary_board(tmp_path):
+    ep = tmp_path / "episodes" / "EP001"
+    (ep / "audio").mkdir(parents=True)
+    (ep / "board.json").write_text(
+        '{"n_spoken": 0, "shots": [{"id": "s001", "h3_mode": "fl2va_first", "h3_prompt": "slow push-in"}]}',
+        encoding="utf-8",
+    )
+    (ep / "audio" / "tts_manifest.json").write_text(
+        '{"n_tts": 0, "shots": 1, "deferred": true, "reason": "isolated canary"}',
+        encoding="utf-8",
+    )
+    assert pre_gpu_artifacts_ready(tmp_path, "EP001") is True
 
 
 def test_run_pre_gpu_if_needed_pulls_r2_before_produce(tmp_path, monkeypatch):
@@ -94,6 +113,22 @@ def test_run_pre_gpu_if_needed_pulls_r2_before_produce(tmp_path, monkeypatch):
     assert pulled == [("story-1", str(tmp_path))]
     assert produced == []
     assert out == {"skipped": True, "reason": "pre_gpu_ready"}
+
+
+def test_run_pre_gpu_if_needed_honors_skip_env(tmp_path, monkeypatch):
+    from gpu_worker import session
+
+    produced = []
+    monkeypatch.setenv("AF_SKIP_PRE_GPU", "1")
+    monkeypatch.setattr(session, "pull_story", lambda *_a, **_k: [])
+    monkeypatch.setattr(
+        session,
+        "produce_episode",
+        lambda *args, **kwargs: produced.append(kwargs) or {"blocked": True},
+    )
+    out = session.run_pre_gpu_if_needed("story-1", tmp_path, "EP001", skip_pull=True)
+    assert produced == []
+    assert out == {"skipped": True, "reason": "af_skip_pre_gpu"}
 
 
 def test_gpu_dockerfile_copies_language_registry():

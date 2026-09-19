@@ -2882,7 +2882,42 @@ def ensure_story_db(story_id: str, root: Path) -> Any:
     return conn
 
 
+def _shot_has_spoken_line(shot: dict) -> bool:
+    line = shot.get("line") if isinstance(shot, dict) else None
+    if not isinstance(line, dict):
+        return False
+    return any(str(v or "").strip() for v in line.values())
+
+
+def _shot_has_video_prompt(shot: dict) -> bool:
+    if not isinstance(shot, dict):
+        return False
+    return any(
+        str(shot.get(key) or "").strip()
+        for key in ("h3_mode", "h3_prompt", "prompt", "first_frame_prompt")
+    )
+
+
+def _tts_manifest_complete(audio: Path) -> bool:
+    manifest = audio / "tts_manifest.json"
+    if manifest.is_file():
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 — unreadable manifest is not complete
+            data = {}
+        if isinstance(data, dict) and data.get("deferred") is True:
+            return False
+        return True
+    return any(audio.rglob("*.wav")) or any(audio.rglob("*.mp3"))
+
+
 def pre_gpu_artifacts_ready(root: Path, episode_code: str) -> bool:
+    """Skip hosted bible when the board is already GPU-runnable.
+
+    Spoken boards still need real TTS (not a deferred placeholder). Silent H3
+    canary boards ship shots with prompts and n_spoken=0 — those must not call
+    the director LLM on an isolated box.
+    """
     ep = Path(root) / "episodes" / episode_code
     board = ep / "board.json"
     if not board.is_file():
@@ -2890,19 +2925,14 @@ def pre_gpu_artifacts_ready(root: Path, episode_code: str) -> bool:
     try:
         data = json.loads(board.read_text(encoding="utf-8"))
         shots = list(data.get("shots") or [])
-        spoken = [
-            shot
-            for shot in shots
-            if any(str(v or "").strip() for v in (shot.get("line") or {}).values())
-        ]
-        if not spoken:
+        if not shots:
             return False
+        spoken = [shot for shot in shots if _shot_has_spoken_line(shot)]
+        if spoken:
+            return _tts_manifest_complete(ep / "audio")
+        return all(_shot_has_video_prompt(shot) for shot in shots)
     except Exception:  # noqa: BLE001 — missing/invalid board is not ready
         return False
-    audio = ep / "audio"
-    if (audio / "tts_manifest.json").is_file():
-        return True
-    return any(audio.rglob("*.wav")) or any(audio.rglob("*.mp3"))
 
 
 def run_pre_gpu_if_needed(
@@ -2923,6 +2953,8 @@ def run_pre_gpu_if_needed(
     """
     if not skip_pull:
         pull_story(story_id, root, episode_code=episode_code)
+    if str(os.environ.get("AF_SKIP_PRE_GPU") or "").strip().lower() in {"1", "true", "yes"}:
+        return {"skipped": True, "reason": "af_skip_pre_gpu"}
     if pre_gpu_artifacts_ready(root, episode_code):
         return {"skipped": True, "reason": "pre_gpu_ready"}
     return produce_episode(

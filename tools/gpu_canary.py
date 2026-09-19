@@ -283,6 +283,7 @@ def build_canary_env(*, image_digest: str, story_id: str, backend: str = "h3") -
         "AF_GPU_PROFILE": profile,
         "AF_START_COMFY": "1",
         "ANIME_FACTORY_GPU_STILLS": "1",
+        "AF_SKIP_PRE_GPU": "1",
         "COMFYUI_BASE_URL": "http://127.0.0.1:8199",
         "R2_ENDPOINT": os.environ.get("R2_ENDPOINT") or "",
         "R2_BUCKET": os.environ.get("R2_BUCKET") or "",

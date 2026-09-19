@@ -258,6 +258,7 @@ def test_canary_env_sets_required_keys():
     assert env["VAST_ALLOW_REPLACE"] == "0"
     assert env["AF_EXPECTED_IMAGE_DIGEST"] == DIGEST
     assert env["AF_REPORTED_IMAGE_DIGEST"] == DIGEST
+    assert env["AF_SKIP_PRE_GPU"] == "1"
 
 
 def test_canary_env_longlive_sets_profile_and_lock():
