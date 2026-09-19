@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -330,6 +331,105 @@ def test_work_claim_and_report_send_auth(monkeypatch):
     )
     assert [row[0].rsplit("/", 1)[-1].split("?")[0] for row in seen] == ["work", "claim", "report"]
     assert all(row[1][AGENT_KEY_HEADER.lower()] == "box-secret" for row in seen)
+
+
+def _http_error(code: int) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError("https://control.example/gpu/work", code, "err", None, None)
+
+
+def test_fetch_work_403_fail_fast_no_retry(monkeypatch):
+    hits = {"n": 0}
+
+    def open_control(_req, timeout=20):
+        hits["n"] += 1
+        raise _http_error(403)
+
+    monkeypatch.setattr(poll.urllib.request, "urlopen", open_control)
+    first = poll.fetch_work("https://control.example")
+    second = poll.fetch_work("https://control.example")
+    assert first.get("fail_fast") is True
+    assert first.get("failure_class") == "control_plane_403"
+    assert first.get("http_status") == 403
+    assert second.get("fail_fast") is True
+    assert hits["n"] == 2
+
+
+def test_fetch_work_502_stays_retryable(monkeypatch):
+    def open_control(_req, timeout=20):
+        raise _http_error(502)
+
+    monkeypatch.setattr(poll.urllib.request, "urlopen", open_control)
+    payload = poll.fetch_work("https://control.example")
+    assert payload.get("fail_fast") is not True
+    assert payload.get("ok") is False
+
+
+def test_recycle_forbidden_host_rates_and_destroys(monkeypatch):
+    rated = []
+    destroyed = []
+
+    class FakeClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def report_machine(self, machine_id, problem, message, rating=1):
+            rated.append((machine_id, problem, rating, "403" in str(message)))
+            return {"ok": True}
+
+    monkeypatch.setenv("VAST_MACHINE_ID", "4242")
+    monkeypatch.setattr(session, "VastClient", FakeClient)
+    monkeypatch.setattr(
+        session,
+        "destroy_self",
+        lambda instance_id, reason, error=None: destroyed.append((instance_id, reason, error))
+        or {"ok": True, "destroyed": True},
+    )
+    out = session.recycle_forbidden_host("51603913", "control_plane_403:HTTP 403")
+    assert rated == [("4242", "network", 1, True)]
+    assert destroyed[0][0] == "51603913"
+    assert out["teardown"]["destroyed"] is True
+
+
+def test_main_fail_fast_on_control_plane_403_without_comfy(monkeypatch):
+    destroyed = []
+    booted = []
+
+    monkeypatch.setenv("AF_ONCE", "1")
+    monkeypatch.setenv("AF_START_COMFY", "1")
+    monkeypatch.setenv("CONTROL_PLANE_URL", "https://control.example")
+    monkeypatch.setenv("VAST_MACHINE_ID", "4242")
+    monkeypatch.setenv("VAST_DRY_RUN", "1")
+    monkeypatch.delenv("AF_STORY_ID", raising=False)
+
+    def boom(**_k):
+        booted.append("comfy")
+        raise AssertionError("must not boot Comfy after 403")
+
+    monkeypatch.setattr(stack, "boot_gpu_stack", boom)
+    monkeypatch.setattr(stack, "current_tunnel_status", lambda: {})
+    monkeypatch.setattr(worker_main, "maybe_notify_control_plane", lambda *_a, **_k: [])
+    monkeypatch.setattr(
+        poll,
+        "fetch_work",
+        lambda *_a, **_k: {
+            "ok": False,
+            "fail_fast": True,
+            "error": "control_plane_403:HTTP 403",
+            "failure_class": "control_plane_403",
+            "batch": None,
+            "jobs": [],
+        },
+    )
+    monkeypatch.setattr(
+        session,
+        "recycle_forbidden_host",
+        lambda instance_id, error: destroyed.append((instance_id, error))
+        or {"rated": {"ok": True}, "teardown": {"ok": True, "destroyed": True}},
+    )
+    assert worker_main.main() == 1
+    assert booted == []
+    assert destroyed
+    assert destroyed[0][1] == "control_plane_403:HTTP 403"
 
 
 def test_parse_batch_preserves_multi_episode_contract():

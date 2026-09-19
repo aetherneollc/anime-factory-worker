@@ -14,6 +14,46 @@ from urllib.parse import quote
 from typing import Any
 
 AGENT_KEY_HEADER = "X-Studio-Agent-Key"
+FAIL_FAST_HTTP = frozenset({401, 403, 407})
+CONTROL_PLANE_403 = "control_plane_403"
+
+
+class ControlPlaneAuthError(RuntimeError):
+    """HTTP 403/401 from the control plane — stop retrying and recycle the box."""
+
+    failure_class = CONTROL_PLANE_403
+
+    def __init__(self, status: int, url: str = ""):
+        self.status = int(status)
+        self.url = url
+        super().__init__(f"{CONTROL_PLANE_403}:HTTP {self.status}")
+
+
+def fail_fast_http_payload(exc: BaseException) -> dict[str, Any] | None:
+    """Return a fail-fast work payload for 403/401/407. 5xx stays retryable."""
+    if not isinstance(exc, urllib.error.HTTPError):
+        return None
+    if int(getattr(exc, "code", 0) or 0) not in FAIL_FAST_HTTP:
+        return None
+    status = int(exc.code)
+    return {
+        "ok": False,
+        "fail_fast": True,
+        "error": f"{CONTROL_PLANE_403}:HTTP {status}",
+        "failure_class": CONTROL_PLANE_403,
+        "http_status": status,
+        "batch": None,
+        "jobs": [],
+    }
+
+
+def is_fail_fast_control_error(payload: dict[str, Any] | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("fail_fast") is True:
+        return True
+    err = str(payload.get("error") or "")
+    return CONTROL_PLANE_403 in err.replace("-", "_")
 
 
 def control_headers(*, json_body: bool = False) -> dict[str, str]:
@@ -146,6 +186,9 @@ def fetch_work(base: str, instance_id: str = "") -> dict[str, Any]:
     try:
         return _get_json(url)
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+        fast = fail_fast_http_payload(exc)
+        if fast is not None:
+            return fast
         return {"ok": False, "error": f"{type(exc).__name__}:{exc}", "batch": None, "jobs": []}
 
 
@@ -161,6 +204,9 @@ def claim_job(base: str, instance_id: str, story_id: str, episode_code: str = "E
             },
         )
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+        fast = fail_fast_http_payload(exc)
+        if fast is not None:
+            return fast
         return {"ok": False, "error": f"{type(exc).__name__}:{exc}"}
 
 
@@ -169,6 +215,9 @@ def report_episode(base: str, payload: dict[str, Any]) -> dict[str, Any]:
     try:
         return _post_json(url, payload)
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+        fast = fail_fast_http_payload(exc)
+        if fast is not None:
+            return fast
         return {"ok": False, "error": f"{type(exc).__name__}:{exc}"}
 
 

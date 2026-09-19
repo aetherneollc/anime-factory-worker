@@ -88,6 +88,8 @@ RECYCLE_FAILURE_CLASSES = frozenset(
         "capability_mismatch",
         "comfy_startup_failed",
         "weight_pull_timeout",
+        "control_plane_403",
+        "host_secrets_403",
     }
 )
 

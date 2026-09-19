@@ -149,5 +149,26 @@ class VastClient:
         Counters.vast_instance_delete += 1
         return self._request("DELETE", path)
 
+    def report_machine(
+        self,
+        machine_id: str,
+        problem: str = "network",
+        message: str = "host secrets fetch HTTP 403",
+        rating: int = 1,
+    ) -> dict:
+        """Best-effort renter report. Vast documents GET; PUT uses the same path."""
+        mid = str(machine_id or "").strip()
+        if not mid:
+            return {"ok": False, "skipped": True, "reason": "machine_id missing"}
+        path = f"/machines/{mid}/reports/"
+        body = {"problem": problem, "message": str(message)[:500], "rating": int(rating)}
+        if self.dry_run:
+            self.calls.append(("PUT", f"{VAST_API_BASE}{path}"))
+            return {"dry_run": True, "id": mid, "payload": body}
+        try:
+            return self._request("PUT", path, body)
+        except Exception as exc:  # noqa: BLE001 — never block destroy
+            return {"ok": False, "skipped": True, "error": f"{type(exc).__name__}:{exc}"}
+
     def instance_lookup_url(self, instance_id: str) -> str:
         return f"{VAST_API_BASE}/instances/{instance_id}/"

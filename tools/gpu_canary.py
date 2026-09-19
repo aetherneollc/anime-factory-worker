@@ -92,6 +92,10 @@ CANARY_OCI_ERROR_RE = re.compile(
     r"failed to create task|nvidia-container",
     re.I,
 )
+CANARY_SECRETS_403_RE = re.compile(
+    r"secrets fetch failed.*(?:unexpected\s+)?http\s*403|secrets fetch failed.*\b403\b",
+    re.I,
+)
 CANARY_RETRY_POLL_REASONS = frozenset({"instance_gone"})
 CANARY_EXCLUDE_TTL_S = 24 * 3600
 
@@ -837,6 +841,16 @@ class CanaryWatchdog:
         state: str,
         msg: str,
     ) -> dict | None:
+        if msg and CANARY_SECRETS_403_RE.search(msg):
+            self._note_excluded_machine(offer, v1_row, last_payload)
+            return {
+                "status": "failed",
+                "reason": "instance_gone",
+                "pull_stuck": "secrets_403",
+                "status_msg": msg,
+                "machine_id": v1_machine_id(v1_row) or offer_machine_id(offer),
+                "last": last_payload,
+            }
         if not is_pull_state(state):
             self._pull_since = None
             self._pull_msg = ""

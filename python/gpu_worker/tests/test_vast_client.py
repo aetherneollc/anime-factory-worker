@@ -19,6 +19,22 @@ def test_list_instances_v1_uses_v1_base_and_opener():
     assert client.calls[0][0] == "GET"
 
 
+def test_report_machine_puts_low_rating():
+    seen = []
+
+    def opener(req):
+        seen.append((req.get_method(), req.full_url, req.data))
+        return {"success": True}
+
+    client = VastClient("fake-key", opener=opener, dry_run=False)
+    out = client.report_machine("4242", "network", "Secrets fetch HTTP 403", rating=1)
+    assert out.get("success") is True
+    assert seen[0][0] == "PUT"
+    assert seen[0][1].endswith("/machines/4242/reports/")
+    assert b'"rating": 1' in seen[0][2]
+    assert b"403" in seen[0][2]
+
+
 def test_list_instances_v1_dry_run_without_opener():
     client = VastClient("fake-key", dry_run=True)
     payload = client.list_instances_v1()

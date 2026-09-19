@@ -962,6 +962,25 @@ def destroy_self(instance_id: str, reason: str, error: str | None = None) -> dic
     }
 
 
+def recycle_forbidden_host(instance_id: str, error: str) -> dict[str, Any]:
+    """HTTP 403 from secrets/control plane: rate the Vast host poorly, then destroy this box."""
+    mid = (os.environ.get("VAST_MACHINE_ID") or os.environ.get("MACHINE_ID") or "").strip()
+    rated: dict[str, Any] = {"skipped": True, "reason": "machine_id missing"}
+    if mid:
+        api_key = os.environ.get("CONTAINER_API_KEY") or os.environ.get("VAST_API_KEY") or ""
+        try:
+            rated = VastClient(api_key=api_key).report_machine(
+                mid,
+                "network",
+                error or "control_plane_403:HTTP 403",
+                rating=1,
+            )
+        except Exception as exc:  # noqa: BLE001 — never skip destroy
+            rated = {"ok": False, "error": f"{type(exc).__name__}:{exc}"}
+    teardown = destroy_self(instance_id, "explicit_abort", error=error)
+    return {"rated": rated, "teardown": teardown}
+
+
 def persist_boot_failure(payload: dict[str, Any], story_id: str | None = None) -> dict[str, Any]:
     """Upload boot/preflight failure JSON to R2 before instance teardown."""
     story_id = (story_id or os.environ.get("AF_STORY_ID") or "").strip()

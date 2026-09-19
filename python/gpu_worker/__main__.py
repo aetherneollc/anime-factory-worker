@@ -218,6 +218,7 @@ def main() -> int:
         best_effort_upload_checkpoint,
         destroy_self,
         persist_boot_failure,
+        recycle_forbidden_host,
         gpu_cycle_idle_reason,
         hourly_rate_from_work,
         lease_age_seconds_from_work,
@@ -229,6 +230,7 @@ def main() -> int:
     from gpu_worker.poll import (
         claim_job,
         fetch_work,
+        is_fail_fast_control_error,
         parse_batch,
         parse_hitchhikers,
         parse_pre_gpu,
@@ -270,6 +272,13 @@ def main() -> int:
     startup_batch = parse_batch(startup_payload)
     if startup_batch:
         runtime.adopt_batch(startup_batch)
+    if is_fail_fast_control_error(startup_payload):
+        err = str(startup_payload.get("error") or "control_plane_403:HTTP 403")
+        runtime.last_error = err
+        runtime.record_startup_stage("control_plane_403")
+        recycled = recycle_forbidden_host(instance_id, err)
+        print(json.dumps({"control_plane_403": recycled}, ensure_ascii=False), flush=True)
+        return 1
 
     def monitored_teardown(stop: BaseException) -> dict[str, Any]:
         runtime.status = "draining"
@@ -675,6 +684,12 @@ def main() -> int:
             ):
                 try:
                     payload = fetch_work(control_base, instance_id) if control_base else {"batch": None, "jobs": []}
+                    if is_fail_fast_control_error(payload):
+                        err = str(payload.get("error") or "control_plane_403:HTTP 403")
+                        runtime.last_error = err
+                        recycled = recycle_forbidden_host(instance_id, err)
+                        print(json.dumps({"control_plane_403": recycled}, ensure_ascii=False), flush=True)
+                        return 1
                     last_queue_depth = work_queue_depth(payload)
                     runtime.set_hourly_rate(hourly_rate_from_work(payload, instance_id))
                     runtime.account_for_lease_age(

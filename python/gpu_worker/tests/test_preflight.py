@@ -276,6 +276,8 @@ def test_recycle_failure_class_maps_stable_codes():
         "capability_mismatch"
     )
     assert recycle_failure_class("install_failure: font_setup_failed") is None
+    assert recycle_failure_class("control_plane_403:HTTP 403") == "control_plane_403"
+    assert recycle_failure_class("host_secrets_403:unexpected HTTP 403") == "host_secrets_403"
 
 
 def test_probe_nvfp4_runtime_missing_and_present(monkeypatch):
