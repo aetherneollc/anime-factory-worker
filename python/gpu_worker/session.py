@@ -1405,9 +1405,11 @@ def generate_missing_stills(
             from anime_factory.keyframe import keyframe_file_ok
 
             kf = root / "episodes" / EP / "keyframes" / shot["id"] / "f1.png"
-            # A 3-byte f1.png used to satisfy `>= 1` and skip the redraw.
-            if keyframe_file_ok(kf) or _reuse_scene_plate_as_fl2va_keyframe(root, shot):
-                continue
+            # Reuse a locked plate when f1 is missing, then still call ensure_keyframe
+            # so per-cut f01/f02 anchors are minted. Skipping here left stories looping
+            # on "missing per-cut keyframes" after f1.png already existed.
+            if not keyframe_file_ok(kf):
+                _reuse_scene_plate_as_fl2va_keyframe(root, shot)
         try:
             ensure_keyframe(conn, story_id, EP, shot, geo, assets_index, lib.get("specs") or {}, client, None, "fiction", root)
             created.append(shot["id"])

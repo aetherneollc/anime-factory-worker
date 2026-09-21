@@ -343,6 +343,54 @@ def test_generate_missing_stills_fails_closed_without_f1(tmp_path, monkeypatch):
     assert not (ep / "keyframes" / "EP001-01" / "f1.png").exists()
 
 
+def test_generate_missing_stills_still_mints_cuts_when_f1_exists(tmp_path, monkeypatch):
+    """f1.png on disk must not skip ensure_keyframe; per-cut f01 is still required."""
+    import json
+
+    from gpu_worker import session as sess
+
+    ep = tmp_path / "episodes" / "EP001"
+    kf_dir = ep / "keyframes" / "s001"
+    kf_dir.mkdir(parents=True)
+    (kf_dir / "f1.png").write_bytes(PNG_STUB)
+    (ep / "board.json").write_text(
+        json.dumps(
+            {
+                "segments": [
+                    {
+                        "id": "s001",
+                        "chain_index": 0,
+                        "h3_mode": "fl2va_first",
+                        "duration": 5.0,
+                        "first_frame_prompt": "wide establishing store interior",
+                        "cuts": [{"seq": 1, "seconds": 5.0, "frame_prompt": "counter wide"}],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    called: list[str] = []
+    monkeypatch.setattr(sess, "EP", "EP001")
+    monkeypatch.setattr(sess, "_pull_studio_asset_index", lambda *_a, **_k: False)
+    monkeypatch.setattr(sess, "upload_tree", lambda *_a, **_k: [])
+    monkeypatch.setattr(
+        "anime_factory.design.library_from_db",
+        lambda *_a, **_k: {"created": [], "specs": {}},
+    )
+    monkeypatch.setattr(sess, "KolorsClient", lambda *_a, **_k: type("C", (), {"live": True})())
+    monkeypatch.setattr(
+        sess,
+        "ensure_keyframe",
+        lambda *_a, **_k: called.append(str(_a[3].get("id"))) or "ok",
+    )
+    monkeypatch.setattr(sess, "assert_keyframe_files", lambda *_a, **_k: None)
+    conn = open_db(tmp_path / "s.sqlite")
+    migrate(conn)
+    sess.generate_missing_stills("story-x", tmp_path, conn)
+    assert called == ["s001"]
+
+
 def test_generate_missing_stills_uploads_before_needs_human(tmp_path, monkeypatch):
     from gpu_worker import session as sess
 
