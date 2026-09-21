@@ -43,6 +43,9 @@ STUDIO_BACKDROP_LUMA = 235
 NAVY_TORSO_LUMA_MAX = 150.0
 # Khaki/olive joggers on live 6454ab7 sheets sat at luma ~133–182 in this crop.
 BLACK_PANTS_LUMA_MAX = 110.0
+# Warm reflected light can make genuinely dark trousers brown. Only use hue
+# skew as a rejection signal above the darkest observed live shadow samples.
+BLACK_PANTS_WARM_LUMA_MIN = 90.0
 _GARMENT_MODIFIERS = (
     r"(?:(?:rescue|safety|utility|hooded|wool|zip-up|zipped|denim|leather|canvas|straight-leg|"
     r"cropped|oversized|padded|plain|quilted)\s+)*"
@@ -502,7 +505,12 @@ def structure_check(
                 reasons.append("character_canvas_3to1")
 
     image = _load_rgb(data)
-    char_kind = kind in {"character_sheet", "character_view_derive", "costume_derive"}
+    char_kind = kind in {
+        "character_sheet",
+        "character_view_derive",
+        "character_turnaround",
+        "costume_derive",
+    }
     entropy = shannon_entropy(image, ignore_near_white=char_kind)
     dominant = dominant_bin_ratio(image, ignore_near_white=char_kind)
     scores["entropy"] = float(entropy)
@@ -567,9 +575,13 @@ def black_pants_ok(red: float, green: float, blue: float) -> bool:
     luma = 0.299 * red + 0.587 * green + 0.114 * blue
     if luma > BLACK_PANTS_LUMA_MAX:
         return False
-    if green > blue + 12 and luma > 80:
+    if green > blue + 12 and luma > BLACK_PANTS_WARM_LUMA_MIN:
         return False
-    if red > blue + 18 and green > blue + 8:
+    if (
+        red > blue + 18
+        and green > blue + 8
+        and luma > BLACK_PANTS_WARM_LUMA_MIN
+    ):
         return False
     return True
 

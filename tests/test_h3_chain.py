@@ -343,6 +343,100 @@ def test_generate_missing_stills_fails_closed_without_f1(tmp_path, monkeypatch):
     assert not (ep / "keyframes" / "EP001-01" / "f1.png").exists()
 
 
+def test_generate_missing_stills_uploads_before_needs_human(tmp_path, monkeypatch):
+    from gpu_worker import session as sess
+
+    uploaded: list[str] = []
+    pulled: list[str] = []
+
+    monkeypatch.setattr(
+        sess,
+        "_pull_studio_asset_index",
+        lambda story_id, _root: pulled.append(story_id) or False,
+    )
+    monkeypatch.setattr(
+        "anime_factory.design.library_from_db",
+        lambda *_a, **_k: {"needs_human": ["char_a-kai_turnaround"], "created": [], "specs": {}},
+    )
+    monkeypatch.setattr(
+        sess,
+        "upload_tree",
+        lambda story_id, root, rel_dir="assets": uploaded.append(rel_dir) or [{"ok": True, "key": f"{rel_dir}/x.png"}],
+    )
+    monkeypatch.setattr(
+        sess,
+        "KolorsClient",
+        lambda *_a, **_k: type("C", (), {"live": True})(),
+    )
+    conn = open_db(tmp_path / "s.sqlite")
+    migrate(conn)
+    try:
+        sess.generate_missing_stills("story-x", tmp_path, conn)
+    except RuntimeError as exc:
+        assert "char_a-kai_turnaround" in str(exc)
+        assert "needs_human" in str(exc)
+    else:
+        raise AssertionError("needs_human must still refuse H3")
+    assert pulled == ["story-x"]
+    assert uploaded == ["assets", "episodes", "canon"]
+
+
+def test_pull_studio_asset_index_force_replaces_local_copy(tmp_path, monkeypatch):
+    from gpu_worker import session as sess
+
+    local = tmp_path / "assets" / "index.json"
+    local.parent.mkdir(parents=True)
+    local.write_text('{"source":"worker-cache"}', encoding="utf-8")
+    requested: list[str] = []
+
+    def fake_download(key, dest):
+        requested.append(key)
+        Path(dest).write_text('{"source":"studio"}', encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(sess, "download_file", fake_download)
+    assert sess._pull_studio_asset_index("story-x", tmp_path) is True
+    assert requested == ["stories/story-x/assets/index.json"]
+    assert local.read_text(encoding="utf-8") == '{"source":"studio"}'
+
+
+def test_needs_human_error_surfaces_upload_failures(tmp_path, monkeypatch):
+    from gpu_worker import session as sess
+
+    monkeypatch.setattr(sess, "_pull_studio_asset_index", lambda *_a, **_k: False)
+    monkeypatch.setattr(
+        "anime_factory.design.library_from_db",
+        lambda *_a, **_k: {"needs_human": ["char_a-kai_side"], "created": [], "specs": {}},
+    )
+    monkeypatch.setattr(
+        sess,
+        "upload_tree",
+        lambda _story_id, _root, rel_dir="assets": (
+            [{"ok": False, "key": "stories/story-x/assets/index.json", "error": "timeout"}]
+            if rel_dir == "assets"
+            else []
+        ),
+    )
+    monkeypatch.setattr(
+        sess,
+        "KolorsClient",
+        lambda *_a, **_k: type("C", (), {"live": True})(),
+    )
+    conn = open_db(tmp_path / "s.sqlite")
+    migrate(conn)
+    try:
+        sess.generate_missing_stills("story-x", tmp_path, conn)
+    except RuntimeError as exc:
+        message = str(exc)
+        assert "needs_human" in message
+        assert "char_a-kai_side" in message
+        assert "r2_upload_failed" in message
+        assert "assets/index.json" in message
+        assert "timeout" in message
+    else:
+        raise AssertionError("needs_human must refuse H3 even when upload fails")
+
+
 def test_chain_segment_graph_has_last_frame_guide_and_same_refs():
     graph = native_h3_graph(
         {

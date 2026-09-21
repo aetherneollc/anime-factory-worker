@@ -55,7 +55,7 @@ from anime_factory.qc import (
     select_passing_generation,
     shot_version_path,
 )
-from anime_factory.r2_client import download_prefix, put_file, upload_tree
+from anime_factory.r2_client import download_file, download_prefix, put_file, upload_tree
 from anime_factory.r2_paths import join_story, story_prefix
 from gpu_worker.boot import (
     NEVER_DESTROY_ERRORS,
@@ -1261,6 +1261,56 @@ def _reuse_scene_plate_as_fl2va_keyframe(root: Path, shot: dict) -> bool:
     return keyframe_file_ok(kf)
 
 
+def _pull_studio_asset_index(story_id: str, root: Path) -> bool:
+    """Replace local assets/index.json with Studio's copy when R2 has one.
+
+    Approve/lock lives on R2. The box must see that lock before the next design loop
+    or side/back stay skipped and H3 stays refused.
+    """
+    dest = Path(root) / "assets" / "index.json"
+    tmp = dest.with_name("index.json.remote")
+    if not download_file(join_story(story_id, "assets/index.json"), tmp):
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        return False
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp.replace(dest)
+    return True
+
+
+def _upload_story_media(
+    story_id: str,
+    root: Path,
+    progress: ProgressCallback | None = None,
+) -> list[str]:
+    """Push stills/index so Studio can show and approve a needs_human sheet."""
+    uploads: list[dict[str, Any]] = []
+    failed: list[str] = []
+    for rel_dir in ("assets", "episodes", "canon"):
+        try:
+            uploads.extend(
+                item
+                for item in upload_tree(story_id, root, rel_dir)
+                if isinstance(item, dict)
+            )
+        except Exception as exc:  # noqa: BLE001 — report the failed prefix to Studio/H3
+            failed.append(f"{rel_dir}:{exc}")
+    for item in uploads:
+        if item.get("ok") is not False or item.get("skipped"):
+            continue
+        key = str(item.get("key") or "upload")
+        error = str(item.get("error") or item.get("reason") or "").strip()
+        failed.append(f"{key}:{error}" if error else key)
+    if progress:
+        for upload in uploads:
+            if isinstance(upload, dict) and upload.get("ok"):
+                progress(f"r2_uploaded:{upload.get('key') or 'stills'}")
+    return failed
+
+
 def generate_missing_stills(
     story_id: str,
     root: Path,
@@ -1279,9 +1329,18 @@ def generate_missing_stills(
     errors: list[str] = []
     from anime_factory.design import library_from_db
 
+    _pull_studio_asset_index(story_id, root)
     lib = library_from_db(conn, story_id, client, root, skip_existing=True)
     if lib.get("needs_human"):
-        raise RuntimeError(f"design visual QC needs_human: {lib['needs_human']}; refusing H3")
+        failed_puts = _upload_story_media(story_id, root, progress)
+        upload_error = (
+            f"; r2_upload_failed:{','.join(failed_puts[:8])}"
+            if failed_puts
+            else ""
+        )
+        raise RuntimeError(
+            f"design visual QC needs_human: {lib['needs_human']}; refusing H3{upload_error}"
+        )
     created.extend(lib.get("created") or [])
     assets_index = {"items": [{"id": k, **v} for k, v in (lib.get("specs") or {}).items()]}
     geo = export_geo(conn, story_id, invented=True, sources=[])
@@ -1354,22 +1413,9 @@ def generate_missing_stills(
             created.append(shot["id"])
         except Exception as exc:  # noqa: BLE001 — collect, then fail the stage closed
             errors.append(f"keyframe_error:{shot['id']}:{exc}")
-    uploads = [
-        *upload_tree(story_id, root, "assets"),
-        *upload_tree(story_id, root, "episodes"),
-        *upload_tree(story_id, root, "canon"),
-    ]
-    failed_puts = [
-        str(item.get("key") or item.get("error") or "upload")
-        for item in uploads
-        if isinstance(item, dict) and item.get("ok") is False and not item.get("skipped")
-    ]
+    failed_puts = _upload_story_media(story_id, root, progress)
     if failed_puts:
         errors.append("r2_upload_failed:" + ",".join(failed_puts[:8]))
-    if progress:
-        for upload in uploads:
-            if isinstance(upload, dict) and upload.get("ok"):
-                progress(f"r2_uploaded:{upload.get('key') or 'stills'}")
     try:
         assert_keyframe_files(root, EP, shots, assets_index)
     except RuntimeError as exc:

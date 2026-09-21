@@ -116,6 +116,29 @@ def test_character_sheet_studio_backdrop_passes_structure():
     assert result.scores["entropy"] >= 2.5
 
 
+def test_character_turnaround_studio_backdrop_passes_structure():
+    from PIL import ImageDraw
+
+    width, height = visual_qc.TURNAROUND_SIZE
+    img = Image.new("RGB", (width, height), (248, 248, 248))
+    draw = ImageDraw.Draw(img)
+    for panel in range(3):
+        left = panel * CHARACTER_SIZE[0] + 290
+        draw.ellipse([left + 60, 120, left + 190, 260], fill=(190, 150, 120))
+        for band in range(10):
+            top = 260 + band * 80
+            color = (30 + band * 5, 42 + band * 4, 62 + band * 3)
+            draw.rectangle([left, top, left + 250, top + 79], fill=color)
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    blob = _pad_png(buf.getvalue())
+    assert dominant_bin_ratio(img) > 0.55
+    result = structure_check(blob, kind="character_turnaround", allow_placeholder=True)
+    assert result.verdict == "pass"
+    assert result.scores["dominant_bin"] <= 0.55
+    assert result.scores["entropy"] >= 2.5
+
+
 def test_structure_rejects_3to1_character_canvas():
     blob = synthetic_still_png(1536, 512, tag="three-to-one", placeholder=True)
     result = structure_check(blob, kind="character_sheet", allow_placeholder=True)
@@ -473,7 +496,25 @@ def test_black_pants_ok_rejects_live_khaki_joggers():
     # Live 6454ab7 sheet_front / sheet_front_2 lower-body means.
     assert black_pants_ok(132.5, 134.3, 129.4) is False
     assert black_pants_ok(189.7, 181.1, 169.5) is False
+    # A brighter warm candidate remains khaki-like and rejectable.
+    assert black_pants_ok(140.0, 130.0, 110.0) is False
     assert black_pants_ok(40.0, 42.0, 48.0) is True
+
+
+@pytest.mark.parametrize(
+    "rgb",
+    [
+        (84.0, 74.6, 62.5),
+        (94.5, 84.7, 68.7),
+        (87.7, 74.4, 64.2),
+        (82.8, 67.8, 56.1),
+        (83.2, 71.3, 59.7),
+    ],
+)
+def test_black_pants_ok_accepts_live_warm_shadow_samples(rgb):
+    from anime_factory.visual_qc import black_pants_ok
+
+    assert black_pants_ok(*rgb) is True
 
 
 def _navy_khaki_sheet_png(*, pants=(160, 150, 110)) -> bytes:

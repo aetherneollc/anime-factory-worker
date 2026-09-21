@@ -87,6 +87,9 @@ def test_three_deterministic_seeds_then_needs_human(tmp_path):
     hero = load_assets_index(tmp_path)["characters"]["hero"]
     assert hero.get("selected") is None
     assert not has_locked_identity(tmp_path, "hero")
+    assert "char_hero_side" in out["needs_human"]
+    assert "char_hero_back" in out["needs_human"]
+    assert "char_hero_turnaround" in out["needs_human"]
     assert not (tmp_path / "assets/characters/hero/sheet_side.png").is_file() or hero.get("qc_verdict") != "pass"
 
 
@@ -473,6 +476,75 @@ def test_composite_uses_this_round_paths(tmp_path):
     assert (hero / "sheet_turnaround_2.png").read_bytes() == composed
 
 
+def test_failed_views_are_regenerated_without_front_substitution(tmp_path):
+    conn = open_db(tmp_path / "s.sqlite")
+    migrate(conn)
+    hero = tmp_path / "assets" / "characters" / "hero"
+    hero.mkdir(parents=True)
+    front = synthetic_still_png(CHAR_VIEW_WIDTH, CHAR_VIEW_HEIGHT, tag="front", placeholder=True)
+    failed_side = synthetic_still_png(
+        CHAR_VIEW_WIDTH,
+        CHAR_VIEW_HEIGHT,
+        tag="failed-side",
+        placeholder=True,
+    )
+    failed_back = synthetic_still_png(
+        CHAR_VIEW_WIDTH,
+        CHAR_VIEW_HEIGHT,
+        tag="failed-back",
+        placeholder=True,
+    )
+    failed_turnaround = synthetic_still_png(
+        CHAR_VIEW_WIDTH * 3,
+        CHAR_VIEW_HEIGHT,
+        tag="failed-turnaround",
+        placeholder=True,
+    )
+    (hero / FRONT_ALIAS_FILENAME).write_bytes(front)
+    (hero / "sheet_side.png").write_bytes(failed_side)
+    (hero / "sheet_back.png").write_bytes(failed_back)
+    (hero / TURNAROUND_FILENAME).write_bytes(failed_turnaround)
+    lock_after_qc(tmp_path, character_id="hero", filename=FRONT_ALIAS_FILENAME, qc=pass_qc())
+    for filename in ("sheet_side.png", "sheet_back.png", TURNAROUND_FILENAME):
+        record_qc_candidate(
+            tmp_path,
+            character_id="hero",
+            filename=filename,
+            qc=fail_qc("attr_pants_palette"),
+        )
+
+    client = KolorsClient(["k"], opener=sized_placeholder_opener("fresh-view"), live=False)
+    chars, locs, props, interiors = harbor_mvp_cast()
+    out = generate_asset_library(
+        conn,
+        "story-x",
+        chars,
+        locs,
+        props,
+        client,
+        None,
+        "fiction",
+        tmp_path,
+        interiors=interiors,
+        skip_existing=True,
+        clip_scorer=passing_scorer(),
+    )
+
+    assert out["specs"]["char_hero_side"]["path"].endswith("sheet_side_2.png")
+    assert out["specs"]["char_hero_back"]["path"].endswith("sheet_back_2.png")
+    assert out["specs"]["char_hero_turnaround"]["path"].endswith("sheet_turnaround_2.png")
+    sources = out["specs"]["char_hero_turnaround"]["source_paths"]
+    assert sources == [
+        "assets/characters/hero/sheet_front.png",
+        "assets/characters/hero/sheet_side_2.png",
+        "assets/characters/hero/sheet_back_2.png",
+    ]
+    assert all(path != "assets/characters/hero/sheet_front.png" for path in sources[1:])
+    assert (hero / "sheet_side.png").read_bytes() == failed_side
+    assert (hero / "sheet_back.png").read_bytes() == failed_back
+    assert (hero / TURNAROUND_FILENAME).read_bytes() == failed_turnaround
+
+
 def test_locked_front_reuses_side_back_for_turnaround(tmp_path):
     conn = open_db(tmp_path / "s.sqlite")
     migrate(conn)
@@ -485,6 +557,25 @@ def test_locked_front_reuses_side_back_for_turnaround(tmp_path):
     (hero / "sheet_side_2.png").write_bytes(side)
     (hero / "sheet_back_3.png").write_bytes(back)
     lock_after_qc(tmp_path, character_id="hero", filename=FRONT_ALIAS_FILENAME, qc=pass_qc())
+    record_qc_candidate(
+        tmp_path,
+        character_id="hero",
+        filename="sheet_side_2.png",
+        qc=pass_qc(),
+    )
+    conn.execute(
+        """
+        INSERT INTO assets (id, kind, path, fingerprint, character_id)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            "char_hero_back",
+            "character_sheet",
+            "https://r2.example/stories/story-x/assets/characters/hero/sheet_back_3.png?download=1",
+            "sha256:passed-back",
+            "hero",
+        ),
+    )
     client = KolorsClient(["k"], opener=sized_placeholder_opener("must-not-reroll"), live=False)
     chars, locs, props, interiors = harbor_mvp_cast()
     out = generate_asset_library(
@@ -509,4 +600,72 @@ def test_locked_front_reuses_side_back_for_turnaround(tmp_path):
     assert sources[0].endswith("sheet_front.png")
     assert sources[1].endswith("sheet_side_2.png")
     assert sources[2].endswith("sheet_back_3.png")
+    assert out["specs"]["char_hero_side"]["path"] == sources[1]
+    assert out["specs"]["char_hero_back"]["path"] == sources[2]
     assert (hero / TURNAROUND_FILENAME).is_file()
+
+
+def test_passed_turnaround_reuses_exact_evidenced_path(tmp_path):
+    conn = open_db(tmp_path / "s.sqlite")
+    migrate(conn)
+    hero = tmp_path / "assets" / "characters" / "hero"
+    hero.mkdir(parents=True)
+    files = {
+        FRONT_ALIAS_FILENAME: synthetic_still_png(
+            CHAR_VIEW_WIDTH,
+            CHAR_VIEW_HEIGHT,
+            tag="front",
+            placeholder=True,
+        ),
+        "sheet_side_2.png": synthetic_still_png(
+            CHAR_VIEW_WIDTH,
+            CHAR_VIEW_HEIGHT,
+            tag="side",
+            placeholder=True,
+        ),
+        "sheet_back_3.png": synthetic_still_png(
+            CHAR_VIEW_WIDTH,
+            CHAR_VIEW_HEIGHT,
+            tag="back",
+            placeholder=True,
+        ),
+        "sheet_turnaround_4.png": synthetic_still_png(
+            CHAR_VIEW_WIDTH * 3,
+            CHAR_VIEW_HEIGHT,
+            tag="turnaround",
+            placeholder=True,
+        ),
+    }
+    for filename, blob in files.items():
+        (hero / filename).write_bytes(blob)
+    lock_after_qc(tmp_path, character_id="hero", filename=FRONT_ALIAS_FILENAME, qc=pass_qc())
+    for filename in ("sheet_side_2.png", "sheet_back_3.png", "sheet_turnaround_4.png"):
+        record_qc_candidate(
+            tmp_path,
+            character_id="hero",
+            filename=filename,
+            qc=pass_qc(),
+        )
+
+    client = KolorsClient(["k"], opener=sized_placeholder_opener("must-not-reroll"), live=False)
+    chars, locs, props, interiors = harbor_mvp_cast()
+    out = generate_asset_library(
+        conn,
+        "story-x",
+        chars,
+        locs,
+        props,
+        client,
+        None,
+        "fiction",
+        tmp_path,
+        interiors=interiors,
+        skip_existing=True,
+        clip_scorer=passing_scorer(),
+    )
+
+    assert out["specs"]["char_hero_turnaround"]["path"] == (
+        "assets/characters/hero/sheet_turnaround_4.png"
+    )
+    assert (hero / "sheet_turnaround_4.png").read_bytes() == files["sheet_turnaround_4.png"]
+    assert not (hero / TURNAROUND_FILENAME).exists()

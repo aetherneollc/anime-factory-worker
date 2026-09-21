@@ -30,7 +30,6 @@ from anime_factory.asset_lock import (
     FRONT_ALIAS_FILENAME,
     PLATE_FILENAME,
     TURNAROUND_FILENAME,
-    append_history_file,
     has_locked_identity,
     has_locked_scene,
     is_qc_locked,
@@ -1065,14 +1064,17 @@ def _store_qc_outcome(
     if story_root is None:
         return
     kind = spec.get("kind")
-    if kind in {"prop", "character_turnaround"}:
-        if kind == "character_turnaround":
-            append_history_file(
-                story_root,
-                character_id=spec.get("character_id"),
-                filename=filename,
-                parent_id=spec.get("parent_id"),
-            )
+    if kind == "prop":
+        return
+    if kind == "character_turnaround":
+        record_qc_candidate(
+            story_root,
+            character_id=spec.get("character_id"),
+            filename=filename,
+            qc=qc,
+            parent_id=spec.get("parent_id"),
+            max_attempts=MAX_QC_ATTEMPTS,
+        )
         return
     cid = spec.get("character_id") if kind != "scene_plate" else None
     lid = spec.get("scene_id") if kind == "scene_plate" else None
@@ -1422,12 +1424,9 @@ def _bind_locked(
             return bool(cid) and cid in locked_idents
         return bool(cid) and is_qc_locked(story_root, character_id=cid)
     if kind in {"character_view_derive", "character_turnaround"}:
-        cid = str(spec.get("character_id") or "")
-        rel = spec.get("path")
-        locked = cid in locked_idents if locked_idents is not None else is_qc_locked(story_root, character_id=cid)
-        if not cid or not locked:
-            return False
-        return bool(rel) and still_file_ok(Path(story_root) / rel)
+        # The character lock points at the identity/front sheet. Derived views
+        # are reusable only through their own QC evidence, handled below.
+        return False
     if kind == "scene_plate":
         lid = str(spec.get("scene_id") or "")
         if locked_scenes is not None:
@@ -1702,22 +1701,83 @@ def _record_round_view(round_views: dict[str, dict[str, str]], spec: dict, rel: 
         round_views.setdefault(cid, {})[view] = rel
 
 
-def _reuse_existing_view(story_root: Path | None, spec: dict) -> str | None:
-    """Resume a locked identity without re-rolling side/back history files."""
-    if story_root is None or spec.get("kind") != "character_view_derive":
+def _normalized_stored_asset_relpath(value: Any) -> str | None:
+    """Map legacy relative/R2/URL paths back to the local assets/ subtree."""
+    text = str(value or "").replace("\\", "/").split("?", 1)[0].split("#", 1)[0]
+    parts = [part for part in text.strip().split("/") if part not in {"", "."}]
+    if ".." in parts or "assets" not in parts:
         return None
+    return "/".join(parts[parts.index("assets") :])
+
+
+def _specific_character_view_rel(
+    story_root: Path,
+    cid: str,
+    stem: str,
+    stored_path: Any,
+) -> str | None:
+    normalized = _normalized_stored_asset_relpath(stored_path)
+    name = Path(normalized or str(stored_path or "")).name
+    if not re.fullmatch(rf"{re.escape(stem)}(?:_\d+)?\.png", name):
+        return None
+    expected = character_asset_rel(cid, name)
+    if normalized is not None and normalized != expected:
+        return None
+    return expected if still_file_ok(Path(story_root) / expected) else None
+
+
+def _reuse_existing_view(
+    conn: sqlite3.Connection,
+    story_root: Path | None,
+    spec: dict,
+) -> str | None:
+    """Reuse an exact side/back/turnaround only when successful QC left evidence."""
+    if story_root is None:
+        return None
+    kind = str(spec.get("kind") or "")
     cid = str(spec.get("character_id") or "")
     view = str(spec.get("view") or "")
-    if not cid or view not in {"side", "back"}:
+    if kind == "character_view_derive" and view in {"side", "back"}:
+        stem = f"sheet_{view}"
+    elif kind == "character_turnaround":
+        stem = "sheet_turnaround"
+    else:
         return None
-    folder = Path(story_root) / "assets" / "characters" / cid
-    if not folder.is_dir():
+    if not cid:
         return None
-    matches = [path for path in folder.glob(f"sheet_{view}*.png") if still_file_ok(path)]
-    if not matches:
+
+    rec = (load_assets_index(story_root).get("characters") or {}).get(cid) or {}
+    for candidate in reversed(rec.get("candidates") or []):
+        if not isinstance(candidate, dict) or candidate.get("verdict") != "pass":
+            continue
+        rel = _specific_character_view_rel(
+            Path(story_root),
+            cid,
+            stem,
+            candidate.get("filename"),
+        )
+        if rel:
+            return rel
+
+    try:
+        cols = _asset_columns(conn)
+        selected = ", selected_image_id" if "selected_image_id" in cols else ""
+        row = conn.execute(
+            f"SELECT path{selected} FROM assets WHERE id = ?",
+            (str(spec.get("id") or ""),),
+        ).fetchone()
+    except sqlite3.Error:
+        row = None
+    if row is None:
         return None
-    matches.sort(key=lambda path: path.stat().st_mtime)
-    return str(matches[-1].relative_to(story_root))
+    stored_values = [row["path"]]
+    if "selected_image_id" in row.keys():
+        stored_values.append(row["selected_image_id"])
+    for stored in stored_values:
+        rel = _specific_character_view_rel(Path(story_root), cid, stem, stored)
+        if rel:
+            return rel
+    return None
 
 
 def generate_asset_library(
@@ -1754,11 +1814,21 @@ def generate_asset_library(
     regen = _regen_set(story_root)
 
     def emit(batch: dict[str, dict]) -> None:
+        def block(asset_id: str) -> None:
+            if asset_id and asset_id not in needs_human:
+                needs_human.append(asset_id)
+
         for aid, spec in batch.items():
             rel = spec["path"]
             kind = str(spec.get("kind") or "")
             force = _force_regen(regen, spec)
             if story_root is not None and not _parent_ready(story_root, spec) and not force:
+                parent = str(spec.get("parent_id") or spec.get("character_id") or "")
+                if kind in {"character_view_derive", "character_turnaround", "costume_derive"}:
+                    block(f"char_{parent}_sheet")
+                elif kind in {"scene_plate", "scene_derive"} and parent:
+                    block(f"plate_{parent}")
+                block(aid)
                 continue
             if (
                 story_root is not None
@@ -1783,8 +1853,8 @@ def generate_asset_library(
                         write_front_alias(locked)
                 continue
             reused = (
-                _reuse_existing_view(story_root, spec)
-                if story_root is not None and skip_existing and not force
+                _reuse_existing_view(conn, story_root, spec)
+                if story_root is not None and not force
                 else None
             )
             if reused:
@@ -1806,7 +1876,11 @@ def generate_asset_library(
                 cid = str(spec.get("character_id") or "")
                 views = round_views.get(cid) or {}
                 if not (views.get("front") and views.get("side") and views.get("back")):
-                    needs_human.append(aid)
+                    for view in ("front", "side", "back"):
+                        if views.get(view):
+                            continue
+                        block(f"char_{cid}_{'sheet' if view == 'front' else view}")
+                    block(aid)
                     continue
                 spec["source_paths"] = [views["front"], views["side"], views["back"]]
             if force and story_root is not None:
@@ -1838,7 +1912,7 @@ def generate_asset_library(
                     "character_view_derive",
                     "character_turnaround",
                 }:
-                    needs_human.append(aid)
+                    block(aid)
                 continue
             rel = written
             _record_round_view(round_views, spec, rel)
