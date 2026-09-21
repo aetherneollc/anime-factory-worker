@@ -10,7 +10,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-from anime_factory.board import assert_still_prompt_clean, shot_visual_prompt
+from anime_factory.board import assert_still_prompt_clean, scrub_still_prompt, shot_visual_prompt
 from anime_factory.continuity_gates import gate3_assets
 from anime_factory.design import (
     KolorsClient,
@@ -197,7 +197,7 @@ def compose_cut_still_prompt(segment: dict, cut: dict, *, story_root: Path | Non
     size = str(cut.get("size") or "MS").strip()
     parts.append(f"framing {size}")
     visual = ", ".join(p for p in parts if p)
-    return visual or shot_visual_prompt(segment)
+    return scrub_still_prompt(visual) or shot_visual_prompt(segment)
 
 
 def _mint_still(
@@ -212,6 +212,7 @@ def _mint_still(
     world_mode: str,
     story_root: Path | None,
 ) -> None:
+    prompt = scrub_still_prompt(prompt)
     assert_still_prompt_clean(prompt, label=label)
     prefix, bible_negative = style_md_prefix(story_root)
     positives, negatives = period_lists(period_md, world_mode)

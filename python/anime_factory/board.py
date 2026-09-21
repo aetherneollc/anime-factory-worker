@@ -56,6 +56,7 @@ __all__ = [
     "assert_shot_prompt_diversity",
     "assert_speaker_matches_frame",
     "assert_still_prompt_clean",
+    "scrub_still_prompt",
     "board_from_script",
     "board_totals",
     "choose_h3_mode",
@@ -136,6 +137,19 @@ def shot_visual_prompt(shot: dict) -> str:
 def shot_motion_prompt(shot: dict) -> str:
     """The H3 video prompt: Chinese, @tags, camera direction, H3_TAIL."""
     return str(shot.get("h3_prompt") or "").strip()
+
+
+def scrub_still_prompt(prompt: str) -> str:
+    """Drop H3 video markers so a cut.frame_prompt can still be drawn as a still.
+
+    H3 v2 stores `@character` / `@scene` in cut.frame_prompt. Those are video
+    cite tokens; SDXL stills want the same English staging without `@`.
+    """
+    text = str(prompt or "").strip()
+    text = re.sub(r"<<<image_\d+>>>", " ", text, flags=re.I)
+    text = re.sub(r"@([A-Za-z0-9_-]+)", r"\1", text)
+    text = re.sub(r"\s+", " ", text).strip(" ,")
+    return text
 
 
 def assert_still_prompt_clean(prompt: str, *, label: str = "still") -> str:

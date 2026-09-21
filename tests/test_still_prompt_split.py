@@ -78,6 +78,18 @@ def test_assert_still_prompt_clean_accepts_a_still_description():
     assert assert_still_prompt_clean(prompt) == prompt
 
 
+def test_scrub_still_prompt_drops_at_tags_from_h3_cut_frames():
+    from anime_factory.board import scrub_still_prompt
+
+    clean = scrub_still_prompt(
+        "@lin-xiao at @start-lot, low angle on front wheel, dawn fog, empty asphalt around, anime background"
+    )
+    assert "@" not in clean
+    assert "lin-xiao" in clean
+    assert "start-lot" in clean
+    assert_still_prompt_clean(clean)
+
+
 def test_still_prompt_text_strips_cineflow_and_chinese_staging():
     dirty = "[镜头1：中近景] First: @阿柯 站在便利店中, camera pans left, Then: she looks up, shot 3 of 9, 1280x720"
     clean = still_prompt_text(dirty)
