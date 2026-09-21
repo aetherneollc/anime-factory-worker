@@ -16,6 +16,8 @@ from anime_factory.models import (
     H3_MAX_REFS,
     H3_OOM_FALLBACK_HEIGHT,
     H3_OOM_FALLBACK_WIDTH,
+    H3_OOM_SAFE_HEIGHT,
+    H3_OOM_SAFE_WIDTH,
     VIDEO_HEIGHT,
     VIDEO_WIDTH,
 )
@@ -47,10 +49,24 @@ H3_NATIVE_WIDTH = H3_GEN_WIDTH
 H3_NATIVE_HEIGHT = H3_GEN_HEIGHT
 H3_LOW_VRAM_WIDTH = H3_OOM_FALLBACK_WIDTH
 H3_LOW_VRAM_HEIGHT = H3_OOM_FALLBACK_HEIGHT
+H3_SAFE_WIDTH = H3_OOM_SAFE_WIDTH
+H3_SAFE_HEIGHT = H3_OOM_SAFE_HEIGHT
 H3_NATIVE_VRAM_MB = 32_000
 H3_LOW_VRAM_HEAD_CHUNKS = 16
 H3_LOW_VRAM_FF_CHUNKS = 8
 H3_LOW_VRAM_SEQ_THRESHOLD = 4096
+H3_SAFE_HEAD_CHUNKS = 32
+H3_SAFE_FF_CHUNKS = 16
+H3_OOM_MAX_TIER = 2
+# Chain tails add AddGuide + last-frame on top of a resident DiT. A 32GB card
+# that is already ~29.6 GiB full cannot survive another 1024×576 sample — the
+# old 480p retry ran only *after* that OOM, which SIGKILL'd the box.
+H3_TIER0_MIN_FREE_MB = 8192
+H3_TIER1_MIN_FREE_MB = 6144
+
+
+class H3ShotOomRefused(RuntimeError):
+    """Shot refused after safe canvases; the worker process must stay alive."""
 
 _H3_OOM_MARKERS = (
     "out of memory",
@@ -97,6 +113,74 @@ def is_h3_oom(error: BaseException | str | None) -> bool:
     if re.search(r"\boom\b", text):
         return True
     return False
+
+
+def is_chain_tail(segment: dict | None) -> bool:
+    if not segment:
+        return False
+    return int(segment.get("chain_index") or 0) > 0 or bool(segment.get("chain_source_last_frame"))
+
+
+def gpu_vram_used_mb() -> int | None:
+    """Return used VRAM in MiB from nvidia-smi; None when the probe fails."""
+    try:
+        raw = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used",
+                "--format=csv,noheader,nounits",
+            ],
+            timeout=10,
+            stderr=subprocess.DEVNULL,
+        ).decode("utf-8", "replace")
+        first = raw.strip().splitlines()[0] if raw.strip() else ""
+        return int(float(first)) if first else None
+    except Exception:  # noqa: BLE001 — hardware probe only
+        return None
+
+
+def resolve_h3_oom_tier(segment: dict, *, oom_fallback: bool | None = None) -> int:
+    """0 = 1024×576, 1 = 864×480, 2 = 640×352."""
+    if oom_fallback is False:
+        return 0
+    raw = segment.get("h3_oom_tier")
+    if raw is not None and str(raw).strip() != "":
+        try:
+            return max(0, min(H3_OOM_MAX_TIER, int(raw)))
+        except (TypeError, ValueError):
+            pass
+    if oom_fallback or segment.get("h3_oom_fallback") or segment.get("h3_downgraded"):
+        return 1
+    return 0
+
+
+def choose_h3_start_tier(
+    segment: dict,
+    *,
+    used_mb: int | None = None,
+    total_mb: int | None = None,
+) -> int:
+    """Pick the first canvas that can run without SIGKILL on a nearly-full card.
+
+    Heads keep 1024×576. Chain tails that already sit on ~29.6/32 GiB start at
+    864×480 or 640×352 *before* the first sample, because the old retry only
+    downshifted after CUDA OOM — which killed the box.
+    """
+    latched = resolve_h3_oom_tier(segment)
+    free_mb = None
+    if used_mb is not None and total_mb is not None and int(total_mb) > 0:
+        free_mb = max(0, int(total_mb) - int(used_mb))
+    needed = 0
+    if is_chain_tail(segment):
+        if free_mb is None:
+            needed = 1
+        elif free_mb < H3_TIER1_MIN_FREE_MB:
+            needed = 2
+        elif free_mb < H3_TIER0_MIN_FREE_MB:
+            needed = 1
+        else:
+            needed = 0
+    return max(latched, needed)
 
 
 def prune_empty_last_frame(workflow: dict) -> dict:
@@ -366,24 +450,32 @@ def h3_resolution_profile(
     *,
     oom_fallback: bool | None = None,
 ) -> dict[str, Any]:
-    """Primary 1024×576 delivery-upscaled to 1280×720; OOM latch uses 864×480."""
-    use_fallback = bool(
-        oom_fallback
-        if oom_fallback is not None
-        else segment.get("h3_oom_fallback") or segment.get("h3_downgraded")
-    )
-    if use_fallback:
+    """Primary 1024×576; OOM latch 864×480; last-resort chain-tail canvas 640×352."""
+    tier_n = resolve_h3_oom_tier(segment, oom_fallback=oom_fallback)
+    if tier_n >= 2:
+        gen_w = H3_OOM_SAFE_WIDTH
+        gen_h = H3_OOM_SAFE_HEIGHT
+        tier = "oom_fallback_352p"
+        downgraded = True
+        reason = str(segment.get("h3_downgrade_reason") or "oom_fallback_safe")
+        head_chunks = H3_SAFE_HEAD_CHUNKS
+        chunks = H3_SAFE_FF_CHUNKS
+    elif tier_n >= 1:
         gen_w = H3_OOM_FALLBACK_WIDTH
         gen_h = H3_OOM_FALLBACK_HEIGHT
         tier = "oom_fallback_480p"
         downgraded = True
         reason = str(segment.get("h3_downgrade_reason") or "oom_fallback")
+        head_chunks = H3_LOW_VRAM_HEAD_CHUNKS
+        chunks = H3_LOW_VRAM_FF_CHUNKS
     else:
         gen_w = H3_GEN_WIDTH
         gen_h = H3_GEN_HEIGHT
         tier = "gen_576p"
         downgraded = False
         reason = "primary_1024x576"
+        head_chunks = H3_LOW_VRAM_HEAD_CHUNKS
+        chunks = H3_LOW_VRAM_FF_CHUNKS
     vram_mb = gpu_vram_mb() if detected_vram_mb is None else detected_vram_mb
     width = _align_dim(int(segment.get("width") or gen_w), gen_w)
     height = _align_dim(int(segment.get("height") or gen_h), gen_h)
@@ -396,11 +488,12 @@ def h3_resolution_profile(
         "height": height,
         "delivery_width": VIDEO_WIDTH,
         "delivery_height": VIDEO_HEIGHT,
-        "head_chunks": H3_LOW_VRAM_HEAD_CHUNKS,
-        "chunks": H3_LOW_VRAM_FF_CHUNKS,
+        "head_chunks": head_chunks,
+        "chunks": chunks,
         "seq_threshold": H3_LOW_VRAM_SEQ_THRESHOLD,
         "vram_mb": vram_mb,
         "tier": tier,
+        "oom_tier": tier_n,
         "downgraded": downgraded,
         "reason": reason,
     }
@@ -412,18 +505,27 @@ def h3_spatial_size(segment: dict, *, oom_fallback: bool | None = None) -> tuple
     return int(profile["width"]), int(profile["height"])
 
 
-def _low_vram_model_chain(unet_node: str = "1") -> dict[str, Any]:
+def _low_vram_model_chain(
+    unet_node: str = "1",
+    *,
+    head_chunks: int | None = None,
+    chunks: int | None = None,
+    seq_threshold: int | None = None,
+) -> dict[str, Any]:
     return {
         "lv_attn": {
             "class_type": "MiniMaxLowVRAMAttention",
-            "inputs": {"model": [unet_node, 0], "head_chunks": H3_LOW_VRAM_HEAD_CHUNKS},
+            "inputs": {
+                "model": [unet_node, 0],
+                "head_chunks": int(head_chunks or H3_LOW_VRAM_HEAD_CHUNKS),
+            },
         },
         "lv_ff": {
             "class_type": "MiniMaxChunkFeedForward",
             "inputs": {
                 "model": ["lv_attn", 0],
-                "chunks": H3_LOW_VRAM_FF_CHUNKS,
-                "seq_threshold": H3_LOW_VRAM_SEQ_THRESHOLD,
+                "chunks": int(chunks or H3_LOW_VRAM_FF_CHUNKS),
+                "seq_threshold": int(seq_threshold or H3_LOW_VRAM_SEQ_THRESHOLD),
             },
         },
     }
@@ -445,7 +547,8 @@ def native_h3_graph(segment: dict, mode: str) -> dict:
         )
     unet = REF2VA_UNET if mode == "ref2va" else FL2VA_UNET
     cond_type = "MiniMaxH3ReferenceToVideo" if mode == "ref2va" else "MiniMaxH3ImageToVideo"
-    width, height = h3_spatial_size(segment)
+    profile = h3_resolution_profile(segment)
+    width, height = int(profile["width"]), int(profile["height"])
     cond_inputs: dict[str, Any] = {
         "clip": ["2", 0],
         "vae": ["3", 0],
@@ -527,7 +630,13 @@ def native_h3_graph(segment: dict, mode: str) -> dict:
             },
         },
     }
-    graph.update(_low_vram_model_chain())
+    graph.update(
+        _low_vram_model_chain(
+            head_chunks=int(profile["head_chunks"]),
+            chunks=int(profile["chunks"]),
+            seq_threshold=int(profile["seq_threshold"]),
+        )
+    )
     if mode == "ref2va":
         for i, filename in enumerate(ref_image_filenames(segment)):
             graph[f"r{i + 1}"] = {

@@ -10,12 +10,16 @@ from anime_factory.models import (
     H3_GEN_WIDTH,
     H3_OOM_FALLBACK_HEIGHT,
     H3_OOM_FALLBACK_WIDTH,
+    H3_OOM_SAFE_HEIGHT,
+    H3_OOM_SAFE_WIDTH,
     VIDEO_HEIGHT,
     VIDEO_WIDTH,
 )
 from gpu_worker import session
 from gpu_worker.h3 import (
+    H3ShotOomRefused,
     apply_chain_first_frame,
+    choose_h3_start_tier,
     h3_resolution_profile,
     is_h3_oom,
     native_h3_graph,
@@ -43,6 +47,27 @@ def test_oom_fallback_resolution_is_864x480():
     )
     assert profile["downgraded"] is True
     assert profile["tier"] == "oom_fallback_480p"
+    assert profile["oom_tier"] == 1
+
+
+def test_oom_safe_resolution_is_640x352():
+    profile = h3_resolution_profile({"h3_oom_tier": 2})
+    assert (profile["gen_width"], profile["gen_height"]) == (
+        H3_OOM_SAFE_WIDTH,
+        H3_OOM_SAFE_HEIGHT,
+    )
+    assert profile["downgraded"] is True
+    assert profile["tier"] == "oom_fallback_352p"
+    assert profile["oom_tier"] == 2
+    assert profile["head_chunks"] == 32
+    assert profile["chunks"] == 16
+    graph = native_h3_graph(
+        {"id": "E01-02", "first_frame_path": "f1.png", "h3_oom_tier": 2},
+        "fl2va_first",
+    )
+    assert graph["6"]["inputs"]["width"] == H3_OOM_SAFE_WIDTH
+    assert graph["6"]["inputs"]["height"] == H3_OOM_SAFE_HEIGHT
+    assert graph["lv_attn"]["inputs"]["head_chunks"] == 32
 
 
 def test_native_graph_wires_low_vram_nodes_between_unet_and_sigma():
@@ -128,37 +153,160 @@ def test_cpu_post_queue_drains_background_upload(tmp_path, monkeypatch):
     cpu.close()
 
 
-def test_h3_oom_retries_once_then_fail_closed(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        session,
-        "_board_shots",
-        lambda _root: [{"id": "E01-01", "duration": 8, "h3_mode": "fl2va_first", "first_frame_path": "f1.png"}],
-    )
-    monkeypatch.setattr(session, "lock_video_backend", lambda **_k: "h3")
-    monkeypatch.setattr(session, "existing_generation_file", lambda *_a, **_k: None)
-    monkeypatch.setattr(session, "next_generation_path", lambda *_a, **_k: (1, "episodes/EP001/shots/E01-01/v001.mp4"))
-    monkeypatch.setattr(session, "H3PrepPool", lambda stage_fn: MagicMock(prime=stage_fn, schedule=lambda *_a: None, close=lambda: None))
-    monkeypatch.setattr(session, "_upload_h3_inputs", lambda *_a, **_k: None)
-    calls = {"n": 0}
+def test_choose_h3_start_tier_heads_stay_native_when_vram_is_full():
+    head = {"id": "E01-01", "chain_index": 0}
+    assert choose_h3_start_tier(head, used_mb=29_600, total_mb=32_768) == 0
+    assert choose_h3_start_tier(head, used_mb=None, total_mb=None) == 0
+
+
+def test_choose_h3_start_tier_chain_tails_start_at_480p_or_352p():
+    tail = {"id": "E01-02", "chain_index": 1, "chain_source_last_frame": "prev.png"}
+    assert choose_h3_start_tier(tail, used_mb=20_000, total_mb=32_768) == 0
+    assert choose_h3_start_tier(tail, used_mb=25_768, total_mb=32_768) == 1
+    assert choose_h3_start_tier(tail, used_mb=29_600, total_mb=32_768) == 2
+    assert choose_h3_start_tier(tail, used_mb=None, total_mb=None) == 1
+    latched = {**tail, "h3_oom_tier": 1}
+    assert choose_h3_start_tier(latched, used_mb=29_600, total_mb=32_768) == 2
+
+
+def test_sample_h3_probes_occupancy_before_free_and_starts_tail_at_352p(tmp_path, monkeypatch):
+    order: list[object] = []
+
+    def used():
+        order.append("probe")
+        return 29_600
+
+    def total():
+        return 32_768
+
+    def reclaim(**_kw):
+        order.append("free")
+        return {"ok": True}
 
     def boom(_router, shot, _root, dest, progress=None):
-        calls["n"] += 1
+        order.append(("sample", shot.get("h3_oom_tier"), shot.get("h3_oom_fallback")))
         raise RuntimeError("CUDA out of memory")
 
+    monkeypatch.setattr(session, "gpu_vram_used_mb", used)
+    monkeypatch.setattr(session, "gpu_vram_mb", total)
+    monkeypatch.setattr(session, "_submit_h3_gpu", boom)
+    router = MagicMock()
+    router.free = MagicMock(side_effect=reclaim)
+    shot = {
+        "id": "E01-02",
+        "duration": 8,
+        "chain_index": 1,
+        "chain_source_last_frame": "prev.png",
+        "first_frame_path": "prev.png",
+        "h3_mode": "fl2va_first",
+    }
+    try:
+        session._sample_h3_with_oom_policy(
+            router, shot, tmp_path, tmp_path / "v001.mp4", None, "fl2va_first", {}
+        )
+    except H3ShotOomRefused as exc:
+        assert "h3_oom_shot_refused" in str(exc)
+        assert "h3_fail_closed" not in str(exc)
+        assert "640x352" in str(exc)
+    else:
+        raise AssertionError("expected H3ShotOomRefused after safe canvas")
+    assert order[0] == "probe"
+    assert "free" in order
+    assert order.index("probe") < order.index("free")
+    samples = [item for item in order if isinstance(item, tuple) and item[0] == "sample"]
+    assert samples == [("sample", 2, True)]
+
+
+def test_sample_h3_head_walks_tiers_then_refuses_without_fail_closed(tmp_path, monkeypatch):
+    seen: list[int] = []
+
+    def boom(_router, shot, _root, dest, progress=None):
+        seen.append(int(shot.get("h3_oom_tier")))
+        raise RuntimeError("CUDA out of memory")
+
+    monkeypatch.setattr(session, "gpu_vram_used_mb", lambda: 10_000)
+    monkeypatch.setattr(session, "gpu_vram_mb", lambda: 32_768)
+    monkeypatch.setattr(session, "_submit_h3_gpu", boom)
     router = MagicMock()
     router.free = MagicMock(return_value={"ok": True})
-    monkeypatch.setattr(session, "_submit_h3_gpu", boom)
+    shot = {"id": "E01-01", "duration": 8, "h3_mode": "fl2va_first", "first_frame_path": "f1.png"}
     try:
-        session.run_anim("story-1", tmp_path, object(), router=router, progress=None)
-    except RuntimeError as exc:
-        assert "h3_fail_closed" in str(exc)
-        assert "oom_downshift_exhausted" in str(exc)
-        assert "gen_480p" in str(exc)
-        assert "fallback_tier" in str(exc)
+        session._sample_h3_with_oom_policy(
+            router, shot, tmp_path, tmp_path / "v001.mp4", None, "fl2va_first", {}
+        )
+    except H3ShotOomRefused as exc:
+        assert "h3_oom_shot_refused" in str(exc)
+        assert "h3_fail_closed" not in str(exc)
     else:
-        raise AssertionError("expected fail-closed after fallback OOM")
-    assert calls["n"] == 2
-    router.free.assert_called_once()
+        raise AssertionError("expected H3ShotOomRefused after safe canvas")
+    assert seen == [0, 1, 2]
+    assert router.free.call_count == 3
+
+
+def test_h3_oom_skips_shot_without_killing_episode(tmp_path, monkeypatch):
+    shots = [
+        {"id": "E01-01", "duration": 8, "h3_mode": "fl2va_first", "first_frame_path": "f1.png"},
+        {"id": "E01-02", "duration": 8, "h3_mode": "fl2va_first", "first_frame_path": "f2.png"},
+    ]
+    monkeypatch.setattr(session, "_board_shots", lambda _root: shots)
+    monkeypatch.setattr(session, "lock_video_backend", lambda **_k: "h3")
+    monkeypatch.setattr(session, "existing_generation_file", lambda *_a, **_k: None)
+    monkeypatch.setattr(session, "select_passing_generation", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        session,
+        "next_generation_path",
+        lambda _root, sid: (1, f"episodes/EP001/shots/{sid}/v001.mp4"),
+    )
+
+    class _NoopPrepPool:
+        def __init__(self, stage_fn):
+            self._stage_fn = stage_fn
+
+        def prime(self, shot):
+            return self._stage_fn(shot)
+
+        def schedule(self, shot):
+            return None
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(session, "H3PrepPool", _NoopPrepPool)
+    monkeypatch.setattr(session, "gpu_vram_used_mb", lambda: 10_000)
+    monkeypatch.setattr(session, "gpu_vram_mb", lambda: 32_768)
+
+    def submit(_router, shot, _root, dest, progress=None):
+        if shot["id"] == "E01-01":
+            raise RuntimeError("CUDA out of memory")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"x" * 5000)
+        last = tmp_path / "last.png"
+        last.write_bytes(b"\x89PNG" + b"x" * 64)
+        shot["last_frame_path"] = str(last)
+        return {"shot": shot["id"]}
+
+    monkeypatch.setattr(session, "_submit_h3_gpu", submit)
+    monkeypatch.setattr(session, "_normalize_h3_for_qc", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        session,
+        "_probe_video",
+        lambda _path: {"width": 1280, "height": 720, "duration": 8, "frames": 192, "size_bytes": 5000},
+    )
+    monkeypatch.setattr(session, "incremental_qc_segment", lambda *_a, **_k: "pass")
+    monkeypatch.setattr(session, "mark_completed_passing", lambda *_a, **_k: None)
+    monkeypatch.setattr(session, "record_generation_result", lambda *_a, **_k: None)
+    monkeypatch.setattr(session, "put_file", lambda *_a, **_k: {"ok": True})
+    monkeypatch.setattr(session, "_checkpoint_story", lambda *_a, **_k: {"ok": True})
+    monkeypatch.setattr(session, "_db_execute", lambda *_a, **_k: None)
+    router = MagicMock()
+    router.free = MagicMock(return_value={"ok": True})
+    result = session.run_anim("story-1", tmp_path, object(), router=router, progress=None)
+    assert result["generated"] == ["E01-02"]
+    assert len(result["failed"]) == 1
+    assert result["failed"][0]["id"] == "E01-01"
+    assert "h3_oom_shot_refused" in str(result["failed"][0]["error"])
+    assert "h3_fail_closed" not in str(result["failed"][0]["error"])
+    assert result["gpu_done"] is False
 
 
 def test_offers_require_64gb_ram_and_cuda_13():

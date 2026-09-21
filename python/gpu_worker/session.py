@@ -66,11 +66,15 @@ from gpu_worker.boot import (
 )
 from gpu_worker.comfy import ComfyRouter, extract_execution_error, format_execution_error
 from gpu_worker.h3 import (
+    H3ShotOomRefused,
     apply_chain_first_frame,
+    choose_h3_start_tier,
     extract_last_frame,
-    h3_resolution_profile,
-    is_directory_like,
     gpu_vram_mb,
+    gpu_vram_used_mb,
+    h3_resolution_profile,
+    is_chain_tail,
+    is_directory_like,
     is_h3_oom,
     prepare_workflow,
     ref_image_filenames,
@@ -1815,6 +1819,103 @@ def _submit_h3_gpu(
     return {"shot": shot["id"], "path": str(dest), "bytes": len(blob), "last_frame": shot.get("last_frame_path")}
 
 
+def _reclaim_h3_vram(router: ComfyRouter | None) -> None:
+    """Drop cached H3/SDXL weights and activations before a chain tail or OOM retry."""
+    if router is None:
+        return
+    free = getattr(router, "free", None)
+    if not callable(free):
+        return
+    try:
+        free(unload_models=True, free_memory=True)
+    except Exception:  # noqa: BLE001 — still try the smaller canvas
+        return
+
+
+def _sample_h3_with_oom_policy(
+    router: ComfyRouter,
+    shot: dict,
+    root: Path,
+    dest: Path,
+    progress: ProgressCallback | None,
+    used_mode: str,
+    mode_fallback_latched: dict[str, bool],
+) -> tuple[dict, float]:
+    """Sample one shot. Downshift canvases on OOM; refuse the shot instead of SIGKILL.
+
+    Probe occupancy *before* reclaiming so a 29.6/32 GiB card still starts a chain
+    tail at 480p/352p. Freeing first would make the card look empty and send the
+    tail back into 1024×576 — the sample that SIGKILL'd the box.
+    """
+    sid = str(shot.get("id") or "")
+    used_mb = gpu_vram_used_mb()
+    total_mb = gpu_vram_mb()
+    if is_chain_tail(shot):
+        _reclaim_h3_vram(router)
+    start_tier = choose_h3_start_tier(
+        shot,
+        used_mb=used_mb,
+        total_mb=total_mb,
+    )
+    if mode_fallback_latched.get(used_mode):
+        start_tier = max(start_tier, 1)
+    last_exc: BaseException | None = None
+    for tier in range(start_tier, 3):
+        shot = dict(shot)
+        shot["h3_oom_tier"] = tier
+        shot["h3_oom_fallback"] = tier >= 1
+        if tier >= 1 and not shot.get("h3_downgrade_reason"):
+            shot["h3_downgrade_reason"] = (
+                "chain_tail_vram_headroom" if last_exc is None else "oom_primary"
+            )
+        profile = h3_resolution_profile(shot)
+        print(
+            {
+                "h3_submit": sid,
+                "mode": used_mode,
+                "backend": "h3",
+                "chain_index": shot.get("chain_index", 0),
+                "oom_tier": tier,
+                "gen_width": profile.get("gen_width"),
+                "gen_height": profile.get("gen_height"),
+                "downgraded": profile.get("downgraded"),
+            },
+            flush=True,
+        )
+        try:
+            sample_t0 = time.monotonic()
+            _submit_h3_gpu(router, shot, root, dest, progress)
+            return shot, time.monotonic() - sample_t0
+        except (BudgetExceeded, ProgressStalled, StartupTimeout):
+            raise
+        except Exception as exc:  # noqa: BLE001 — OOM downshift or refuse shot
+            last_exc = exc
+            if recycle_failure_class(exc):
+                raise
+            if is_h3_oom(exc):
+                _reclaim_h3_vram(router)
+                mode_fallback_latched[used_mode] = True
+                print(
+                    {
+                        "h3_oom_downgrade": sid,
+                        "mode": used_mode,
+                        "tier": tier,
+                        "backend": "h3",
+                    },
+                    flush=True,
+                )
+                continue
+            raise
+    profile = h3_resolution_profile(
+        {**shot, "h3_oom_tier": 2, "h3_oom_fallback": True},
+        oom_fallback=True,
+    )
+    raise H3ShotOomRefused(
+        f"h3_oom_shot_refused: safe_canvas_exhausted shot={sid} "
+        f"canvas={profile.get('gen_width')}x{profile.get('gen_height')}"
+    ) from last_exc
+
+
 def _submit_h3(
     router: ComfyRouter,
     shot: dict,
@@ -2548,69 +2649,28 @@ def _run_anim_h3(
                 dest = root / rel
                 used_mode = select_mode(shot)
                 session_tracker.note_mode(used_mode)
-                use_fallback = bool(mode_fallback_latched.get(used_mode) or shot.get("h3_oom_fallback"))
-                if use_fallback:
-                    shot = dict(shot, h3_oom_fallback=True)
+                try:
+                    shot, sample_s = _sample_h3_with_oom_policy(
+                        router,
+                        shot,
+                        root,
+                        dest,
+                        progress,
+                        used_mode,
+                        mode_fallback_latched,
+                    )
                     shots[index] = shot
-                profile = h3_resolution_profile(shot, oom_fallback=use_fallback)
-                print(
-                    {
-                        "h3_submit": sid,
-                        "mode": used_mode,
-                        "backend": "h3",
-                        "chain_index": shot.get("chain_index", 0),
-                        "gen_width": profile.get("gen_width"),
-                        "gen_height": profile.get("gen_height"),
-                        "downgraded": profile.get("downgraded"),
-                    },
-                    flush=True,
-                )
-                submit_error: BaseException | None = None
-                oom_retried = False
-                sample_s = 0.0
-                for submit_attempt in range(2):
-                    try:
-                        sample_t0 = time.monotonic()
-                        _submit_h3_gpu(router, shot, root, dest, progress)
-                        sample_s = time.monotonic() - sample_t0
-                        submit_error = None
-                        break
-                    except (BudgetExceeded, ProgressStalled, StartupTimeout):
-                        raise
-                    except Exception as exc:  # noqa: BLE001 — OOM downgrade or fail closed
-                        submit_error = exc
-                        if recycle_failure_class(exc):
-                            break
-                        if is_h3_oom(exc) and not oom_retried:
-                            router.free()
-                            oom_retried = True
-                            mode_fallback_latched[used_mode] = True
-                            shot = dict(
-                                shot,
-                                h3_oom_fallback=True,
-                                h3_downgrade_reason="oom_primary",
-                            )
-                            shots[index] = shot
-                            print(
-                                {
-                                    "h3_oom_downgrade": sid,
-                                    "mode": used_mode,
-                                    "attempt": submit_attempt + 1,
-                                    "backend": "h3",
-                                },
-                                flush=True,
-                            )
-                            continue
-                        if is_h3_oom(exc):
-                            raise RuntimeError(
-                                f"h3_fail_closed: oom_downshift_exhausted gen_480p fallback_tier 864x480 shot={sid}"
-                            ) from exc
-                        break
-                if submit_error is not None:
-                    classified = recycle_failure_class(submit_error)
-                    if classified:
-                        raise RuntimeError(f"{classified}:{submit_error}") from submit_error
-                    raise submit_error
+                except H3ShotOomRefused as exc:
+                    print(
+                        {
+                            "h3_oom_skip": sid,
+                            "error": str(exc)[:800],
+                            "backend": "h3",
+                        },
+                        flush=True,
+                    )
+                    failed.append({"id": sid, "error": str(exc)[:800]})
+                    continue
                 final_profile = h3_resolution_profile(
                     shot,
                     oom_fallback=bool(shot.get("h3_oom_fallback")),
@@ -2694,7 +2754,30 @@ def _run_anim_h3(
                         },
                         flush=True,
                     )
-                    _submit_h3_gpu(router, shot, root, dest, progress)
+                    try:
+                        shot, _repair_s = _sample_h3_with_oom_policy(
+                            router,
+                            shot,
+                            root,
+                            dest,
+                            progress,
+                            used_mode,
+                            mode_fallback_latched,
+                        )
+                        shots[index] = shot
+                    except H3ShotOomRefused as exc:
+                        print(
+                            {
+                                "h3_oom_skip": sid,
+                                "error": str(exc)[:800],
+                                "backend": "h3",
+                                "phase": "repair",
+                            },
+                            flush=True,
+                        )
+                        failed.append({"id": sid, "error": str(exc)[:800]})
+                        verdict = "oom_skip"
+                        break
                     last_path = _ensure_last_frame(root, shot, dest)
                     if last_path is not None:
                         _link_next_chain(shots, index, last_path)
@@ -2710,7 +2793,7 @@ def _run_anim_h3(
                         last_path,
                         progress,
                     )
-                else:
+                elif verdict != "oom_skip":
                     failed.append({"id": sid, "verdict": verdict})
                 if next_shot is not None and int(next_shot.get("chain_index") or 0) > 0:
                     prep_pool.schedule(dict(next_shot))

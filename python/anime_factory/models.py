@@ -141,12 +141,15 @@ def scrub_copycat(text: str) -> str:
     return cleaned.strip(" ,")
 
 
-# H3 generates 1024×576 (primary) or 864×480 (OOM fallback). Both scale to delivery
-# 1280×720 at session normalize. Odd sizes break the 32px latent grid.
+# H3 generates 1024×576 (primary), 864×480 (first OOM fallback), or 640×352
+# (chain-tail / last-resort canvas). All scale to delivery 1280×720 at session
+# normalize. Odd sizes break the 32px latent grid; 640×360 is not aligned.
 H3_GEN_WIDTH = 1024
 H3_GEN_HEIGHT = 576
 H3_OOM_FALLBACK_WIDTH = 864
 H3_OOM_FALLBACK_HEIGHT = 480
+H3_OOM_SAFE_WIDTH = 640
+H3_OOM_SAFE_HEIGHT = 352
 VIDEO_WIDTH = 1280
 VIDEO_HEIGHT = 720
 VIDEO_FPS = 24

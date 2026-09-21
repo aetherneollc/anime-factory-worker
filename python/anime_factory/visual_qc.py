@@ -278,7 +278,13 @@ class OpenClipScorer:
         model, _, preprocess = open_clip.create_model_and_transforms(arch, pretrained=None)
         open_clip.load_checkpoint(model, str(weight))
         tokenizer = open_clip.get_tokenizer(arch)
-        device = "cuda" if getattr(torch, "cuda", None) and torch.cuda.is_available() else "cpu"
+        # Default CPU: CLIP on CUDA shares the 32GB card with Comfy H3 and was
+        # part of the ~29.6 GiB-full chain-tail OOM. Opt in with AF_VISUAL_QC_DEVICE=cuda.
+        raw = (os.environ.get("AF_VISUAL_QC_DEVICE") or "cpu").strip().lower()
+        want_cuda = raw in {"cuda", "gpu", "1", "true", "yes", "on"}
+        device = "cpu"
+        if want_cuda and getattr(torch, "cuda", None) and torch.cuda.is_available():
+            device = "cuda"
         model = model.to(device)
         model.eval()
         return cls(model, preprocess, tokenizer, device=device)
