@@ -1464,6 +1464,25 @@ def _comfy_image_name(src: Path) -> str:
     return name
 
 
+def _comfy_ref_bind_name(ref: str, src: Path) -> str:
+    """LoadImage filename matching H3 ref tokens (char_*_sheet.png / plate_*.png)."""
+    text = str(ref or "").strip()
+    name = Path(text).name
+    stem = Path(name).stem if "." in name else name
+    if stem.startswith("char_") or stem.startswith("plate_"):
+        return f"{stem}.png"
+    parts = src.parts
+    if "characters" in parts:
+        idx = parts.index("characters")
+        if idx + 1 < len(parts) and parts[idx + 1]:
+            return f"char_{parts[idx + 1]}_sheet.png"
+    if "scenes" in parts:
+        idx = parts.index("scenes")
+        if idx + 1 < len(parts) and parts[idx + 1]:
+            return f"plate_{parts[idx + 1]}.png"
+    return _comfy_image_name(src)
+
+
 def _read_asset_lock_index(root: Path) -> dict[str, Any]:
     path = Path(root) / "assets" / "index.json"
     if not path.is_file():
@@ -1554,19 +1573,23 @@ def _resolve_ref_file(root: Path, ref: str) -> Path | None:
         return None
     name = Path(text).name
     rid = text
+    stem = Path(text).stem
     if rid.startswith("char_") and rid.endswith("_sheet"):
         locked = _locked_character_file(root, rid[len("char_") : -len("_sheet")])
         if locked is not None:
             return locked
         return None
-    stem = Path(text).stem
     if stem.startswith("char_") and stem.endswith("_sheet"):
         locked = _locked_character_file(root, stem[len("char_") : -len("_sheet")])
         if locked is not None:
             return locked
         return None
-    if rid.startswith("plate_"):
-        locked = _locked_scene_file(root, rid[len("plate_") :])
+    plate_stem = stem if stem.startswith("plate_") else (rid if rid.startswith("plate_") else "")
+    if plate_stem.startswith("plate_"):
+        lid = Path(plate_stem).stem if "." in Path(plate_stem).name else plate_stem
+        if lid.startswith("plate_"):
+            lid = lid[len("plate_") :]
+        locked = _locked_scene_file(root, lid)
         if locked is not None:
             return locked
         return None
@@ -1641,10 +1664,13 @@ def _stage_first_frame(shot: dict, root: Path) -> dict:
         if not files:
             continue
         for src in files:
-            name = _comfy_image_name(src)
+            name = _comfy_ref_bind_name(str(ref), src)
             if name in seen_names:
                 continue
             staged = _stage_named_image(src, name) or name
+            stem = Path(name).stem
+            if stem.startswith("char_") or stem.startswith("plate_"):
+                _stage_named_image(src, stem)
             staged_refs.append(staged)
             seen_names.add(name)
     if mode == "ref2va" and not staged_refs:
@@ -1653,10 +1679,11 @@ def _stage_first_frame(shot: dict, root: Path) -> dict:
             locked = _locked_character_file(root, cid)
             files = [locked] if locked is not None else _character_sheet_files(root, f"char_{cid}_sheet")
             for src in files:
-                name = _comfy_image_name(src)
+                name = _comfy_ref_bind_name(f"char_{cid}_sheet", src)
                 if name in seen_names:
                     continue
                 staged = _stage_named_image(src, name) or name
+                _stage_named_image(src, Path(name).stem)
                 staged_refs.append(staged)
                 seen_names.add(name)
     if staged_refs:
@@ -1695,7 +1722,11 @@ def _upload_h3_inputs(router: ComfyRouter, shot: dict, root: Path) -> None:
                 src = staged
         if src is None or not src.is_file():
             raise RuntimeError(f"h3 upload missing ref for {sid}: {ref}")
-        router.upload_image(Path(str(ref)).name, src.read_bytes())
+        bind = Path(str(ref)).name
+        router.upload_image(bind, src.read_bytes())
+        stem = Path(bind).stem
+        if stem.startswith("char_") or stem.startswith("plate_"):
+            router.upload_image(stem, src.read_bytes())
     last = shot.get("last_frame_path")
     if last and not is_directory_like(last):
         last_path = Path(str(last))

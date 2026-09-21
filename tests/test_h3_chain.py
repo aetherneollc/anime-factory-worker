@@ -221,6 +221,50 @@ def test_ref2va_graph_loads_sheets_not_dummy_f1():
     assert "audio" not in graph["14"]["inputs"]
 
 
+def test_ref_bind_names_add_png_and_skip_dummy_f01():
+    from anime_factory.h3_storyboard import ref_bind_names
+
+    names = ref_bind_names(
+        {
+            "id": "s001",
+            "character_id": "lin-xiao",
+            "plate_id": "start-lot",
+            "refs": ["char_lin-xiao_sheet", "plate_start-lot"],
+            "first_frame_path": "f01.png",
+            "h3_mode": "ref2va",
+        }
+    )
+    assert "char_lin-xiao_sheet.png" in names
+    assert "plate_start-lot.png" in names
+    assert "f01.png" not in names
+    assert "char_lin-xiao_sheet" not in names
+
+
+def test_native_graph_loadimage_uses_png_tokens_when_f01_exists():
+    graph = native_h3_graph(
+        {
+            "id": "s001",
+            "duration": 8,
+            "h3_mode": "ref2va",
+            "character_id": "lin-xiao",
+            "plate_id": "start-lot",
+            "refs": ["char_lin-xiao_sheet", "plate_start-lot"],
+            "first_frame_path": "f01.png",
+        },
+        "ref2va",
+    )
+    assert graph["r1"]["inputs"]["image"] == "char_lin-xiao_sheet.png"
+    assert graph["r2"]["inputs"]["image"] == "plate_start-lot.png"
+    assert graph["5"]["inputs"]["image"] == "f01.png"
+    images = [
+        node["inputs"]["image"]
+        for node in graph.values()
+        if isinstance(node, dict) and node.get("class_type") == "LoadImage"
+    ]
+    assert "char_lin-xiao_sheet" not in images
+    assert "plate_start-lot" not in images
+
+
 def test_ref2va_head_mints_composition_f1_and_keeps_sheet(tmp_path, monkeypatch):
     """H3 v2: ref2va chain heads mint composition f1 (+ cut anchors) while still requiring sheets."""
     from anime_factory.asset_lock import lock_after_qc

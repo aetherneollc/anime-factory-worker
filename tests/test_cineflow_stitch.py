@@ -294,17 +294,61 @@ def test_stage_first_frame_copies_locked_sheet_not_every_png(tmp_path, monkeypat
         tmp_path,
     )
     names = list(staged.get("refs") or [])
-    assert any("front" in n for n in names)
-    assert any("plate" in n for n in names)
+    assert "char_ke_sheet.png" in names
+    assert "plate_store.png" in names
     assert not any("sheet_side" in n for n in names)
     assert not any("turnaround" in n for n in names)
     assert staged.get("first_frame_path") in {"last.png", str(last)}
     copied = {p.name for p in comfy_in.iterdir()} if comfy_in.is_dir() else set()
-    assert "ke_sheet_front.png" in copied or "sheet_front.png" in copied
+    assert "char_ke_sheet.png" in copied
+    assert "plate_store.png" in copied
+    assert "char_ke_sheet" in copied
+    assert "plate_store" in copied
     assert "sheet_turnaround.png" not in copied
     assert "ke_sheet_turnaround.png" not in copied
     assert "sheet_side.png" not in copied
     assert "ke_sheet_side.png" not in copied
+
+
+def test_stage_then_graph_loadimage_names_exist_in_comfy(tmp_path, monkeypatch):
+    from anime_factory.asset_lock import lock_after_qc
+    from gpu_worker.h3 import native_h3_graph
+    from gpu_worker import session as sess
+    from tests.clip_fakes import pass_qc
+
+    comfy_in = tmp_path / "comfy" / "input"
+    monkeypatch.setattr(sess, "_comfy_input_dir", lambda: comfy_in)
+    cid_dir = tmp_path / "assets" / "characters" / "lin-xiao"
+    cid_dir.mkdir(parents=True)
+    (cid_dir / "sheet_front.png").write_bytes(_art("front"))
+    scene = tmp_path / "assets" / "scenes" / "start-lot"
+    scene.mkdir(parents=True)
+    (scene / "plate_base.png").write_bytes(_art("plate"))
+    lock_after_qc(tmp_path, character_id="lin-xiao", filename="sheet_front.png", qc=pass_qc())
+    lock_after_qc(tmp_path, scene_id="start-lot", filename="plate_base.png", qc=pass_qc())
+    f01 = tmp_path / "episodes" / "EP001" / "keyframes" / "s001" / "f01.png"
+    f01.parent.mkdir(parents=True)
+    f01.write_bytes(_art("f01"))
+    staged = sess._stage_first_frame(
+        {
+            "id": "s001",
+            "chain_index": 0,
+            "h3_mode": "ref2va",
+            "character_id": "lin-xiao",
+            "plate_id": "start-lot",
+            "refs": ["char_lin-xiao_sheet", "plate_start-lot"],
+            "first_frame_path": str(f01),
+        },
+        tmp_path,
+    )
+    graph = native_h3_graph(staged, "ref2va")
+    copied = {p.name for p in comfy_in.iterdir()} if comfy_in.is_dir() else set()
+    for nid, node in graph.items():
+        if not isinstance(node, dict) or node.get("class_type") != "LoadImage":
+            continue
+        if not str(nid).startswith("r"):
+            continue
+        assert node["inputs"]["image"] in copied, nid
 
 
 def test_persist_board_writes_scene_chain_id(tmp_path):

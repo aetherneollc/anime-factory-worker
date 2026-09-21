@@ -176,33 +176,26 @@ def image_filename(value: Any) -> str | None:
 
 
 def ref_image_filenames(segment: dict) -> list[str]:
-    """Basenames for LoadImage nodes. Prefer reference_manifest order when present."""
+    """Basenames for LoadImage nodes. Sheets/plates as *.png, never extensionless tokens."""
     chain_tail = int(segment.get("chain_index") or 0) > 0 or bool(segment.get("chain_source_last_frame"))
     chain_first = image_filename(segment.get("first_frame_path")) if chain_tail else None
     names: list[str] = []
-    manifest = segment.get("reference_manifest")
-    if isinstance(manifest, dict) and manifest.get("refs"):
-        ordered = list(manifest.get("refs") or [])
-    else:
-        try:
-            from anime_factory.h3_storyboard import build_reference_manifest
+    try:
+        from anime_factory.h3_storyboard import ref_bind_names
 
-            ordered = list(build_reference_manifest(segment).get("refs") or [])
-        except Exception:  # noqa: BLE001
-            ordered = list(segment.get("refs") or [])
+        ordered = list(ref_bind_names(segment))
+    except Exception:  # noqa: BLE001
+        ordered = list(segment.get("refs") or [])
     for raw in ordered[:H3_MAX_REFS]:
-        name = image_filename(raw)
+        name = image_filename(raw) or str(raw or "").strip()
         if not name:
-            # Keep logical tokens like char_*_sheet for downstream binders.
-            text = str(raw or "").strip()
-            if text:
-                names.append(text)
             continue
-        if "." not in name and not name.endswith("_sheet") and not name.startswith("plate_"):
+        if "." not in name:
             name = f"{name}.png"
         if chain_tail and chain_first and name == chain_first:
             continue
-        names.append(name)
+        if name not in names:
+            names.append(name)
     return names[:H3_MAX_REFS]
 
 

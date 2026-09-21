@@ -362,14 +362,29 @@ def build_reference_manifest(segment: dict[str, Any]) -> dict[str, Any]:
     cid = str(segment.get("character_id") or "").strip()
     if cid and segment.get("on_camera") is not False:
         token = f"char_{cid}_sheet"
-        # Only add the bare token when no sheet ref was supplied.
-        if not any(token in c or c.startswith(f"char_{cid}_") for c in characters):
+        # Skip when a sheet file or char_{cid}_* token is already in the pack.
+        if not any(
+            token in c
+            or c.startswith(f"char_{cid}_")
+            or Path(c).name.startswith(f"char_{cid}_")
+            or Path(c).name.startswith(f"{cid}_")
+            or Path(c).stem == token
+            for c in characters
+        ):
             characters.append(token)
 
     plate = str(segment.get("plate_id") or "").strip()
     if plate:
         plate_token = plate if plate.startswith("plate_") else f"plate_{plate}"
-        if plate_token not in scenes:
+        lid = plate_token[len("plate_") :] if plate_token.startswith("plate_") else plate
+        if not any(
+            plate_token == s
+            or plate_token in s
+            or Path(s).stem == plate_token
+            or Path(s).name.startswith(f"{lid}_")
+            or Path(s).stem.startswith(f"{lid}_")
+            for s in scenes
+        ):
             scenes.append(plate_token)
 
     for cut in cuts:
@@ -412,6 +427,59 @@ def build_reference_manifest(segment: dict[str, Any]) -> dict[str, Any]:
         "refs": unique[:MAX_REFS],
         "segment_id": sid,
     }
+
+
+def ref_bind_name(raw: str) -> str:
+    """Comfy LoadImage filename for a ref token or path. Always a real file name."""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    name = Path(text).name.strip() or text
+    if "." not in name:
+        return f"{name}.png"
+    return name
+
+
+def _is_synthetic_keyframe_name(name: str) -> bool:
+    low = str(name or "").lower()
+    if low in {"f1.png", "f1"}:
+        return True
+    return bool(low.startswith("f") and len(low) >= 5 and low[1:3].isdigit() and low.endswith(".png"))
+
+
+def ref_bind_names(segment: dict[str, Any]) -> list[str]:
+    """Comfy ref LoadImage slots: character/scene/prop files, not dummy f1/f01 labels.
+
+    Temporal keyframes bind on the first-frame guide node when a real file exists.
+    """
+    manifest = segment.get("reference_manifest")
+    if not isinstance(manifest, dict):
+        manifest = build_reference_manifest(segment)
+    names: list[str] = []
+    seen: set[str] = set()
+
+    def add(raw: Any) -> None:
+        name = ref_bind_name(str(raw or ""))
+        if not name:
+            return
+        key = name.lower()
+        if key in seen or _is_synthetic_keyframe_name(name):
+            return
+        seen.add(key)
+        names.append(name)
+
+    groups = [
+        *(manifest.get("characters") or []),
+        *(manifest.get("scenes") or []),
+        *(manifest.get("props") or []),
+    ]
+    if groups:
+        for raw in groups:
+            add(raw)
+    else:
+        for raw in list(manifest.get("refs") or segment.get("refs") or []):
+            add(raw)
+    return names[:MAX_REFS]
 
 
 def compile_segment_v2(segment: dict[str, Any]) -> dict[str, Any]:
