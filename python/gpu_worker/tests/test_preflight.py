@@ -235,6 +235,10 @@ def test_probe_comfy_nodes_requires_ipadapter_advanced(monkeypatch):
             else {
                 "KSampler": {},
                 "IPAdapterAdvanced": {},
+                "MZ_KolorsUNETLoaderV2": {},
+                "MZ_ChatGLM3Loader": {},
+                "MZ_ChatGLM3_Advance_V2": {},
+                "MZ_IPAdapterAdvancedKolors": {},
                 "MiniMaxH3ImageToVideo": {},
                 "MiniMaxH3ReferenceToVideo": {},
                 "MiniMaxH3SigmaShift": {},

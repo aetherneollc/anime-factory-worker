@@ -95,7 +95,7 @@ RUN git init /opt/ComfyUI/custom_nodes/ComfyUI-Kolors-MZ \
          https://github.com/MinusZoneAI/ComfyUI-Kolors-MZ.git \
     && git -C /opt/ComfyUI/custom_nodes/ComfyUI-Kolors-MZ fetch --depth 1 origin "${KOLORS_MZ_REF}" \
     && git -C /opt/ComfyUI/custom_nodes/ComfyUI-Kolors-MZ checkout --detach FETCH_HEAD \
-    && pip install --no-cache-dir sentencepiece protobuf accelerate
+    && pip install --no-cache-dir --only-binary=:all: sentencepiece protobuf accelerate
 
 RUN KOLORS_MZ_REF="${KOLORS_MZ_REF}" python3 - <<'PY'
 import json

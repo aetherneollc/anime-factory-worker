@@ -169,8 +169,10 @@ def test_ref2va_graph_skips_h3_speech():
     assert "VAEDecodeAudio" not in types
     assert "audio" not in graph["14"]["inputs"]
     assert "audio_vae" not in graph["6"]["inputs"]
+    # Bind order: character locks (board sheet + character_id token) then scene plate.
     assert graph["r1"]["inputs"]["image"] == "sheet_front.png"
-    assert graph["r2"]["inputs"]["image"] == "plate_store.png"
+    assert graph["r2"]["inputs"]["image"] == "char_ke_sheet.png"
+    assert graph["r3"]["inputs"]["image"] == "plate_store.png"
 
 
 def test_oom_fallback_canvas_aligns_32(monkeypatch):
@@ -286,6 +288,14 @@ def test_run_anim_skip_existing_uploads_to_r2(tmp_path, monkeypatch):
     dest = tmp_path / "shots" / "E01-01" / "v001.mp4"
     dest.parent.mkdir(parents=True)
     dest.write_bytes(b"x" * 5000)
+    # Orphan mp4 without a QC-pass row must not auto-skip; only a passing
+    # generation resume uploads and counts as skipped_existing.
+    monkeypatch.setattr(
+        session,
+        "select_passing_generation",
+        lambda _conn, root, sid: (root / "shots" / sid / "v001.mp4", 1, "pass"),
+    )
+    monkeypatch.setattr(session, "_ensure_last_frame", lambda *_a, **_k: None)
     out = session.run_anim("story-x", tmp_path, object(), router=None)
     assert out["skipped_existing"] == ["E01-01"]
     assert out["shots_done"] == 1
