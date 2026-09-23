@@ -59,6 +59,7 @@ from anime_factory.models import (
     STILL_IMAGE_SIZE,
     STILL_WIDTH,
     STYLE_PREFIX,
+    STYLE_PREFIX_CHARACTER,
     animagine_quality_suffix,
     normalize_style_preset,
     scrub_copycat,
@@ -111,6 +112,23 @@ SHEET_NEGATIVE = (
     "character turnaround, multiple views, split panel, collage, contact sheet, floating heads, "
     "cropped body, cinematic still, movie screenshot, dramatic rim light, scenery background, "
     "text on the sheet, caption, portrait, upper body, bust, half body, cropped feet, close-up"
+)
+# Kolors/ChatGLM does not treat Danbooru "full body" as a framing tag. A tail tag
+# after "character design" draws a bust, and Qwen then fails not_full_body /
+# not_both_feet_visible. Lead with a natural-language full-length sentence, and
+# put bust bans first so they survive ChatGLM's ~256-token window.
+_CHARACTER_STILL_KINDS = frozenset({"character_sheet", "character_view_derive", "costume_derive"})
+KOLORS_CHARACTER_FRAMING = (
+    "full body shot, long shot, head to toe, "
+    "full-length character reference, the whole figure from the top of the head to both shoes "
+    "fits inside the frame, both feet fully visible, standing with empty space below the shoes"
+)
+KOLORS_CHARACTER_PREFIX = (
+    "original anime, solo, cel shaded, clean lineart, warm ivory studio background"
+)
+KOLORS_CHARACTER_NEGATIVE_LEAD = (
+    "close-up, portrait, headshot, bust, cowboy shot, upper body, half body, "
+    "cropped legs, cropped feet, missing shoes, zoomed in"
 )
 ESTABLISHING_PLATE_LOOK = (
     "anime location background, wide establishing shot, no characters, "
@@ -415,6 +433,12 @@ def style_prompt(
     if period_positive:
         extra = ", " + ", ".join(period_positive)
     head = scrub_copycat(prefix if prefix is not None else style_prefix_for_kind(kind))
+    if still_backend() == "kolors" and str(kind or "") in _CHARACTER_STILL_KINDS:
+        # "character design" is a bust-poster cue for Kolors. Framing must be first.
+        if not head or head == STYLE_PREFIX_CHARACTER or head.startswith("original anime character design"):
+            head = f"{KOLORS_CHARACTER_FRAMING}, {KOLORS_CHARACTER_PREFIX}"
+        elif KOLORS_CHARACTER_FRAMING.lower() not in head.lower():
+            head = f"{KOLORS_CHARACTER_FRAMING}, {head}"
     body = scrub_copycat(user_prompt)
     if kind in {"scene_plate", "scene_derive", "keyframe"}:
         body = sanitize_location_prompt(body)
@@ -434,13 +458,17 @@ def style_negative(
     *,
     base: str | None = None,
     extra: str | None = None,
+    kind: str | None = None,
 ) -> str:
     """FIXED_NEGATIVE (or the bible's `negative:` line) plus per-kind and period terms."""
-    terms = [scrub_copycat(base) if base else FIXED_NEGATIVE]
-    if extra:
-        terms.append(extra)
-    terms.extend(period_negative or [])
-    return ", ".join(term for term in (str(t).strip() for t in terms) if term)
+    base_text = scrub_copycat(base) if base else FIXED_NEGATIVE
+    extra_text = str(extra or "").strip()
+    period = [str(item).strip() for item in (period_negative or []) if str(item).strip()]
+    if still_backend() == "kolors" and str(kind or "") in _CHARACTER_STILL_KINDS:
+        terms = [KOLORS_CHARACTER_NEGATIVE_LEAD, extra_text, base_text, *period]
+    else:
+        terms = [base_text, extra_text, *period]
+    return ", ".join(term for term in terms if term)
 
 
 def build_scene_plate_payload(
@@ -1732,6 +1760,7 @@ def _render_spec(
             neg,
             base=negative_base,
             extra=_kind_negative(kind, prompt, view=str(spec.get("view") or "")),
+            kind=kind,
         ),
         "image_size": spec.get("image_size") or CHAR_IMAGE_SIZE,
         "batch_size": 1,
@@ -1758,6 +1787,7 @@ def _render_spec(
             neg,
             base=negative_base,
             extra=_kind_negative(kind, prompt, view=view),
+            kind=kind,
         )
     png = client.generate(payload)
     return png

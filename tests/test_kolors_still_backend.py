@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import pytest
 
-from anime_factory.design import build_scene_plate_payload, style_prompt
+from anime_factory.design import (
+    KOLORS_CHARACTER_FRAMING,
+    KOLORS_CHARACTER_NEGATIVE_LEAD,
+    _kind_negative,
+    build_scene_plate_payload,
+    style_negative,
+    style_prompt,
+)
 from anime_factory.models import (
     IMAGE_CKPT,
     IMAGE_MODEL,
@@ -105,6 +112,59 @@ def test_kolors_view_derive_keeps_ipadapter(monkeypatch):
     assert ipadapter["inputs"]["weight"] == 0.75
     loader = next(node for node in prompt.values() if node.get("class_type") == "LoadImage")
     assert loader["inputs"]["image"] == "af_side.png"
+
+
+def test_kolors_character_prompt_leads_with_full_length_framing(monkeypatch):
+    monkeypatch.setenv("STILL_BACKEND", "kolors")
+    identity = "1boy, young adult, short black hair, brown eyes, black leather jacket, red shirt"
+    prompt = style_prompt(
+        f"{identity}, solo, front view, looking at viewer, full body, standing",
+        kind="character_sheet",
+        gender_tag="1boy",
+    )
+    lowered = prompt.lower()
+    assert lowered.startswith("full body shot")
+    assert "both feet fully visible" in lowered
+    assert "character design" not in lowered
+    assert lowered.index("both feet fully visible") < lowered.index("black leather")
+    assert KOLORS_CHARACTER_FRAMING.split(",")[0].lower() in lowered
+
+
+def test_kolors_character_negative_puts_bust_bans_first(monkeypatch):
+    monkeypatch.setenv("STILL_BACKEND", "kolors")
+    negative = style_negative(
+        extra=_kind_negative("character_sheet", "1boy, black pants"),
+        kind="character_sheet",
+    )
+    lowered = negative.lower()
+    assert lowered.startswith("close-up")
+    assert "cropped feet" in lowered
+    assert lowered.index("bust") < lowered.index("photorealistic")
+    assert KOLORS_CHARACTER_NEGATIVE_LEAD.split(",")[0] in lowered
+
+
+def test_animagine_character_prompt_keeps_booru_sheet(monkeypatch):
+    monkeypatch.setenv("STILL_BACKEND", "animagine")
+    prompt = style_prompt(
+        "1boy, young adult, short black hair, brown eyes, grey hoodie",
+        kind="character_sheet",
+        gender_tag="1boy",
+    ).lower()
+    assert "both feet fully visible" not in prompt
+    assert "original anime character design" in prompt
+    assert "masterpiece" in prompt
+    negative = style_negative(
+        extra=_kind_negative("character_sheet", "1boy, grey hoodie"),
+        kind="character_sheet",
+    ).lower()
+    assert negative.startswith("photorealistic")
+
+
+def test_kolors_scene_plate_does_not_take_character_framing(monkeypatch):
+    monkeypatch.setenv("STILL_BACKEND", "kolors")
+    prompt = style_prompt("empty mountain road", kind="scene_plate").lower()
+    assert "both feet fully visible" not in prompt
+    assert "full body shot" not in prompt
 
 
 def test_scene_plate_refuses_parent_bytes():
