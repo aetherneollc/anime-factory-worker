@@ -126,7 +126,11 @@ def test_kolors_character_prompt_leads_with_full_length_framing(monkeypatch):
     assert lowered.startswith("full body shot")
     assert "both feet fully visible" in lowered
     assert "character design" not in lowered
+    assert "character reference" not in lowered
     assert lowered.index("both feet fully visible") < lowered.index("black leather")
+    assert lowered.index("black leather") < lowered.index("looking straight at camera")
+    assert prompt.endswith("looking straight at camera")
+    assert "直视镜头" in prompt
     assert KOLORS_CHARACTER_FRAMING.split(",")[0].lower() in lowered
 
 
@@ -140,6 +144,8 @@ def test_kolors_character_negative_puts_bust_bans_first(monkeypatch):
     assert lowered.startswith("close-up")
     assert "cropped feet" in lowered
     assert lowered.index("bust") < lowered.index("photorealistic")
+    assert lowered.endswith("not full body")
+    assert "裁掉脚" in negative
     assert KOLORS_CHARACTER_NEGATIVE_LEAD.split(",")[0] in lowered
 
 
@@ -158,6 +164,37 @@ def test_animagine_character_prompt_keeps_booru_sheet(monkeypatch):
         kind="character_sheet",
     ).lower()
     assert negative.startswith("photorealistic")
+
+
+def test_kolors_character_tail_follows_view(monkeypatch):
+    monkeypatch.setenv("STILL_BACKEND", "kolors")
+    side = style_prompt(
+        "1boy, short black hair, brown eyes, black jacket, from side, strict left side profile, full body",
+        kind="character_view_derive",
+    )
+    assert side.endswith("strict side profile")
+    assert "looking straight at camera" not in side
+    assert "直视镜头" not in side
+    back = style_prompt(
+        "1boy, short black hair, brown eyes, black jacket, from behind, facing away, strict rear view, full body",
+        kind="character_view_derive",
+    )
+    assert back.endswith("face hidden")
+    assert "looking straight at camera" not in back
+    assert "直视镜头" not in back
+
+
+def test_kolors_negative_tail_survives_a_long_bible_negative(monkeypatch):
+    monkeypatch.setenv("STILL_BACKEND", "kolors")
+    negative = style_negative(
+        extra=_kind_negative("character_sheet", "1boy, black pants"),
+        kind="character_sheet",
+        base="photorealistic, " + ", ".join(f"filler clause {i}" for i in range(80)),
+    )
+    assert negative.lower().startswith("close-up")
+    assert negative.lower().endswith("not full body")
+    assert "cropped feet" in negative.lower()
+    assert "khaki pants" in negative.lower()
 
 
 def test_kolors_scene_plate_does_not_take_character_framing(monkeypatch):

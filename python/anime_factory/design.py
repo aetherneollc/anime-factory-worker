@@ -113,22 +113,43 @@ SHEET_NEGATIVE = (
     "cropped body, cinematic still, movie screenshot, dramatic rim light, scenery background, "
     "text on the sheet, caption, portrait, upper body, bust, half body, cropped feet, close-up"
 )
-# Kolors/ChatGLM does not treat Danbooru "full body" as a framing tag. A tail tag
-# after "character design" draws a bust, and Qwen then fails not_full_body /
-# not_both_feet_visible. Lead with a natural-language full-length sentence, and
-# put bust bans first so they survive ChatGLM's ~256-token window.
+# Kolors pools ChatGLM hidden_states[-1][-1] — the last token — into the SDXL
+# timestep embed, and that vector sets the crop. The encoder is causal, so the
+# tail outweighs the head. 48de22d led with an English full-length sentence and
+# Qwen still saw busts: "character reference" is a poster cue, and the pooled
+# token was the identity / "simple background" tail. Keep a short English lead
+# for cross-attention, then end on a Chinese full-length lock (Kolors' training
+# language). Bust bans must also be the last negative clause, inside the
+# 256-token window, or the pooled negative is horror wording instead of a crop ban.
 _CHARACTER_STILL_KINDS = frozenset({"character_sheet", "character_view_derive", "costume_derive"})
+_KOLORS_TOKEN_BUDGET = 220
 KOLORS_CHARACTER_FRAMING = (
     "full body shot, long shot, head to toe, "
-    "full-length character reference, the whole figure from the top of the head to both shoes "
-    "fits inside the frame, both feet fully visible, standing with empty space below the shoes"
+    "the whole figure from the top of the head to both shoes fits inside the frame, "
+    "both feet fully visible, standing with empty space below the shoes"
 )
 KOLORS_CHARACTER_PREFIX = (
     "original anime, solo, cel shaded, clean lineart, warm ivory studio background"
 )
+KOLORS_CHARACTER_TAIL_FRONT = (
+    "全身，从头顶到两只鞋完整入画，脚下留白，双脚和鞋子都完整可见，正面站立直视镜头, "
+    "both shoes fully visible, looking straight at camera"
+)
+KOLORS_CHARACTER_TAIL_SIDE = (
+    "全身，从头顶到两只鞋完整入画，脚下留白，双脚和鞋子都完整可见，严格左侧面, "
+    "both shoes fully visible, strict side profile"
+)
+KOLORS_CHARACTER_TAIL_BACK = (
+    "全身，从头顶到两只鞋完整入画，脚下留白，双脚和鞋子都完整可见，严格背面，脸完全不可见, "
+    "both shoes fully visible, strict rear view, face hidden"
+)
 KOLORS_CHARACTER_NEGATIVE_LEAD = (
     "close-up, portrait, headshot, bust, cowboy shot, upper body, half body, "
     "cropped legs, cropped feet, missing shoes, zoomed in"
+)
+KOLORS_CHARACTER_NEGATIVE_TAIL = (
+    "半身，特写，大头照，上半身，裁掉双腿，裁掉脚，看不见鞋子, "
+    "bust, cropped feet, missing shoes, not full body"
 )
 ESTABLISHING_PLATE_LOOK = (
     "anime location background, wide establishing shot, no characters, "
@@ -421,6 +442,56 @@ def _kind_negative(
     return base
 
 
+def _estimate_chatglm_tokens(text: str) -> int:
+    """Conservative stand-in for ChatGLM sentencepiece: ~4 Latin chars or 1 CJK = 1 token."""
+    tokens = 0
+    ascii_run = 0
+    for ch in text or "":
+        if "\u4e00" <= ch <= "\u9fff" or "\u3040" <= ch <= "\u30ff" or "\uac00" <= ch <= "\ud7af":
+            if ascii_run:
+                tokens += max(1, (ascii_run + 3) // 4)
+                ascii_run = 0
+            tokens += 1
+        else:
+            ascii_run += 1
+    if ascii_run:
+        tokens += max(1, (ascii_run + 3) // 4)
+    return tokens
+
+
+def _trim_clauses_from_end(text: str, max_tokens: int) -> str:
+    body = str(text or "").strip().strip(",")
+    while body and _estimate_chatglm_tokens(body) > max_tokens:
+        if "," not in body:
+            return ""
+        body = body.rsplit(",", 1)[0].rstrip()
+    return body
+
+
+def _kolors_character_tail(prompt: str) -> str:
+    low = str(prompt or "").lower()
+    if "from behind" in low or "strict rear" in low or "facing away" in low:
+        return KOLORS_CHARACTER_TAIL_BACK
+    if "from side" in low or "side profile" in low or "strict left side" in low:
+        return KOLORS_CHARACTER_TAIL_SIDE
+    return KOLORS_CHARACTER_TAIL_FRONT
+
+
+def _kolors_append_tail(text: str, tail: str, *, budget: int = _KOLORS_TOKEN_BUDGET) -> str:
+    """Keep `tail` as the final clause inside ChatGLM's 256-token window."""
+    tail = str(tail or "").strip().strip(",")
+    body = str(text or "").strip().strip(",")
+    if not tail:
+        return body
+    if body.lower().endswith(tail.lower()):
+        return body
+    room = max(budget - _estimate_chatglm_tokens(tail) - 2, 0)
+    body = _trim_clauses_from_end(body, room)
+    if not body:
+        return tail
+    return f"{body}, {tail}"
+
+
 def style_prompt(
     user_prompt: str,
     period_positive: list[str] | None = None,
@@ -433,8 +504,9 @@ def style_prompt(
     if period_positive:
         extra = ", " + ", ".join(period_positive)
     head = scrub_copycat(prefix if prefix is not None else style_prefix_for_kind(kind))
-    if still_backend() == "kolors" and str(kind or "") in _CHARACTER_STILL_KINDS:
-        # "character design" is a bust-poster cue for Kolors. Framing must be first.
+    kolors_character = still_backend() == "kolors" and str(kind or "") in _CHARACTER_STILL_KINDS
+    if kolors_character:
+        # "character design" / "character reference" are bust-poster cues. Framing leads.
         if not head or head == STYLE_PREFIX_CHARACTER or head.startswith("original anime character design"):
             head = f"{KOLORS_CHARACTER_FRAMING}, {KOLORS_CHARACTER_PREFIX}"
         elif KOLORS_CHARACTER_FRAMING.lower() not in head.lower():
@@ -450,6 +522,10 @@ def style_prompt(
         tail = animagine_quality_suffix(kind, gender_tag=gender_tag)
         if tail.lower() not in composed.lower():
             composed = f"{composed}, {tail}"
+    elif kolors_character:
+        # Last tokens become the pooled crop embedding. View is read from the
+        # user clause so a side/back sheet does not demand eye contact.
+        composed = _kolors_append_tail(composed, _kolors_character_tail(body))
     return composed
 
 
@@ -466,8 +542,9 @@ def style_negative(
     period = [str(item).strip() for item in (period_negative or []) if str(item).strip()]
     if still_backend() == "kolors" and str(kind or "") in _CHARACTER_STILL_KINDS:
         terms = [KOLORS_CHARACTER_NEGATIVE_LEAD, extra_text, base_text, *period]
-    else:
-        terms = [base_text, extra_text, *period]
+        joined = ", ".join(term for term in terms if term)
+        return _kolors_append_tail(joined, KOLORS_CHARACTER_NEGATIVE_TAIL)
+    terms = [base_text, extra_text, *period]
     return ", ".join(term for term in terms if term)
 
 
