@@ -24,6 +24,12 @@ from gpu_worker.stills import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _animagine_still_backend(monkeypatch):
+    """This module locks the Animagine workflow. Kolors has its own tests."""
+    monkeypatch.setenv("STILL_BACKEND", "animagine")
+
+
 class FakeRouter:
     def __init__(self, blob: bytes | None = None):
         self.uploads: list[tuple[str, int]] = []

@@ -28,7 +28,17 @@ import threading
 from pathlib import Path
 from typing import Callable
 
-from anime_factory.models import IMAGE_CKPT, IMAGE_MODEL
+from anime_factory.models import (
+    IMAGE_CKPT,
+    IMAGE_MODEL,
+    KOLORS_CHATGLM_FILE,
+    KOLORS_CLIP_VISION_FILE,
+    KOLORS_IPADAPTER_FILE,
+    KOLORS_MODEL,
+    KOLORS_UNET_FILE,
+    KOLORS_VAE_FILE,
+    still_backend,
+)
 
 # hf_xet reconstructs safetensors with mmap. A short reconstruction (header
 # committed, data past EOF) raises SIGBUS and kills af-start — no Python
@@ -47,6 +57,11 @@ H3_DIT_REPO = "lilcheaty/MiniMax-H3-NVFP4"
 STILL_CKPT_REPO = IMAGE_MODEL
 STILL_CKPT_FILE = IMAGE_CKPT
 STILL_CKPT_DEST = f"models/checkpoints/{STILL_CKPT_FILE}"
+KOLORS_UNET_DEST = f"models/diffusion_models/{KOLORS_UNET_FILE}"
+KOLORS_VAE_DEST = f"models/vae/{KOLORS_VAE_FILE}"
+KOLORS_CHATGLM_DEST = f"models/LLM/{KOLORS_CHATGLM_FILE}"
+KOLORS_IPADAPTER_DEST = f"models/ipadapter/{KOLORS_IPADAPTER_FILE}"
+KOLORS_CLIP_VISION_DEST = f"models/clip_vision/{KOLORS_CLIP_VISION_FILE}"
 IPADAPTER_REPO = "h94/IP-Adapter"
 IPADAPTER_FILE = "ip-adapter-plus_sdxl_vit-h.safetensors"
 IPADAPTER_DEST = f"models/ipadapter/{IPADAPTER_FILE}"
@@ -97,7 +112,7 @@ H3_REF2VA_FILES: list[dict[str, str]] = [
 ]
 # Audio VAE is never decoded (CosyVoice2 is the mix). Do not download it.
 H3_FILES: list[dict[str, str]] = [*H3_CORE_FILES, *H3_FL2VA_FILES, *H3_REF2VA_FILES]
-STILL_FILES: list[dict[str, str]] = [
+ANIMAGINE_STILL_FILES: list[dict[str, str]] = [
     {
         "repo": STILL_CKPT_REPO,
         "hf": STILL_CKPT_FILE,
@@ -113,6 +128,36 @@ STILL_FILES: list[dict[str, str]] = [
         "hf": "models/image_encoder/model.safetensors",
         "dest": CLIP_VISION_DEST,
     },
+]
+# Local Kwai Kolors: UNet + VAE + ChatGLM3 + Kolors IP-Adapter. Not SiliconFlow.
+KOLORS_STILL_FILES: list[dict[str, str]] = [
+    {
+        "repo": KOLORS_MODEL,
+        "hf": "unet/diffusion_pytorch_model.fp16.safetensors",
+        "dest": KOLORS_UNET_DEST,
+    },
+    {
+        "repo": KOLORS_MODEL,
+        "hf": "vae/diffusion_pytorch_model.fp16.safetensors",
+        "dest": KOLORS_VAE_DEST,
+    },
+    {
+        "repo": "Kijai/ChatGLM3-safetensors",
+        "hf": KOLORS_CHATGLM_FILE,
+        "dest": KOLORS_CHATGLM_DEST,
+    },
+    {
+        "repo": "Kwai-Kolors/Kolors-IP-Adapter-Plus",
+        "hf": "ip_adapter_plus_general.bin",
+        "dest": KOLORS_IPADAPTER_DEST,
+    },
+    {
+        "repo": "Kwai-Kolors/Kolors-IP-Adapter-Plus",
+        "hf": "image_encoder/pytorch_model.bin",
+        "dest": KOLORS_CLIP_VISION_DEST,
+    },
+]
+VISUAL_QC_STILL_FILES: list[dict[str, str]] = [
     {
         "repo": VISUAL_QC_CLIP_REPO,
         "hf": VISUAL_QC_CLIP_WEIGHT_HF,
@@ -126,8 +171,24 @@ STILL_FILES: list[dict[str, str]] = [
         "min_bytes": str(VISUAL_QC_CLIP_CONFIG_MIN_BYTES),
     },
 ]
-RUNTIME_WEIGHT_FILES: list[dict[str, str]] = [*STILL_FILES, *H3_FILES]
-# Historical alias used by tests; stills are anime SDXL, not a Kolors snapshot.
+
+
+def still_weight_files(backend: str | None = None) -> list[dict[str, str]]:
+    """One still stack plus visual-QC CLIP. Never both Animagine and Kolors."""
+    chosen = still_backend() if backend is None else backend
+    if chosen not in {"kolors", "animagine"}:
+        raise ValueError(f"still backend must be kolors or animagine, got {chosen!r}")
+    body = KOLORS_STILL_FILES if chosen == "kolors" else ANIMAGINE_STILL_FILES
+    return [*body, *VISUAL_QC_STILL_FILES]
+
+
+def runtime_weight_files(backend: str | None = None) -> list[dict[str, str]]:
+    return [*still_weight_files(backend), *H3_FILES]
+
+
+# Default-backend snapshot. Call still_weight_files() after STILL_BACKEND changes.
+STILL_FILES: list[dict[str, str]] = still_weight_files("kolors")
+RUNTIME_WEIGHT_FILES: list[dict[str, str]] = runtime_weight_files("kolors")
 H3_AND_KOLORS_FILES = RUNTIME_WEIGHT_FILES
 
 _h3_lock = threading.Lock()
@@ -183,6 +244,7 @@ def extra_model_paths_yaml(comfy_dir: Path) -> str:
         "    text_encoders: models/text_encoders/\n"
         "    unet: models/diffusion_models/\n"
         "    vae: models/vae/\n"
+        "    LLM: models/LLM/\n"
     )
 
 
@@ -357,11 +419,11 @@ def validate_visual_qc_clip_weights(comfy_dir: Path | str | None = None) -> None
     weight = Path(paths["weights"])
     config = Path(paths["config"])
     weight_item = next(
-        (item for item in STILL_FILES if item["dest"] == VISUAL_QC_CLIP_WEIGHT_DEST),
+        (item for item in still_weight_files() if item["dest"] == VISUAL_QC_CLIP_WEIGHT_DEST),
         None,
     )
     config_item = next(
-        (item for item in STILL_FILES if item["dest"] == VISUAL_QC_CLIP_CONFIG_DEST),
+        (item for item in still_weight_files() if item["dest"] == VISUAL_QC_CLIP_CONFIG_DEST),
         None,
     )
     if not _file_meets_contract(weight, weight_item):
@@ -506,7 +568,7 @@ def ensure_still_weights(
     yaml_path = write_extra_model_paths(root)
     if _skip_weights():
         return _empty_materialize(root, yaml_path)
-    out = _materialize_items(STILL_FILES, root, progress=progress)
+    out = _materialize_items(still_weight_files(), root, progress=progress)
     out["extra_model_paths"] = str(yaml_path)
     out["kind"] = "stills"
     return out

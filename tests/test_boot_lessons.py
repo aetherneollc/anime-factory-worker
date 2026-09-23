@@ -353,21 +353,23 @@ def test_weights_from_hf_not_r2(tmp_path):
     unet = tmp_path / "models/diffusion_models/minimax_h3_fl2va_pruned_nvfp4.safetensors"
     clip = tmp_path / "models/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
     vae = tmp_path / "models/vae/minimax_h3_video_vae_fp16.safetensors"
-    still = tmp_path / "models/checkpoints/animagine-xl-4.0.safetensors"
-    ipadapter = tmp_path / "models/ipadapter/ip-adapter-plus_sdxl_vit-h.safetensors"
+    still = tmp_path / weights_mod.KOLORS_UNET_DEST
+    ipadapter = tmp_path / weights_mod.KOLORS_IPADAPTER_DEST
     visual_qc = tmp_path / weights_mod.VISUAL_QC_CLIP_WEIGHT_DEST
     assert unet.is_file() and clip.is_file() and vae.is_file() and still.is_file() and ipadapter.is_file()
     assert visual_qc.is_file() and visual_qc.stat().st_size >= weights_mod.VISUAL_QC_CLIP_MIN_BYTES
     weights_mod.validate_visual_qc_clip_weights(tmp_path)
     yaml = extra_model_paths_yaml(tmp_path)
+    assert "LLM:" in yaml
     assert "r2://" not in yaml
     assert "weights/" not in yaml
     assert str(tmp_path.resolve()) in yaml
     assert (tmp_path / "extra_model_paths.yaml").is_file()
 
 
-def test_anime_sdxl_stills_workflow_fill_and_gpu_client():
+def test_anime_sdxl_stills_workflow_fill_and_gpu_client(monkeypatch):
     """Stills run anime SDXL at real CFG; cfg=1 on Flux threw FIXED_NEGATIVE away."""
+    monkeypatch.setenv("STILL_BACKEND", "animagine")
     from gpu_worker.h3 import load_workflow
     from gpu_worker.stills import STILL_WORKFLOW, fill_still_workflow, still_payload_to_prompt
     from anime_factory.design import KolorsClient, synthetic_still_png

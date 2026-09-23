@@ -1,0 +1,107 @@
+{
+  "prompt": {
+    "1": {
+      "class_type": "MZ_KolorsUNETLoaderV2",
+      "_meta": { "role": "still_unet" },
+      "inputs": { "unet_name": "kolors_unet_fp16.safetensors" }
+    },
+    "2": {
+      "class_type": "VAELoader",
+      "_meta": { "role": "still_vae" },
+      "inputs": { "vae_name": "kolors_vae_fp16.safetensors" }
+    },
+    "3": {
+      "class_type": "MZ_ChatGLM3Loader",
+      "_meta": { "role": "chatglm" },
+      "inputs": { "chatglm3_checkpoint": "chatglm3-fp16.safetensors" }
+    },
+    "4": {
+      "class_type": "MZ_ChatGLM3_Advance_V2",
+      "_meta": { "role": "positive" },
+      "inputs": {
+        "chatglm3_model": ["3", 0],
+        "text": "PROMPT",
+        "width": 1344,
+        "height": 768,
+        "crop_w": 0,
+        "crop_h": 0,
+        "target_width": 1344,
+        "target_height": 768
+      }
+    },
+    "5": {
+      "class_type": "MZ_ChatGLM3_Advance_V2",
+      "_meta": { "role": "negative" },
+      "inputs": {
+        "chatglm3_model": ["3", 0],
+        "text": "NEGATIVE",
+        "width": 1344,
+        "height": 768,
+        "crop_w": 0,
+        "crop_h": 0,
+        "target_width": 1344,
+        "target_height": 768
+      }
+    },
+    "6": {
+      "class_type": "EmptyLatentImage",
+      "_meta": { "role": "latent" },
+      "inputs": { "width": 1344, "height": 768, "batch_size": 1 }
+    },
+    "8": {
+      "class_type": "LoadImage",
+      "_meta": { "role": "reference_image" },
+      "inputs": { "image": "", "upload": "image" }
+    },
+    "9": {
+      "class_type": "MZ_IPAdapterModelLoaderKolors",
+      "_meta": { "role": "ipadapter_model" },
+      "inputs": { "ipadapter_file": "kolors_ip_adapter_plus_general.bin" }
+    },
+    "10": {
+      "class_type": "MZ_KolorsCLIPVisionLoader",
+      "_meta": { "role": "ipadapter_clip_vision" },
+      "inputs": { "clip_name": "kolors_ip_image_encoder.bin" }
+    },
+    "11": {
+      "class_type": "MZ_IPAdapterAdvancedKolors",
+      "_meta": { "role": "ipadapter" },
+      "inputs": {
+        "model": ["1", 0],
+        "ipadapter": ["9", 0],
+        "image": ["8", 0],
+        "clip_vision": ["10", 0],
+        "weight": 0.6,
+        "weight_type": "linear",
+        "combine_embeds": "concat",
+        "start_at": 0,
+        "end_at": 0.7,
+        "embeds_scaling": "V only"
+      }
+    },
+    "12": {
+      "class_type": "KSampler",
+      "_meta": { "role": "sampler" },
+      "inputs": {
+        "model": ["11", 0],
+        "seed": 42,
+        "steps": 28,
+        "cfg": 5,
+        "sampler_name": "euler_ancestral",
+        "scheduler": "normal",
+        "positive": ["4", 0],
+        "negative": ["5", 0],
+        "latent_image": ["6", 0],
+        "denoise": 1
+      }
+    },
+    "13": {
+      "class_type": "VAEDecode",
+      "inputs": { "samples": ["12", 0], "vae": ["2", 0] }
+    },
+    "14": {
+      "class_type": "SaveImage",
+      "inputs": { "images": ["13", 0], "filename_prefix": "kolors_still" }
+    }
+  }
+}

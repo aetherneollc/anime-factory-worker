@@ -17,10 +17,11 @@ from pathlib import Path
 from typing import Any, Callable, Protocol, Sequence
 
 from anime_factory.models import (
-    IMAGE_MODEL,
     PROMPT_TEMPLATE_VERSION,
     STILL_HEIGHT,
     STILL_WIDTH,
+    still_model_id,
+    still_workflow_name,
 )
 
 QC_VERSION = "visual_qc_v1"
@@ -76,6 +77,9 @@ SCENE_POSITIVE = (
     "anime city street",
     "anime building exterior",
     "empty anime location background",
+    "anime landscape",
+    "anime mountain road",
+    "wide anime environment",
 )
 SCENE_NEGATIVE = (
     "ceramic dinner plate",
@@ -143,9 +147,9 @@ class VisualQcResult:
 
 def current_lineage() -> dict[str, str]:
     return {
-        "model_version": IMAGE_MODEL,
+        "model_version": still_model_id(),
         "prompt_version": PROMPT_TEMPLATE_VERSION,
-        "workflow_version": WORKFLOW_VERSION,
+        "workflow_version": still_workflow_name(),
         "qc_version": QC_VERSION,
     }
 
@@ -882,7 +886,11 @@ def score_still(
         scores["clip_margin"] = float(margin)
         scores["clip_pos"] = float(pos)
         scores["clip_neg"] = float(neg)
-        if margin < CLASS_MARGIN_MIN:
+        # Outdoor plates (cliff, hairpin) sit only ~0.01 above "dinner plate" on
+        # ViT-B-32. A positive margin means the image is a location, not a dish.
+        # Characters still need CLASS_MARGIN_MIN so a near-tie does not pass.
+        scene_is_dish = semantic == "scene" and margin < 0
+        if scene_is_dish or (semantic != "scene" and margin < CLASS_MARGIN_MIN):
             if semantic == "scene":
                 reasons.append("scene_classified_as_dinnerware")
             elif semantic == "character":

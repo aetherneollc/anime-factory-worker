@@ -21,10 +21,12 @@ import time
 from typing import Any, Callable
 
 from anime_factory.models import (
+    ANIMAGINE_WORKFLOW,
     FIXED_NEGATIVE,
     IMAGE_CFG,
     IMAGE_CKPT,
-    IMAGE_MODEL,
+    KOLORS_CHATGLM_FILE,
+    KOLORS_VAE_FILE,
     IMAGE_SAMPLER,
     IMAGE_SCHEDULER,
     IMAGE_STEPS,
@@ -32,13 +34,40 @@ from anime_factory.models import (
     STILL_WIDTH,
     STYLE_PREFIX,
     scrub_copycat,
+    still_model_id,
+    still_unet_file,
+    still_workflow_name,
     style_prefix_for_kind,
 )
 
-STILL_WORKFLOW = "anime_t2i"
+STILL_WORKFLOW = ANIMAGINE_WORKFLOW
+TEXT_ENCODE_TYPES = frozenset(
+    {
+        "CLIPTextEncode",
+        "CLIPTextEncodeSDXL",
+        "CLIPTextEncodeFlux",
+        "MZ_ChatGLM3_V2",
+        "MZ_ChatGLM3_Advance_V2",
+    }
+)
 # Kinds whose whole point is to inherit a parent's identity. No reference node → fail.
 REFERENCE_REQUIRED_KINDS = frozenset({"character_view_derive", "costume_derive"})
-IPADAPTER_CLASS_TYPES = frozenset({"IPAdapterAdvanced", "IPAdapter", "IPAdapterApply"})
+IPADAPTER_CLASS_TYPES = frozenset(
+    {
+        "IPAdapterAdvanced",
+        "IPAdapter",
+        "IPAdapterApply",
+        "MZ_IPAdapterAdvancedKolors",
+    }
+)
+REFERENCE_LOADER_TYPES = frozenset(
+    {
+        "IPAdapterModelLoader",
+        "CLIPVisionLoader",
+        "MZ_IPAdapterModelLoaderKolors",
+        "MZ_KolorsCLIPVisionLoader",
+    }
+)
 REFERENCE_ROLE = "reference_image"
 VIEW_DERIVE_IPADAPTER_WEIGHT = 0.75
 VIEW_DERIVE_IPADAPTER_END_AT = 0.9
@@ -88,8 +117,10 @@ def still_payload_to_prompt(payload: dict) -> dict[str, Any]:
         "cfg": cfg,
         "sampler": str(payload.get("sampler_name") or IMAGE_SAMPLER),
         "scheduler": str(payload.get("scheduler") or IMAGE_SCHEDULER),
-        "ckpt": str(payload.get("ckpt_name") or IMAGE_CKPT),
-        "model": payload.get("model") or IMAGE_MODEL,
+        "ckpt": str(payload.get("ckpt_name") or still_unet_file()),
+        "vae": str(payload.get("vae_name") or KOLORS_VAE_FILE),
+        "chatglm": str(payload.get("chatglm_checkpoint") or KOLORS_CHATGLM_FILE),
+        "model": payload.get("model") or still_model_id(),
         "reference_image": payload.get("reference_image") or "",
         "kind": kind,
         "parent_kind": str(payload.get("_parent_kind") or ""),
@@ -119,7 +150,7 @@ def _drop_reference_chain(prompt: dict) -> None:
         if not isinstance(node, dict):
             continue
         role = (node.get("_meta") or {}).get("role")
-        if node.get("class_type") in {"IPAdapterModelLoader", "CLIPVisionLoader"} or role == REFERENCE_ROLE:
+        if node.get("class_type") in REFERENCE_LOADER_TYPES or role == REFERENCE_ROLE:
             drop.add(nid)
     for node in prompt.values():
         if not isinstance(node, dict):
@@ -141,19 +172,29 @@ def fill_still_workflow(template: dict, spec: dict[str, Any]) -> dict:
         inputs = node.setdefault("inputs", {})
         ctype = node.get("class_type") or ""
         role = (node.get("_meta") or {}).get("role")
-        if ctype in {"CLIPTextEncode", "CLIPTextEncodeSDXL", "CLIPTextEncodeFlux"}:
+        if ctype in TEXT_ENCODE_TYPES:
             if role == "negative" or inputs.get("text") == "NEGATIVE":
                 inputs["text"] = spec["negative"]
             else:
                 inputs["text"] = spec["prompt"]
         if ctype == "CheckpointLoaderSimple" and "ckpt_name" in inputs:
             inputs["ckpt_name"] = spec.get("ckpt", IMAGE_CKPT)
+        if ctype == "MZ_KolorsUNETLoaderV2" and "unet_name" in inputs:
+            inputs["unet_name"] = spec.get("ckpt", still_unet_file())
+        if ctype == "VAELoader" and "vae_name" in inputs:
+            inputs["vae_name"] = spec.get("vae", KOLORS_VAE_FILE)
+        if ctype == "MZ_ChatGLM3Loader" and "chatglm3_checkpoint" in inputs:
+            inputs["chatglm3_checkpoint"] = spec.get("chatglm", KOLORS_CHATGLM_FILE)
         if ctype in {"EmptyLatentImage", "EmptySD3LatentImage"} or "width" in inputs:
             if "width" in inputs:
                 inputs["width"] = spec["width"]
             if "height" in inputs:
                 inputs["height"] = spec["height"]
-        if ctype == "IPAdapterAdvanced":
+            if "target_width" in inputs:
+                inputs["target_width"] = spec["width"]
+            if "target_height" in inputs:
+                inputs["target_height"] = spec["height"]
+        if ctype in IPADAPTER_CLASS_TYPES and ctype != "IPAdapterModelLoader":
             kind = str(spec.get("kind") or "")
             parent_kind = str(spec.get("parent_kind") or "")
             if kind == "character_view_derive":
@@ -221,7 +262,7 @@ def bind_reference_image(payload: dict, template: dict, router) -> str:
         return ""
     if not has_node:
         raise RuntimeError(
-            f"{kind or 'derive'} still carries a parent reference but {STILL_WORKFLOW} has no "
+            f"{kind or 'derive'} still carries a parent reference but {still_workflow_name()} has no "
             "IPAdapter node; refusing to silently drop character identity"
         )
     name = _reference_name(payload, blob)
@@ -244,7 +285,7 @@ def generate_via_comfy(
     from gpu_worker.comfy import extract_execution_error, format_execution_error
 
     loader = load_workflow or _load
-    template = loader(STILL_WORKFLOW)
+    template = loader(still_workflow_name())
     spec = still_payload_to_prompt(payload)
     spec["reference_image"] = bind_reference_image(payload, template, router)
     graph = fill_still_workflow(template, spec)
@@ -282,7 +323,7 @@ def generate_via_comfy(
 
 
 def unload_still_models(router) -> dict:
-    """Drop the SDXL checkpoint from VRAM before H3 sampling on the 32GB card."""
+    """Drop still weights (Animagine or Kolors+ChatGLM) before H3 on the 32GB card."""
     if router is None:
         return {"ok": False, "error": "no_router"}
     free = getattr(router, "free", None)

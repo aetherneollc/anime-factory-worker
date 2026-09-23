@@ -50,7 +50,6 @@ from anime_factory.db import utcnow
 from anime_factory.instrument import Counters
 from anime_factory.models import (
     FIXED_NEGATIVE,
-    IMAGE_MODEL,
     IMAGE_STEPS,
     KOLORS_MODEL,
     MIN_STILL_BYTES,
@@ -63,6 +62,9 @@ from anime_factory.models import (
     animagine_quality_suffix,
     normalize_style_preset,
     scrub_copycat,
+    still_backend,
+    still_model_id,
+    still_workflow_name,
     style_prefix_for_kind,
 )
 from anime_factory.r2_paths import character_asset_rel, join_story, scene_asset_rel
@@ -70,7 +72,6 @@ from anime_factory.visual_qc import (
     MAX_QC_ATTEMPTS,
     QC_SEED_SALTS,
     QC_VERSION,
-    WORKFLOW_VERSION,
     ClipScorer,
     score_still,
     require_clip_for_client,
@@ -421,9 +422,10 @@ def style_prompt(
         composed = f"{body}{extra}"
     else:
         composed = f"{head}, {body}{extra}"
-    tail = animagine_quality_suffix(kind, gender_tag=gender_tag)
-    if tail.lower() not in composed.lower():
-        composed = f"{composed}, {tail}"
+    if still_backend() == "animagine":
+        tail = animagine_quality_suffix(kind, gender_tag=gender_tag)
+        if tail.lower() not in composed.lower():
+            composed = f"{composed}, {tail}"
     return composed
 
 
@@ -454,7 +456,7 @@ def build_scene_plate_payload(
         lists = parse_period_md(period_md)
         positives, negatives = lists.positive, lists.negative
     payload: dict[str, Any] = {
-        "model": IMAGE_MODEL,
+        "model": still_model_id(),
         "prompt": style_prompt(
             prompt,
             positives if world_mode != "fiction" else None,
@@ -685,7 +687,7 @@ class KolorsClient:
         label = str(payload.get("_label") or payload.get("_kind") or "still")
         if self.gpu_generate is not None:
             gpu_payload = dict(payload)
-            gpu_payload["model"] = IMAGE_MODEL
+            gpu_payload["model"] = still_model_id()
             return self._checked(self.gpu_generate(gpu_payload), width, height, label)
         # One size, one aspect. The old ladder retried 1024x1024 / 768x1024 and is
         # why square and portrait sheets are sitting in finished stories.
@@ -1440,10 +1442,10 @@ def write_assets_index(story_root: Path, story_id: str, specs: dict[str, dict], 
         "style_prefix": style_prefix_for_kind("scene_plate"),
         "negative": FIXED_NEGATIVE,
         "vast_for_stills": bool(os.environ.get("ANIME_FACTORY_GPU_STILLS", "").strip().lower() in {"1", "true", "yes", "on"}),
-        "model": IMAGE_MODEL,
-        "model_version": IMAGE_MODEL,
+        "model": still_model_id(),
+        "model_version": still_model_id(),
         "prompt_version": PROMPT_TEMPLATE_VERSION,
-        "workflow_version": WORKFLOW_VERSION,
+        "workflow_version": still_workflow_name(),
         "qc_version": QC_VERSION,
         "items": items,
     }
@@ -1718,7 +1720,7 @@ def _render_spec(
         else prefix
     )
     payload: dict[str, Any] = {
-        "model": IMAGE_MODEL,
+        "model": still_model_id(),
         "prompt": style_prompt(
             prompt,
             pos,

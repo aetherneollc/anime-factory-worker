@@ -86,7 +86,38 @@ RUN git init /opt/ComfyUI/custom_nodes/ComfyUI_IPAdapter_plus \
          https://github.com/cubiq/ComfyUI_IPAdapter_plus.git \
     && git -C /opt/ComfyUI/custom_nodes/ComfyUI_IPAdapter_plus fetch --depth 1 origin "${IPADAPTER_PLUS_REF}" \
     && git -C /opt/ComfyUI/custom_nodes/ComfyUI_IPAdapter_plus checkout --detach FETCH_HEAD \
-    && mkdir -p /opt/ComfyUI/models/ipadapter /opt/ComfyUI/models/clip_vision /opt/ComfyUI/models/visual_qc
+    && mkdir -p /opt/ComfyUI/models/ipadapter /opt/ComfyUI/models/clip_vision /opt/ComfyUI/models/visual_qc /opt/ComfyUI/models/LLM
+
+# Kolors is ChatGLM3 + UNet, not an SDXL checkpoint. IPAdapter_plus stays for Animagine.
+ARG KOLORS_MZ_REF=43ec2701a1390259a17ef3bea6244a3134aa5153
+RUN git init /opt/ComfyUI/custom_nodes/ComfyUI-Kolors-MZ \
+    && git -C /opt/ComfyUI/custom_nodes/ComfyUI-Kolors-MZ remote add origin \
+         https://github.com/MinusZoneAI/ComfyUI-Kolors-MZ.git \
+    && git -C /opt/ComfyUI/custom_nodes/ComfyUI-Kolors-MZ fetch --depth 1 origin "${KOLORS_MZ_REF}" \
+    && git -C /opt/ComfyUI/custom_nodes/ComfyUI-Kolors-MZ checkout --detach FETCH_HEAD \
+    && pip install --no-cache-dir sentencepiece protobuf accelerate
+
+RUN KOLORS_MZ_REF="${KOLORS_MZ_REF}" python3 - <<'PY'
+import json
+import os
+import subprocess
+from pathlib import Path
+
+comfy = Path("/opt/ComfyUI")
+node = comfy / "custom_nodes" / "ComfyUI-Kolors-MZ"
+manifest_path = comfy / ".af-source-manifest.json"
+manifest = {}
+if manifest_path.is_file():
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+manifest["kolors_mz_ref"] = os.environ["KOLORS_MZ_REF"]
+try:
+    manifest["kolors_mz_sha"] = subprocess.check_output(
+        ["git", "-C", str(node), "rev-parse", "HEAD"], text=True
+    ).strip()
+except Exception:
+    manifest["kolors_mz_sha"] = ""
+manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+PY
 
 RUN IPADAPTER_PLUS_REF="${IPADAPTER_PLUS_REF}" python3 - <<'PY'
 import json

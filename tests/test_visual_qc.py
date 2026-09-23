@@ -200,6 +200,22 @@ def test_zero_shot_scene_prefers_interior_over_dish():
     )
     assert bad.verdict == "fail"
     assert "scene_classified_as_dinnerware" in bad.reasons
+    # Cliff/hairpin plates land ~0.02 above dinnerware. That is a location, not a dish.
+    weak = score_still(
+        blob,
+        kind="scene_plate",
+        prompt="anime mountain road, cliff overlook, empty anime location background",
+        scorer=ScriptedClipScorer(
+            image_embed=(1.0, 0.96),
+            text_embed=text_vec,
+            model_id="scripted:weak-location",
+        ),
+        allow_placeholder=True,
+    )
+    assert weak.scores["clip_margin"] < CLASS_MARGIN_MIN
+    assert weak.scores["clip_margin"] > 0
+    assert weak.verdict == "pass"
+    assert "scene_classified_as_dinnerware" not in weak.reasons
 
 
 def test_zero_shot_character_rejects_heads_and_nude():

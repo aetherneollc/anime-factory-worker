@@ -11,6 +11,17 @@ QC_MODEL = "Qwen/Qwen3.5-4B"
 # guidance-distilled, so cfg=1 silently dropped FIXED_NEGATIVE; real CFG needs SDXL.
 IMAGE_MODEL = "cagliostrolab/animagine-xl-4.0"
 IMAGE_CKPT = "animagine-xl-4.0.safetensors"
+# GPU stills default to local Kwai Kolors. Animagine stays selectable.
+# Kolors is not an SDXL checkpoint: ChatGLM3 encodes text, so it cannot reuse anime_t2i.
+STILL_BACKENDS = ("kolors", "animagine")
+DEFAULT_STILL_BACKEND = "kolors"
+KOLORS_UNET_FILE = "kolors_unet_fp16.safetensors"
+KOLORS_VAE_FILE = "kolors_vae_fp16.safetensors"
+KOLORS_CHATGLM_FILE = "chatglm3-fp16.safetensors"
+KOLORS_IPADAPTER_FILE = "kolors_ip_adapter_plus_general.bin"
+KOLORS_CLIP_VISION_FILE = "kolors_ip_image_encoder.bin"
+KOLORS_WORKFLOW = "kolors_t2i"
+ANIMAGINE_WORKFLOW = "anime_t2i"
 IMAGE_STEPS = 28
 IMAGE_CFG = 5.0
 IMAGE_SAMPLER = "euler_ancestral"
@@ -95,6 +106,32 @@ FIXED_NEGATIVE = (
     "ghost film, horror lighting, corpse-pale skin, wet gloomy face, empty horror corridor, "
     "undead eyes, found footage, dead white skin, haunted hallway"
 )
+
+
+class StillBackendError(ValueError):
+    """STILL_BACKEND is not kolors or animagine. Never silently pick one."""
+
+
+def still_backend() -> str:
+    """Active GPU still backend. Invalid values fail closed."""
+    raw = (os.environ.get("STILL_BACKEND") or DEFAULT_STILL_BACKEND).strip().lower()
+    if raw not in STILL_BACKENDS:
+        raise StillBackendError(
+            f"STILL_BACKEND must be one of {STILL_BACKENDS}, got {raw!r}"
+        )
+    return raw
+
+
+def still_model_id() -> str:
+    return KOLORS_MODEL if still_backend() == "kolors" else IMAGE_MODEL
+
+
+def still_workflow_name() -> str:
+    return KOLORS_WORKFLOW if still_backend() == "kolors" else ANIMAGINE_WORKFLOW
+
+
+def still_unet_file() -> str:
+    return KOLORS_UNET_FILE if still_backend() == "kolors" else IMAGE_CKPT
 
 
 def normalize_style_preset(preset: str | None = None) -> str:

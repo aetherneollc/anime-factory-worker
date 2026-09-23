@@ -15,10 +15,11 @@ START_SH = REPO_ROOT / "deploy" / "gpu-worker" / "start.sh"
 
 
 def test_still_files_include_openclip_vit_b32_not_vit_h():
-    by_dest = {item["dest"]: item for item in weights.STILL_FILES}
+    by_dest = {item["dest"]: item for item in weights.still_weight_files("kolors")}
     clip_qc = by_dest[weights.VISUAL_QC_CLIP_WEIGHT_DEST]
     config_qc = by_dest[weights.VISUAL_QC_CLIP_CONFIG_DEST]
-    clip_ip = by_dest[weights.CLIP_VISION_DEST]
+    assert weights.CLIP_VISION_DEST not in by_dest
+    clip_ip = {item["dest"]: item for item in weights.still_weight_files("animagine")}[weights.CLIP_VISION_DEST]
 
     assert clip_qc["repo"] == "timm/vit_base_patch32_clip_224.openai"
     assert clip_qc["hf"] == "open_clip_model.safetensors"

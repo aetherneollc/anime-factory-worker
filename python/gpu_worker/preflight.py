@@ -38,6 +38,10 @@ WEIGHT_PULL_TIMEOUT_S = 3600.0
 REQUIRED_COMFY_NODES = frozenset(
     {
         "IPAdapterAdvanced",
+        "MZ_KolorsUNETLoaderV2",
+        "MZ_ChatGLM3Loader",
+        "MZ_ChatGLM3_Advance_V2",
+        "MZ_IPAdapterAdvancedKolors",
         "MiniMaxH3ImageToVideo",
         "MiniMaxH3ReferenceToVideo",
         "MiniMaxH3SigmaShift",

@@ -24,7 +24,7 @@ from anime_factory.design import (
     style_prompt,
 )
 from anime_factory.directors.common import is_chain_head, needs_first_frame_still
-from anime_factory.models import IMAGE_MODEL, STILL_HEIGHT, STILL_IMAGE_SIZE, STILL_WIDTH
+from anime_factory.models import STILL_HEIGHT, STILL_IMAGE_SIZE, STILL_WIDTH, still_model_id
 from anime_factory.r2_paths import join_story
 from anime_factory.visual_qc import (
     QC_SEED_SALTS,
@@ -289,7 +289,7 @@ def _mint_still(
     for salt in QC_SEED_SALTS:
         seed = locked_seed(f"{story_id}:{seed_key}", salt)
         payload: dict = {
-            "model": IMAGE_MODEL,
+            "model": still_model_id(),
             "prompt": styled,
             "negative_prompt": style_negative(negatives, base=bible_negative),
             "seed": seed,

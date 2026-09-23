@@ -365,7 +365,8 @@ def test_identity_conditioned_negative_omits_hoodie_when_identity_is_hoodie():
     assert "olive pants" in black_pants_neg
 
 
-def test_style_prompt_appends_animagine_quality_tags_at_end():
+def test_style_prompt_appends_animagine_quality_tags_at_end(monkeypatch):
+    monkeypatch.setenv("STILL_BACKEND", "animagine")
     prompt = style_prompt("night loft desk", kind="scene_plate")
     assert prompt.endswith("safe")
     assert "masterpiece" in prompt

@@ -512,14 +512,14 @@ def test_h3_sampler_steps_default_remains_eight(monkeypatch):
 
 
 def test_h3_dit_defaults_to_community_pruned_nvfp4():
-    by_dest = {item["dest"]: item for item in weights.H3_AND_KOLORS_FILES}
+    by_dest = {item["dest"]: item for item in weights.runtime_weight_files("kolors")}
     fl2va = by_dest["models/diffusion_models/minimax_h3_fl2va_pruned_nvfp4.safetensors"]
     ref2va = by_dest["models/diffusion_models/minimax_h3_ref2va_pruned_nvfp4.safetensors"]
     te = by_dest["models/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"]
     video_vae = by_dest["models/vae/minimax_h3_video_vae_fp16.safetensors"]
-    still = by_dest["models/checkpoints/animagine-xl-4.0.safetensors"]
-    ipadapter = by_dest["models/ipadapter/ip-adapter-plus_sdxl_vit-h.safetensors"]
-    clip_vision = by_dest["models/clip_vision/CLIP-ViT-H-14-laion2B-s32B-b79K.safetensors"]
+    still = by_dest[weights.KOLORS_UNET_DEST]
+    ipadapter = by_dest[weights.KOLORS_IPADAPTER_DEST]
+    clip_vision = by_dest[weights.KOLORS_CLIP_VISION_DEST]
     visual_qc = by_dest[weights.VISUAL_QC_CLIP_WEIGHT_DEST]
     visual_cfg = by_dest[weights.VISUAL_QC_CLIP_CONFIG_DEST]
     assert fl2va["repo"] == "lilcheaty/MiniMax-H3-NVFP4"
@@ -529,19 +529,21 @@ def test_h3_dit_defaults_to_community_pruned_nvfp4():
     assert te["repo"] == "Comfy-Org/MiniMax-H3"
     assert video_vae["repo"] == "Comfy-Org/MiniMax-H3"
     assert "models/vae/minimax_h3_audio_vae_fp32.safetensors" not in by_dest
-    # Stills are anime-native SDXL now: real CFG, so FIXED_NEGATIVE is not dead code.
-    assert still["repo"] == "cagliostrolab/animagine-xl-4.0"
-    assert still["hf"] == "animagine-xl-4.0.safetensors"
-    # IP-Adapter + ViT-H are what make the locked sheet bind to the shot.
-    assert ipadapter["repo"] == "h94/IP-Adapter"
-    assert ipadapter["hf"] == "sdxl_models/ip-adapter-plus_sdxl_vit-h.safetensors"
-    assert clip_vision["repo"] == "h94/IP-Adapter"
-    assert clip_vision["hf"] == "models/image_encoder/model.safetensors"
+    assert still["repo"] == "Kwai-Kolors/Kolors"
+    assert still["hf"] == "unet/diffusion_pytorch_model.fp16.safetensors"
+    assert ipadapter["repo"] == "Kwai-Kolors/Kolors-IP-Adapter-Plus"
+    assert ipadapter["hf"] == "ip_adapter_plus_general.bin"
+    assert clip_vision["repo"] == "Kwai-Kolors/Kolors-IP-Adapter-Plus"
+    assert clip_vision["hf"] == "image_encoder/pytorch_model.bin"
+    animagine = {item["dest"]: item for item in weights.still_weight_files("animagine")}
+    assert animagine["models/checkpoints/animagine-xl-4.0.safetensors"]["repo"] == "cagliostrolab/animagine-xl-4.0"
+    assert "models/checkpoints/animagine-xl-4.0.safetensors" not in by_dest
     assert visual_qc["repo"] == weights.VISUAL_QC_CLIP_REPO
     assert visual_qc["hf"] == weights.VISUAL_QC_CLIP_WEIGHT_HF
     assert visual_cfg["hf"] == weights.VISUAL_QC_CLIP_CONFIG_HF
     assert "clip_vision" not in visual_qc["dest"]
     assert "visual_qc" not in clip_vision["dest"]
+    assert weights.KOLORS_CHATGLM_DEST in by_dest
     assert "models/Kolors" not in by_dest
     assert not any("flux" in dest for dest in by_dest)
     assert not any(item.get("snapshot") == "1" for item in weights.H3_AND_KOLORS_FILES)
@@ -578,15 +580,19 @@ def test_still_weights_do_not_block_on_h3(tmp_path, monkeypatch):
     still = weights.ensure_still_weights(tmp_path)
     assert still["kind"] == "stills"
     assert pulled == [
-        "animagine-xl-4.0.safetensors",
-        "sdxl_models/ip-adapter-plus_sdxl_vit-h.safetensors",
-        "models/image_encoder/model.safetensors",
+        "unet/diffusion_pytorch_model.fp16.safetensors",
+        "vae/diffusion_pytorch_model.fp16.safetensors",
+        "chatglm3-fp16.safetensors",
+        "ip_adapter_plus_general.bin",
+        "image_encoder/pytorch_model.bin",
         weights.VISUAL_QC_CLIP_WEIGHT_HF,
         weights.VISUAL_QC_CLIP_CONFIG_HF,
     ]
-    assert (tmp_path / "models/checkpoints/animagine-xl-4.0.safetensors").is_file()
-    assert (tmp_path / "models/ipadapter/ip-adapter-plus_sdxl_vit-h.safetensors").is_file()
-    assert (tmp_path / "models/clip_vision/CLIP-ViT-H-14-laion2B-s32B-b79K.safetensors").is_file()
+    assert (tmp_path / weights.KOLORS_UNET_DEST).is_file()
+    assert (tmp_path / weights.KOLORS_VAE_DEST).is_file()
+    assert (tmp_path / weights.KOLORS_CHATGLM_DEST).is_file()
+    assert (tmp_path / weights.KOLORS_IPADAPTER_DEST).is_file()
+    assert not (tmp_path / "models/checkpoints/animagine-xl-4.0.safetensors").exists()
     assert (tmp_path / weights.VISUAL_QC_CLIP_WEIGHT_DEST).is_file()
     assert (tmp_path / weights.VISUAL_QC_CLIP_CONFIG_DEST).is_file()
     assert not (tmp_path / "models/diffusion_models/minimax_h3_fl2va_pruned_nvfp4.safetensors").exists()
