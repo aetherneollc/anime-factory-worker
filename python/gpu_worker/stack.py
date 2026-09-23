@@ -32,6 +32,7 @@ from gpu_worker.preflight import (
     select_profile_id,
 )
 from anime_factory.video_backend import VideoBackendLockError, lock_video_backend
+from gpu_worker.kolors_compat import patch_kolors_chatglm_transformers5
 from gpu_worker.weights import (
     ensure_still_weights,
     runtime_weight_bytes,
@@ -1310,6 +1311,7 @@ def boot_gpu_stack(progress: Callable[[str], None] | None = None) -> dict:
     ensure_infer_schema_sitecustomize()
     patch_kitchen_triton_optional()
     patch_comfy_kitchen_for_torch26()
+    patch_kolors_chatglm_transformers5()
     try:
         backend = lock_video_backend()
     except VideoBackendLockError as exc:

@@ -294,6 +294,9 @@ ENV PYTHONPATH=/app/python \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     HF_HUB_DISABLE_XET=1
 
+# transformers>=5 drops ChatGLMConfig.use_cache; Kolors encode reads it.
+RUN python3 -c "from gpu_worker.kolors_compat import patch_kolors_chatglm_transformers5; patched = patch_kolors_chatglm_transformers5(); assert patched, 'kolors chatglm patch missed'"
+
 LABEL org.aetherneo.anime-factory.comfy="true" \
       org.aetherneo.anime-factory.h3="true" \
       org.aetherneo.anime-factory.video-backend="h3" \
