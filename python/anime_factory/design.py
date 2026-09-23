@@ -115,16 +115,20 @@ SHEET_NEGATIVE = (
 )
 # Kolors pools ChatGLM hidden_states[-1][-1] — the last token — into the SDXL
 # timestep embed, and that vector sets the crop. The encoder is causal, so the
-# tail outweighs the head. 48de22d led with an English full-length sentence and
-# Qwen still saw busts: "character reference" is a poster cue, and the pooled
-# token was the identity / "simple background" tail. Keep a short English lead
-# for cross-attention, then end on a Chinese full-length lock (Kolors' training
-# language). Bust bans must also be the last negative clause, inside the
-# 256-token window, or the pooled negative is horror wording instead of a crop ban.
+# tail outweighs the head. 48de22d led with English and the pooled token was
+# still the identity tail, so Qwen saw busts. 618fd30 appended a Chinese
+# full-length clause but then ended on "looking straight at camera", which
+# pools as a portrait. Gaze and view tags stay in the tail for cross-attention;
+# the final tokens must be the Chinese crop lock. Bust bans must also be the
+# last negative tokens, inside the 256-token window.
 _CHARACTER_STILL_KINDS = frozenset({"character_sheet", "character_view_derive", "costume_derive"})
 _KOLORS_TOKEN_BUDGET = 220
+# Last tokens of every character still. Do not append English after this.
+KOLORS_CHARACTER_CROP_LOCK = (
+    "全身，从头顶到两只鞋完整入画，脚下留白，双脚和鞋子都完整可见，全身"
+)
 KOLORS_CHARACTER_FRAMING = (
-    "full body shot, long shot, head to toe, "
+    "full body shot, long shot, zoomed out, head to toe, "
     "the whole figure from the top of the head to both shoes fits inside the frame, "
     "both feet fully visible, standing with empty space below the shoes"
 )
@@ -132,24 +136,21 @@ KOLORS_CHARACTER_PREFIX = (
     "original anime, solo, cel shaded, clean lineart, warm ivory studio background"
 )
 KOLORS_CHARACTER_TAIL_FRONT = (
-    "全身，从头顶到两只鞋完整入画，脚下留白，双脚和鞋子都完整可见，正面站立直视镜头, "
-    "both shoes fully visible, looking straight at camera"
+    "正面站立直视镜头, looking straight at camera, " + KOLORS_CHARACTER_CROP_LOCK
 )
 KOLORS_CHARACTER_TAIL_SIDE = (
-    "全身，从头顶到两只鞋完整入画，脚下留白，双脚和鞋子都完整可见，严格左侧面, "
-    "both shoes fully visible, strict side profile"
+    "严格左侧面, strict side profile, " + KOLORS_CHARACTER_CROP_LOCK
 )
 KOLORS_CHARACTER_TAIL_BACK = (
-    "全身，从头顶到两只鞋完整入画，脚下留白，双脚和鞋子都完整可见，严格背面，脸完全不可见, "
-    "both shoes fully visible, strict rear view, face hidden"
+    "严格背面，脸完全不可见, strict rear view, face hidden, " + KOLORS_CHARACTER_CROP_LOCK
 )
 KOLORS_CHARACTER_NEGATIVE_LEAD = (
     "close-up, portrait, headshot, bust, cowboy shot, upper body, half body, "
     "cropped legs, cropped feet, missing shoes, zoomed in"
 )
 KOLORS_CHARACTER_NEGATIVE_TAIL = (
-    "半身，特写，大头照，上半身，裁掉双腿，裁掉脚，看不见鞋子, "
-    "bust, cropped feet, missing shoes, not full body"
+    "bust, cropped feet, missing shoes, not full body, "
+    "半身，特写，大头照，上半身，裁掉双腿，裁掉脚，看不见鞋子"
 )
 ESTABLISHING_PLATE_LOOK = (
     "anime location background, wide establishing shot, no characters, "

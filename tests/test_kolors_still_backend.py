@@ -129,7 +129,8 @@ def test_kolors_character_prompt_leads_with_full_length_framing(monkeypatch):
     assert "character reference" not in lowered
     assert lowered.index("both feet fully visible") < lowered.index("black leather")
     assert lowered.index("black leather") < lowered.index("looking straight at camera")
-    assert prompt.endswith("looking straight at camera")
+    assert prompt.index("looking straight at camera") < prompt.index("全身，从头顶到两只鞋完整入画")
+    assert prompt.endswith("全身")
     assert "直视镜头" in prompt
     assert KOLORS_CHARACTER_FRAMING.split(",")[0].lower() in lowered
 
@@ -144,7 +145,8 @@ def test_kolors_character_negative_puts_bust_bans_first(monkeypatch):
     assert lowered.startswith("close-up")
     assert "cropped feet" in lowered
     assert lowered.index("bust") < lowered.index("photorealistic")
-    assert lowered.endswith("not full body")
+    assert "not full body" in lowered
+    assert negative.endswith("看不见鞋子")
     assert "裁掉脚" in negative
     assert KOLORS_CHARACTER_NEGATIVE_LEAD.split(",")[0] in lowered
 
@@ -172,14 +174,16 @@ def test_kolors_character_tail_follows_view(monkeypatch):
         "1boy, short black hair, brown eyes, black jacket, from side, strict left side profile, full body",
         kind="character_view_derive",
     )
-    assert side.endswith("strict side profile")
+    assert "strict side profile" in side
+    assert side.endswith("全身")
     assert "looking straight at camera" not in side
     assert "直视镜头" not in side
     back = style_prompt(
         "1boy, short black hair, brown eyes, black jacket, from behind, facing away, strict rear view, full body",
         kind="character_view_derive",
     )
-    assert back.endswith("face hidden")
+    assert "face hidden" in back
+    assert back.endswith("全身")
     assert "looking straight at camera" not in back
     assert "直视镜头" not in back
 
@@ -192,7 +196,8 @@ def test_kolors_negative_tail_survives_a_long_bible_negative(monkeypatch):
         base="photorealistic, " + ", ".join(f"filler clause {i}" for i in range(80)),
     )
     assert negative.lower().startswith("close-up")
-    assert negative.lower().endswith("not full body")
+    assert "not full body" in negative.lower()
+    assert negative.endswith("看不见鞋子")
     assert "cropped feet" in negative.lower()
     assert "khaki pants" in negative.lower()
 
