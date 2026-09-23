@@ -49,7 +49,6 @@ from anime_factory.config import load_settings
 from anime_factory.db import utcnow
 from anime_factory.instrument import Counters
 from anime_factory.models import (
-    DEFAULT_STYLE_PRESET,
     FIXED_NEGATIVE,
     IMAGE_MODEL,
     IMAGE_STEPS,
@@ -99,17 +98,33 @@ SIDE_LOOK = (
     "solo, from side, strict left side profile, full body, standing, simple background"
 )
 BACK_LOOK = (
-    "solo, from behind, facing away, strict rear view, full body, standing, simple background"
+    "solo, from behind, facing away, strict rear view, full body, standing, simple background, "
+    "back of head visible, face completely hidden, no looking back, no head rotation, no over-the-shoulder pose"
+)
+BACK_NEGATIVE = (
+    "looking back, looking at viewer, head turn, profile, over-the-shoulder, visible face"
 )
 TURNAROUND_LOOK = FRONT_LOOK
 SHEET_LOOK = FRONT_LOOK
 SHEET_NEGATIVE = (
     "character turnaround, multiple views, split panel, collage, contact sheet, floating heads, "
     "cropped body, cinematic still, movie screenshot, dramatic rim light, scenery background, "
-    "text on the sheet, caption"
+    "text on the sheet, caption, portrait, upper body, bust, half body, cropped feet, close-up"
 )
-PLATE_LOOK = "anime location background, empty establishing shot"
-PLATE_NEGATIVE = "famous movie still, generic sunset cloud plate, people, crowd, text, ceramic plate, dish, dinnerware, bowl"
+ESTABLISHING_PLATE_LOOK = (
+    "anime location background, wide establishing shot, no characters, "
+    "foreground, midground, background, architectural perspective, "
+    "clear luminous atmosphere, layered clouds, volumetric light, "
+    "atmospheric perspective, saturated blue and gold light"
+)
+DETAIL_PLATE_LOOK = (
+    "anime location background, empty location shot, no characters, "
+    "hand-painted background, volumetric light, atmospheric perspective, "
+    "saturated blue and gold light"
+)
+# Default for callers that still reference PLATE_LOOK; prefer plate_look_for().
+PLATE_LOOK = ESTABLISHING_PLATE_LOOK
+PLATE_NEGATIVE = "famous movie still, people, crowd, text, ceramic plate, dish, dinnerware, bowl"
 PROP_LOOK = "prop design sheet, product turnaround, plain studio background"
 PROP_NEGATIVE = "cinematic still, scenery background, people, text"
 IDENTITY_PROMPT_MAX_CHARS = 1000
@@ -203,7 +218,8 @@ class CharacterIdentityError(KolorsPayloadError):
 def sanitize_location_prompt(text: str) -> str:
     """Location positives must never carry standalone `plate` (Animagine reads it as dinnerware)."""
     out = scrub_copycat(str(text or ""))
-    out = re.sub(r"\bestablishing\s+plate\b", "empty establishing shot", out, flags=re.I)
+    out = re.sub(r"\bestablishing\s+plate\b", "wide establishing shot", out, flags=re.I)
+    out = re.sub(r"\bempty\s+establishing\s+shot\b", "wide establishing shot", out, flags=re.I)
     out = re.sub(r"\bbackground\s+plate\b", "anime location background", out, flags=re.I)
     out = re.sub(r"\blocation\s+plate\b", "anime location background", out, flags=re.I)
     if _STANDALONE_PLATE_RE.search(out):
@@ -211,6 +227,30 @@ def sanitize_location_prompt(text: str) -> str:
     if _CJK_STILL_RE.search(out):
         raise LocationPromptError(f"location still prompt must be English-only: {out[:160]}")
     return out.strip(" ,")
+
+
+def plate_look_for(prompt: str | None = None, *, establishing: bool | None = None) -> str:
+    """Establishing vs detail plate wording. Detail must never say 'empty establishing shot'."""
+    if establishing is False:
+        return DETAIL_PLATE_LOOK
+    if establishing is True:
+        return ESTABLISHING_PLATE_LOOK
+    low = str(prompt or "").lower()
+    detail_markers = (
+        "interior",
+        "close",
+        "detail",
+        "close-up",
+        "closeup",
+        "product",
+        "doorway",
+        "corner",
+        "desk",
+        "counter",
+    )
+    if any(marker in low for marker in detail_markers) and "establishing" not in low:
+        return DETAIL_PLATE_LOOK
+    return ESTABLISHING_PLATE_LOOK
 
 
 def _gender_tag_from_fields(identity: str, gender: str | None = None) -> str:
@@ -338,7 +378,12 @@ def identity_conditioned_negative(identity: str | None) -> str:
     return ", ".join(extra)
 
 
-def _kind_negative(kind: str | None, identity: str | None = None) -> str:
+def _kind_negative(
+    kind: str | None,
+    identity: str | None = None,
+    *,
+    view: str | None = None,
+) -> str:
     """Per-asset-kind negatives. A turnaround must not be cinematic; a plate must not be famous."""
     base = {
         "character_sheet": SHEET_NEGATIVE,
@@ -348,8 +393,12 @@ def _kind_negative(kind: str | None, identity: str | None = None) -> str:
         "prop": PROP_NEGATIVE,
     }.get(str(kind or ""), "")
     if str(kind or "") in {"character_sheet", "character_view_derive", "costume_derive"}:
-        extra = identity_conditioned_negative(identity)
-        return ", ".join(part for part in (base, extra) if part)
+        parts = [base, identity_conditioned_negative(identity)]
+        resolved_view = str(view or "").strip().lower()
+        prompt_low = str(identity or "").lower()
+        if resolved_view == "back" or "from behind" in prompt_low or "strict rear view" in prompt_low:
+            parts.append(BACK_NEGATIVE)
+        return ", ".join(part for part in parts if part)
     return base
 
 
@@ -878,7 +927,7 @@ def plan_derive_specs(
                 "scene_id": child,
                 "parent_id": lid,
                 "path": scene_asset_rel(child, PLATE_FILENAME),
-                "prompt": f"{prompt}, {desc}, {PLATE_LOOK}{extra}",
+                "prompt": f"{prompt}, {desc}, {plate_look_for(f'{prompt}, {desc}')}{extra}",
                 "seed": int(seed) + abs(locked_seed(slug)) % 997,
                 "image_size": SCENE_IMAGE_SIZE,
                 "_kind": "scene_derive",
@@ -1123,9 +1172,8 @@ def style_md_prefix(story_root: Path | None) -> tuple[str, str]:
         else:
             pos_lines.append(line)
     bible_prefix = scrub_copycat(" ".join(p.strip() for p in pos_lines if p.strip()) or prefix)
-    if normalize_style_preset() == DEFAULT_STYLE_PRESET:
-        prefix = bible_prefix
-    elif bible_prefix and bible_prefix not in {STYLE_PREFIX, selected_prefix}:
+    # Story bible adds palette; it must not replace the luminous location prefix.
+    if bible_prefix and bible_prefix not in {STYLE_PREFIX, selected_prefix, prefix}:
         prefix = f"{selected_prefix}, {bible_prefix}"
     if neg_line:
         negative = scrub_copycat(neg_line)
@@ -1181,13 +1229,14 @@ def plan_library_specs(
             ("back", CHAR_BACK_FILENAME, BACK_LOOK, 211),
         ):
             view_aid = f"char_{cid}_{view}"
+            lock = f", {DERIVE_FACE_LOCK}" if view == "side" else ""
             specs[view_aid] = {
                 "id": view_aid,
                 "kind": "character_view_derive",
                 "view": view,
                 "character_id": cid,
                 "path": character_asset_rel(cid, filename),
-                "prompt": f"{identity}, {look}, {DERIVE_FACE_LOCK}{extra}",
+                "prompt": f"{identity}, {look}{lock}{extra}",
                 "gender_tag": gender_tag,
                 "seed": int(seed) + seed_offset,
                 "image_size": CHAR_IMAGE_SIZE,
@@ -1214,9 +1263,16 @@ def plan_library_specs(
         name = loc.get("name") or lid
         raw_prompt = loc.get("plate_prompt") or loc.get("location_prompt") or loc.get("identity_prompt")
         if not raw_prompt and _CJK_STILL_RE.search(str(name or "")):
-            raw_prompt = f"{lid} anime location background, empty establishing shot, no people, no text"
+            raw_prompt = (
+                f"{lid} anime location background, wide establishing shot, no characters, "
+                "no people, no text"
+            )
         prompt = sanitize_location_prompt(
-            raw_prompt or f"{name} anime location background, empty establishing shot, no people, no text"
+            raw_prompt
+            or (
+                f"{name} anime location background, wide establishing shot, no characters, "
+                "no people, no text"
+            )
         )
         seed = loc.get("seed") if loc.get("seed") is not None else locked_seed(f"loc:{lid}")
         aid = f"plate_{lid}"
@@ -1225,7 +1281,7 @@ def plan_library_specs(
             "kind": "scene_plate",
             "scene_id": lid,
             "path": f"assets/scenes/{lid}/plate_base.png",
-            "prompt": f"{prompt}, {PLATE_LOOK}{extra}",
+            "prompt": f"{prompt}, {plate_look_for(prompt)}{extra}",
             "seed": int(seed),
             "image_size": SCENE_IMAGE_SIZE,
         }
@@ -1236,7 +1292,8 @@ def plan_library_specs(
             continue
         name = interior.get("name") or scene_id
         prompt = sanitize_location_prompt(
-            interior.get("plate_prompt") or f"{name} interior, anime location background, empty, no people, no text"
+            interior.get("plate_prompt")
+            or f"{name} interior, anime location background, empty, no people, no text"
         )
         seed = locked_seed(f"int:{scene_id}")
         aid = f"plate_{scene_id}"
@@ -1245,7 +1302,7 @@ def plan_library_specs(
             "kind": "scene_plate",
             "scene_id": scene_id,
             "path": interior.get("asset_path") or f"assets/scenes/{scene_id}/plate_base.png",
-            "prompt": f"{prompt}, {PLATE_LOOK}{extra}",
+            "prompt": f"{prompt}, {plate_look_for(prompt, establishing=False)}{extra}",
             "seed": int(seed),
             "image_size": SCENE_IMAGE_SIZE,
         }
@@ -1578,7 +1635,31 @@ def _render_until_qc(
             allow_placeholder=not require_clip,
             seed=seed,
             label=str(work.get("id") or kind),
+            view=str(work.get("view") or "") or None,
         )
+        if (
+            qc.passed
+            and require_clip
+            and kind in {"character_sheet", "character_view_derive"}
+        ):
+            from anime_factory.llm import master_vision_qc
+            from anime_factory.visual_qc import VisualQcResult
+
+            vision = master_vision_qc(
+                png,
+                view=str(work.get("view") or ("front" if kind == "character_sheet" else "")),
+                kind=kind,
+            )
+            if not vision.passed:
+                qc = VisualQcResult(
+                    verdict="fail",
+                    reasons=list(vision.reasons),
+                    scores=dict(qc.scores),
+                    scorer=qc.scorer,
+                    lineage=dict(qc.lineage),
+                    kind=qc.kind,
+                    seed=qc.seed,
+                )
         last_png, last_rel, last_qc = png, rel, qc
         if story_root is not None:
             dest = Path(story_root) / rel
@@ -1646,7 +1727,9 @@ def _render_spec(
             gender_tag=spec.get("gender_tag") or _gender_tag_from_fields(prompt, None),
         ),
         "negative_prompt": style_negative(
-            neg, base=negative_base, extra=_kind_negative(kind, prompt)
+            neg,
+            base=negative_base,
+            extra=_kind_negative(kind, prompt, view=str(spec.get("view") or "")),
         ),
         "image_size": spec.get("image_size") or CHAR_IMAGE_SIZE,
         "batch_size": 1,
@@ -1660,12 +1743,19 @@ def _render_spec(
         payload["_parent_png"] = parent_png
         payload["_parent_id"] = str(spec.get("parent_id") or "")
         payload["_kind"] = kind if kind in {"character_view_derive", "costume_derive"} else "costume_derive"
+        view = str(spec.get("view") or "").strip().lower()
+        locked_prompt = prompt if (kind == "character_view_derive" and view == "back") else f"{prompt}, {DERIVE_FACE_LOCK}"
         payload["prompt"] = style_prompt(
-            f"{prompt}, {DERIVE_FACE_LOCK}",
+            locked_prompt,
             pos,
             prefix=prompt_prefix,
             kind=payload["_kind"],
             gender_tag=spec.get("gender_tag") or _gender_tag_from_fields(prompt, None),
+        )
+        payload["negative_prompt"] = style_negative(
+            neg,
+            base=negative_base,
+            extra=_kind_negative(kind, prompt, view=view),
         )
     png = client.generate(payload)
     return png
@@ -2442,7 +2532,10 @@ def harbor_mvp_cast() -> tuple[list[dict], list[dict], list[dict], list[dict]]:
         {
             "id": "harbor",
             "name": "暮潮码头",
-            "plate_prompt": "wooden harbor dock at madder dusk, wet planks, lanterns, empty boats, anime location background, empty establishing shot, no people, no text",
+            "plate_prompt": (
+                "wooden harbor dock at madder dusk, wet planks, lanterns, empty boats, "
+                "anime location background, wide establishing shot, no characters, no people, no text"
+            ),
         }
     ]
     interiors = [

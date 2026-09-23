@@ -50,7 +50,8 @@ def test_style_prefix_is_original_production_art_not_shinkai_stills():
     assert "shinkai style" not in STYLE_PREFIX.lower()
     for term in ("Makoto Shinkai", "君の名は", "天气之子", "秒速5厘米"):
         assert term in FIXED_NEGATIVE
-    assert "generic endless sunset" in FIXED_NEGATIVE
+    assert "generic endless sunset" not in FIXED_NEGATIVE
+    assert "clear luminous atmosphere" in STYLE_PREFIX_LOCATION
     assert "ghost film" in FIXED_NEGATIVE
     assert "corpse-pale skin" in FIXED_NEGATIVE
 
@@ -104,8 +105,9 @@ def test_character_sheets_are_model_sheets():
     assert sheets and all("front view" in s["prompt"].lower() for s in sheets)
     assert derives and all(identity in s["prompt"] for s in derives)
     assert derives and all(s["parent_id"] == "ke" for s in derives)
-    assert plates and all("empty establishing shot" in s["prompt"] for s in plates)
+    assert plates and all("empty establishing shot" not in s["prompt"] for s in plates)
     assert plates and all("establishing plate" not in s["prompt"] for s in plates)
+    assert any("wide establishing shot" in s["prompt"] or "empty location shot" in s["prompt"] for s in plates)
     assert plates and all("famous movie still" not in s["prompt"] for s in plates)
     assert "famous movie still" in PLATE_NEGATIVE
     assert "ceramic plate" in PLATE_NEGATIVE
@@ -169,7 +171,8 @@ def test_location_prompt_rejects_standalone_plate():
         sanitize_location_prompt("wooden harbor street plate at dusk")
     clean = sanitize_location_prompt("wooden harbor establishing plate at dusk")
     assert "establishing plate" not in clean.lower()
-    assert "empty establishing shot" in clean.lower()
+    assert "wide establishing shot" in clean.lower()
+    assert "empty establishing shot" not in clean.lower()
 
 
 def test_plan_library_specs_uses_plate_prompt_when_name_is_cjk():
@@ -466,7 +469,8 @@ def test_luminous_preset_reaches_keyframe_payload_and_period_terms(tmp_path, mon
     assert "rainy train station plaza" in prompt
     assert "1890s brick storefronts" in prompt
     assert "makoto shinkai" not in prompt
-    assert "generic endless sunset" in payloads[0]["negative_prompt"]
+    assert "generic endless sunset" not in payloads[0]["negative_prompt"]
+    assert "clear luminous atmosphere" in payloads[0]["prompt"]
     assert "glass skyscrapers" in payloads[0]["negative_prompt"]
 
 

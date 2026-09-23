@@ -57,8 +57,19 @@ _GARMENT_COLOR_RE = re.compile(
     re.I,
 )
 CLASS_MARGIN_MIN = 0.04
+# Whole-image identity is no longer a pass for side/back; region crops use the
+# clothing/footwear floors below. IDENTITY_MIN remains for costume_derive only.
 IDENTITY_MIN = 0.28
+CLOTHING_IDENTITY_MIN = 0.28
+FOOTWEAR_IDENTITY_MIN = 0.28
 ALIGNMENT_MIN = 0.18
+
+# Fixed fractions of the 832×1216 character sheet (left, top, right, bottom).
+TORSO_CROP = (0.30, 0.28, 0.70, 0.72)
+LEGS_CROP = (0.34, 0.55, 0.66, 0.82)
+FOOTWEAR_CROP = (0.28, 0.82, 0.72, 0.98)
+# Face band is intentionally unused for back-view identity (do not score it).
+FACE_CROP = (0.30, 0.05, 0.70, 0.28)
 
 SCENE_POSITIVE = (
     "anime interior room",
@@ -663,13 +674,14 @@ def _mean_rgb(image: Any, box: tuple[int, int, int, int]) -> tuple[float, float,
 
 def _torso_mean_rgb(image: Any) -> tuple[float, float, float]:
     width, height = image.size
+    l, t, r, b = TORSO_CROP
     return _mean_rgb(
         image,
         (
-            int(width * 0.3),
-            int(height * 0.28),
-            int(width * 0.7),
-            int(height * 0.72),
+            int(width * l),
+            int(height * t),
+            int(width * r),
+            int(height * b),
         ),
     )
 
@@ -677,15 +689,95 @@ def _torso_mean_rgb(image: Any) -> tuple[float, float, float]:
 def _legs_mean_rgb(image: Any) -> tuple[float, float, float]:
     """Lower-body crop that skips white sneakers at the ankles."""
     width, height = image.size
+    l, t, r, b = LEGS_CROP
     return _mean_rgb(
         image,
         (
-            int(width * 0.34),
-            int(height * 0.55),
-            int(width * 0.66),
-            int(height * 0.82),
+            int(width * l),
+            int(height * t),
+            int(width * r),
+            int(height * b),
         ),
     )
+
+
+def _fraction_crop(image: Any, box: tuple[float, float, float, float]):
+    width, height = image.size
+    left, top, right, bottom = box
+    return image.crop(
+        (
+            int(width * left),
+            int(height * top),
+            int(width * right),
+            int(height * bottom),
+        )
+    )
+
+
+def resolve_character_view(*, kind: str = "", prompt: str = "", view: str | None = None) -> str:
+    """front / side / back for character masters. Prefer an explicit view flag."""
+    explicit = str(view or "").strip().lower()
+    if explicit in {"front", "side", "back"}:
+        return explicit
+    prompt_low = str(prompt or "").lower()
+    kind_low = str(kind or "").lower()
+    if "from behind" in prompt_low or "strict rear" in prompt_low or kind_low.endswith("_back"):
+        return "back"
+    if "from side" in prompt_low or "strict left side" in prompt_low or kind_low.endswith("_side"):
+        return "side"
+    if "side" in kind_low and "back" not in kind_low:
+        return "side"
+    if "back" in kind_low:
+        return "back"
+    return "front"
+
+
+def region_identity_scores(
+    image: Any,
+    parent: Any,
+    scorer: ClipScorer,
+    *,
+    view: str,
+) -> dict[str, float]:
+    """CLIP cosine on fixed sheet crops. Back never scores a face crop."""
+    crops: list[tuple[str, tuple[float, float, float, float]]] = [
+        ("torso", TORSO_CROP),
+        ("legs", LEGS_CROP),
+        ("footwear", FOOTWEAR_CROP),
+    ]
+    child_imgs = [_fraction_crop(image, box) for _name, box in crops]
+    parent_imgs = [_fraction_crop(parent, box) for _name, box in crops]
+    child_vecs = scorer.embed_images(child_imgs)
+    parent_vecs = scorer.embed_images(parent_imgs)
+    out: dict[str, float] = {}
+    for index, (name, _box) in enumerate(crops):
+        out[name] = float(cosine(child_vecs[index], parent_vecs[index]))
+    clothing_parts = [out["torso"], out["legs"]]
+    out["clothing"] = float(min(clothing_parts))
+    if view == "side":
+        # Side also reports the mean of all clothing-bearing crops for diagnostics.
+        out["clothing_side"] = float(min(out["torso"], out["legs"]))
+    return out
+
+
+def apply_region_identity_gates(
+    region_scores: dict[str, float],
+    *,
+    view: str,
+    reasons: list[str],
+) -> None:
+    """Fail clothing_mismatch / footwear_mismatch. Never gate on a face crop."""
+    clothing = region_scores.get("clothing")
+    if clothing is None:
+        clothing = min(region_scores.get("torso", 0.0), region_scores.get("legs", 0.0))
+    footwear = float(region_scores.get("footwear", 0.0))
+    if view in {"side", "back"}:
+        if float(clothing) < CLOTHING_IDENTITY_MIN:
+            reasons.append("clothing_mismatch")
+        if footwear < FOOTWEAR_IDENTITY_MIN:
+            reasons.append("footwear_mismatch")
+    region_scores["clothing_identity"] = float(clothing)
+    region_scores["footwear_identity"] = float(footwear)
 
 
 def view_consistency_check(images: Sequence[Any], *, max_delta: float = 48.0) -> dict[str, Any]:
@@ -724,6 +816,7 @@ def score_still(
     allow_placeholder: bool | None = None,
     seed: int | None = None,
     label: str = "still",
+    view: str | None = None,
 ) -> VisualQcResult:
     """Structure first; CLIP only after the blob is a real still of the right size."""
     placeholder = (not require_clip) if allow_placeholder is None else allow_placeholder
@@ -763,20 +856,21 @@ def score_still(
     if alignment_text:
         prompt_index = len(texts)
         texts.append(alignment_text)
-    view = "side" if "side" in str(kind or "") or "from side" in prompt_text.lower() else (
-        "back" if "back" in str(kind or "") or "from behind" in prompt_text.lower() else "front"
+    char_view = resolve_character_view(kind=kind, prompt=prompt_text, view=view)
+    attr_probes = (
+        identity_attribute_probes(alignment_text or prompt_text, view=char_view)
+        if semantic == "character"
+        else []
     )
-    attr_probes = identity_attribute_probes(alignment_text or prompt_text, view=view) if semantic == "character" else []
     attr_start = len(texts)
     for probe in attr_probes:
         texts.append(probe["pos"])
         texts.append(probe["neg"])
 
     image_vec = resolved.embed_images([image])[0]
-    parent_vec = None
+    parent_pil = None
     if parent_image is not None:
         parent_pil = _load_rgb(parent_image)
-        parent_vec = resolved.embed_images([parent_pil])[0]
     text_vecs = resolved.embed_texts(texts) if texts else []
 
     scores = dict(struct.scores)
@@ -796,11 +890,25 @@ def score_still(
             else:
                 reasons.append("zero_shot_margin")
 
-    if parent_vec is not None:
-        ident = identity_similarity(image_vec, parent_vec)
-        scores["identity"] = float(ident)
-        if ident < IDENTITY_MIN:
-            reasons.append("identity_mismatch")
+    if parent_pil is not None and semantic == "character":
+        if str(kind or "") == "character_view_derive" and char_view in {"side", "back"}:
+            # Region CLIP vs locked front. Do not pass on whole-image cosine alone.
+            # Back never scores a face crop and never requires whole-image match.
+            region = region_identity_scores(image, parent_pil, resolved, view=char_view)
+            for key, value in region.items():
+                scores[f"region_{key}"] = float(value)
+            # Diagnostic whole-image score only — not a pass gate for side/back.
+            parent_vec = resolved.embed_images([parent_pil])[0]
+            scores["identity"] = float(identity_similarity(image_vec, parent_vec))
+            apply_region_identity_gates(region, view=char_view, reasons=reasons)
+            scores["clothing_identity"] = float(region["clothing_identity"])
+            scores["footwear_identity"] = float(region["footwear_identity"])
+        else:
+            parent_vec = resolved.embed_images([parent_pil])[0]
+            ident = identity_similarity(image_vec, parent_vec)
+            scores["identity"] = float(ident)
+            if ident < IDENTITY_MIN:
+                reasons.append("identity_mismatch")
 
     if prompt_index is not None:
         prompt_vec = text_vecs[prompt_index]

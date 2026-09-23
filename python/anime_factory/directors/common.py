@@ -514,7 +514,11 @@ def prompt_pair(
             f"keep face/costume of {char_tag}"
         )
     else:
-        h3_body = f"{scene_tag} anime location background, empty establishing shot, {framing}, {staging}, no extra people"
+        h3_body = (
+            f"{scene_tag} anime location background, wide establishing shot, "
+            f"clear luminous atmosphere, layered clouds, volumetric light, "
+            f"{framing}, {staging}, no extra people"
+        )
     zh_motion = str(motion_zh or "").strip()
     if zh_motion:
         h3_body = f"{h3_body}, {zh_motion}"
@@ -528,7 +532,10 @@ def prompt_pair(
         still_parts.append(staging)
         still_parts.append(setting)
         if not character_id:
-            still_parts.append("anime location background, empty establishing shot, no people")
+            still_parts.append(
+                "anime location background, wide establishing shot, clear luminous atmosphere, "
+                "layered clouds, volumetric light, no people"
+            )
     first = still_prompt_text(", ".join(part for part in still_parts if str(part).strip()))
     h3 = scrub_copycat(f"{h3_body}, camera {camera}, {motion}, {H3_TAIL}")
     return first, h3

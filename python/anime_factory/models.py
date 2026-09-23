@@ -59,20 +59,20 @@ VECTOR_SCHEMA_VERSION = "v1"
 # Spec 1.2 — per-asset-kind affirmative prefixes. Diffusion cannot process negation;
 # everything we do not want lives in FIXED_NEGATIVE, which SDXL CFG applies.
 # Character sheets must not inherit cinematic / detailed-background wording.
-STYLE_PREFIX_LOCATION = (
-    "original anime production still for this story, anime production still, cel shaded, "
-    "clean lineart, flat shading, 2d anime illustration, detailed background, "
-    "cinematic composition, story-specific props and locations from the bible, "
-    "readable everyday lighting, natural living skin tone"
-)
+# Default location/keyframe look is luminous cinematic anime (Shinkai-like light and sky)
+# described in paint terms. Director names and film titles stay out of the positive
+# prompt; Animagine copies those famous stills instead of this story's places.
 STYLE_PREFIX_LOCATION_LUMINOUS = (
     "original anime production still for this story, anime production still, cel shaded, "
     "clean lineart, flat shading, 2d anime illustration, clear luminous atmosphere, "
+    "hand-painted background, detailed background, "
     "location-specific weather and time of day, contextual layered clouds for open-sky scenes, "
-    "volumetric light, rim light, rain or water wet-surface reflections, saturated blue and gold contrast, "
+    "volumetric light, god rays, rim light, rain or water wet-surface reflections, "
+    "saturated blue and gold contrast, natural sky gradient, "
     "detailed everyday urban and natural backgrounds, atmospheric perspective, cinematic depth, "
-    "story-specific props and locations from the bible, natural living skin tone"
+    "cinematic composition, story-specific props and locations from the bible, natural living skin tone"
 )
+STYLE_PREFIX_LOCATION = STYLE_PREFIX_LOCATION_LUMINOUS
 STYLE_PREFIX_CHARACTER = (
     "original anime character design, solo, cel shaded, clean lineart, "
     "warm ivory studio background"
@@ -89,8 +89,7 @@ FIXED_NEGATIVE = (
     "Makoto Shinkai, Your Name, Kimi no Na wa, Weathering With You, Suzume, "
     "5 centimeters per second, 君の名は, 天气之子, 秒速5厘米, "
     "movie screenshot, famous movie still, screenshot, famous still composition, "
-    "copycat composition, generic endless sunset sky, endless cloud plate, "
-    "generic endless sunset cloud plate, exaggerated moe eyes, "
+    "copycat composition, exaggerated moe eyes, "
     "ceramic plate, dish, dinnerware, bowl, "
     "nude, nsfw, "
     "ghost film, horror lighting, corpse-pale skin, wet gloomy face, empty horror corridor, "

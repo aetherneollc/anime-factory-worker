@@ -42,6 +42,8 @@ IPADAPTER_CLASS_TYPES = frozenset({"IPAdapterAdvanced", "IPAdapter", "IPAdapterA
 REFERENCE_ROLE = "reference_image"
 VIEW_DERIVE_IPADAPTER_WEIGHT = 0.75
 VIEW_DERIVE_IPADAPTER_END_AT = 0.9
+KEYFRAME_PLATE_IPADAPTER_WEIGHT = 0.35
+KEYFRAME_PLATE_IPADAPTER_END_AT = 0.9
 
 
 def parse_size(image_size: str | None) -> tuple[int, int]:
@@ -90,6 +92,7 @@ def still_payload_to_prompt(payload: dict) -> dict[str, Any]:
         "model": payload.get("model") or IMAGE_MODEL,
         "reference_image": payload.get("reference_image") or "",
         "kind": kind,
+        "parent_kind": str(payload.get("_parent_kind") or ""),
     }
 
 
@@ -150,9 +153,19 @@ def fill_still_workflow(template: dict, spec: dict[str, Any]) -> dict:
                 inputs["width"] = spec["width"]
             if "height" in inputs:
                 inputs["height"] = spec["height"]
-        if ctype == "IPAdapterAdvanced" and spec.get("kind") == "character_view_derive":
-            inputs["weight"] = VIEW_DERIVE_IPADAPTER_WEIGHT
-            inputs["end_at"] = VIEW_DERIVE_IPADAPTER_END_AT
+        if ctype == "IPAdapterAdvanced":
+            kind = str(spec.get("kind") or "")
+            parent_kind = str(spec.get("parent_kind") or "")
+            if kind == "character_view_derive":
+                inputs["weight"] = VIEW_DERIVE_IPADAPTER_WEIGHT
+                inputs["end_at"] = VIEW_DERIVE_IPADAPTER_END_AT
+            elif kind == "keyframe" and parent_kind in {"scene_plate", "scene_derive", ""}:
+                # Locked plate bound at low weight; separate from character-view 0.75.
+                inputs["weight"] = KEYFRAME_PLATE_IPADAPTER_WEIGHT
+                inputs["end_at"] = KEYFRAME_PLATE_IPADAPTER_END_AT
+            elif kind == "keyframe":
+                inputs["weight"] = KEYFRAME_PLATE_IPADAPTER_WEIGHT
+                inputs["end_at"] = KEYFRAME_PLATE_IPADAPTER_END_AT
         if ctype in {"LoadImage", "LoadImageOutput"} and role == REFERENCE_ROLE:
             inputs["image"] = spec.get("reference_image") or ""
         if "seed" in inputs:

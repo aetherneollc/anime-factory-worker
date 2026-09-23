@@ -300,6 +300,10 @@ def build_canary_env(*, image_digest: str, story_id: str, backend: str = "h3") -
     hf = (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or "").strip()
     if hf:
         env["HF_TOKEN"] = hf
+    for sf_key in ("SILICONFLOW_API_KEY", "SILICONFLOW_API_KEYS"):
+        sf_val = (os.environ.get(sf_key) or "").strip()
+        if sf_val:
+            env[sf_key] = sf_val
     for forbidden in ISOLATED_ENV_FORBIDDEN_KEYS:
         env.pop(forbidden, None)
     return env

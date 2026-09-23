@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
+import re
+from dataclasses import dataclass, field
 from typing import Any, Callable
 from urllib.request import Request, urlopen
 
@@ -28,6 +31,19 @@ HttpOpener = Callable[[Request], dict[str, Any]]
 # deepseek-v4-flash reasons before it answers; a full trilingual episode script spends
 # ~28k reasoning tokens and takes minutes. 120s cut every real script off mid-thought.
 DEFAULT_TIMEOUT_S = 900.0
+MASTER_VISION_KINDS = frozenset({"character_sheet", "character_view_derive"})
+_JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+FRONT_VISION_FIELDS = ("full_body", "both_feet_visible", "single_subject", "looking_at_viewer")
+SIDE_VISION_FIELDS = FRONT_VISION_FIELDS + ("strict_profile",)
+BACK_VISION_FIELDS = (
+    "rear_view",
+    "face_visible",
+    "head_rotated",
+    "full_body",
+    "both_feet_visible",
+    "single_subject",
+)
 
 
 class RoleLockError(ValueError):
@@ -162,3 +178,173 @@ def client_from_env(opener: HttpOpener | None = None) -> LlmClient | None:
     if not deepseek and not sf:
         return None
     return LlmClient(deepseek_key=deepseek, siliconflow_keys=sf, opener=opener)
+
+
+@dataclass
+class MasterVisionResult:
+    """Closed-boolean master QC. Not a 0–100 score."""
+
+    passed: bool
+    reasons: list[str] = field(default_factory=list)
+    fields: dict[str, bool] = field(default_factory=dict)
+    raw: str = ""
+
+    @property
+    def verdict(self) -> str:
+        return "pass" if self.passed else "fail"
+
+
+def _png_data_url(png: bytes) -> str:
+    return "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+
+
+def _vision_fields_for(view: str) -> tuple[str, ...]:
+    key = str(view or "front").strip().lower()
+    if key == "side":
+        return SIDE_VISION_FIELDS
+    if key == "back":
+        return BACK_VISION_FIELDS
+    return FRONT_VISION_FIELDS
+
+
+def _vision_system_prompt(view: str) -> str:
+    fields = ", ".join(_vision_fields_for(view))
+    return (
+        "You are a strict anime character-sheet inspector. "
+        f"Inspect the single image and reply with JSON only — no markdown — using exactly these "
+        f"boolean keys: {fields}. true means the statement holds; false means it does not."
+    )
+
+
+def _parse_vision_json(text: str) -> dict[str, Any]:
+    raw = str(text or "").strip()
+    if not raw:
+        raise ValueError("empty vision qc reply")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        match = _JSON_OBJECT_RE.search(raw)
+        if not match:
+            raise ValueError(f"vision qc reply is not JSON: {raw[:160]}")
+        data = json.loads(match.group(0))
+    if not isinstance(data, dict):
+        raise ValueError("vision qc JSON must be an object")
+    return data
+
+
+def _coerce_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        low = value.strip().lower()
+        if low in {"true", "yes", "1"}:
+            return True
+        if low in {"false", "no", "0"}:
+            return False
+    return None
+
+
+def evaluate_master_vision_fields(view: str, fields: dict[str, Any]) -> MasterVisionResult:
+    """AND the closed booleans. Transport/JSON errors are handled by the caller."""
+    required = _vision_fields_for(view)
+    parsed: dict[str, bool] = {}
+    reasons: list[str] = []
+    for key in required:
+        coerced = _coerce_bool(fields.get(key))
+        if coerced is None:
+            reasons.append(f"vision_missing_{key}")
+            continue
+        parsed[key] = coerced
+    if reasons:
+        return MasterVisionResult(passed=False, reasons=reasons, fields=parsed)
+
+    key = str(view or "front").strip().lower()
+    if key == "back":
+        ok = (
+            parsed["rear_view"]
+            and parsed["full_body"]
+            and parsed["both_feet_visible"]
+            and parsed["single_subject"]
+            and not parsed["face_visible"]
+            and not parsed["head_rotated"]
+        )
+        if parsed.get("face_visible"):
+            reasons.append("face_visible")
+        if parsed.get("head_rotated"):
+            reasons.append("head_rotated")
+        if not parsed.get("rear_view"):
+            reasons.append("not_rear_view")
+        if not parsed.get("full_body"):
+            reasons.append("not_full_body")
+        if not parsed.get("both_feet_visible"):
+            reasons.append("feet_not_visible")
+        if not parsed.get("single_subject"):
+            reasons.append("not_single_subject")
+        return MasterVisionResult(passed=ok and not reasons, reasons=reasons, fields=parsed)
+
+    want_true = list(FRONT_VISION_FIELDS) if key != "side" else list(SIDE_VISION_FIELDS)
+    for name in want_true:
+        if not parsed.get(name):
+            reasons.append(f"not_{name}")
+    return MasterVisionResult(passed=not reasons, reasons=reasons, fields=parsed)
+
+
+def master_vision_qc(
+    png: bytes,
+    *,
+    view: str,
+    kind: str = "character_sheet",
+    client: LlmClient | None = None,
+    opener: HttpOpener | None = None,
+) -> MasterVisionResult:
+    """SiliconFlow Qwen3.5-4B closed JSON on character masters only. temperature 0."""
+    if str(kind or "") not in MASTER_VISION_KINDS:
+        return MasterVisionResult(passed=True, reasons=[], fields={})
+    resolved_view = str(view or "front").strip().lower() or "front"
+    llm = client
+    if llm is None:
+        llm = client_from_env(opener=opener)
+    if llm is None:
+        # No SiliconFlow key on this process — fail the attempt (do not lock).
+        return MasterVisionResult(passed=False, reasons=["vision_transport_error"], fields={})
+    messages = [
+        {"role": "system", "content": _vision_system_prompt(resolved_view)},
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": _png_data_url(bytes(png))},
+                },
+                {
+                    "type": "text",
+                    "text": (
+                        f"Character sheet view={resolved_view}. "
+                        "Return JSON only with the boolean keys listed in the system prompt."
+                    ),
+                },
+            ],
+        },
+    ]
+    try:
+        raw = llm.chat(
+            ROLE_QC,
+            messages,
+            temperature=0,
+            response_format={"type": "json_object"},
+            max_tokens=512,
+        )
+        data = _parse_vision_json(raw)
+        result = evaluate_master_vision_fields(resolved_view, data)
+        result.raw = raw
+        return result
+    except Exception as exc:  # noqa: BLE001 — non-JSON / transport = failed attempt
+        log.warning("master vision qc failed: %s", exc)
+        return MasterVisionResult(
+            passed=False,
+            reasons=["vision_transport_error"],
+            fields={},
+            raw=str(exc),
+        )

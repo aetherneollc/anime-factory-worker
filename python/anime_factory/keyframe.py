@@ -200,6 +200,68 @@ def compose_cut_still_prompt(segment: dict, cut: dict, *, story_root: Path | Non
     return scrub_still_prompt(visual) or shot_visual_prompt(segment)
 
 
+def _scene_id_from_segment(segment: dict) -> str:
+    """Plate/location id from segment fields or refs (never a character id)."""
+    for key in ("location_id", "scene_id", "plate_id"):
+        raw = str(segment.get(key) or "").strip()
+        if not raw:
+            continue
+        if raw.startswith("plate_"):
+            return raw[len("plate_") :]
+        return raw
+    for rid in list(segment.get("refs") or []):
+        text = str(rid or "").strip()
+        if text.startswith("plate_"):
+            return text[len("plate_") :]
+    return ""
+
+
+def locked_plate_path(segment: dict, assets_index: dict, story_root: Path | None) -> Path | None:
+    """QC-locked scene plate on disk. Same resolution as sheet_file_on_disk._lock_scene; never a sheet."""
+    if story_root is None:
+        return None
+    root = Path(story_root)
+    lid = _scene_id_from_segment(segment)
+    if not lid:
+        return None
+    try:
+        from anime_factory.asset_lock import is_qc_locked, locked_scene_file
+    except ImportError:
+        is_qc_locked = None  # type: ignore[assignment]
+        locked_scene_file = None  # type: ignore[assignment]
+    if is_qc_locked is not None and not is_qc_locked(root, scene_id=lid):
+        return None
+    candidates: list[Path] = []
+    if locked_scene_file is not None:
+        try:
+            candidates.append(Path(locked_scene_file(root, lid)))
+        except (TypeError, AttributeError, OSError):
+            pass
+    scene_lock = assets_index.get("scenes") if isinstance(assets_index.get("scenes"), dict) else {}
+    selected = str((scene_lock.get(lid) or {}).get("selected") or "").strip()
+    if selected:
+        candidates.append(root / "assets" / "scenes" / lid / selected)
+    candidates.append(root / "assets" / "scenes" / lid / "plate_base.png")
+    candidates.append(root / "assets" / "locations" / lid / "plate_base.png")
+    seen: set[str] = set()
+    for path in candidates:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        if _file_ok(path):
+            return path
+    return None
+
+
+def locked_plate_png(segment: dict, assets_index: dict, story_root: Path | None) -> bytes | None:
+    """Locked scene plate bytes for keyframe IP-Adapter. Never used on plate mint itself."""
+    path = locked_plate_path(segment, assets_index, story_root)
+    if path is None:
+        return None
+    return path.read_bytes()
+
+
 def _mint_still(
     *,
     dest: Path,
@@ -211,6 +273,8 @@ def _mint_still(
     period_md: str | None,
     world_mode: str,
     story_root: Path | None,
+    parent_png: bytes | None = None,
+    parent_kind: str | None = None,
 ) -> None:
     prompt = scrub_still_prompt(prompt)
     assert_still_prompt_clean(prompt, label=label)
@@ -224,18 +288,20 @@ def _mint_still(
     dest.parent.mkdir(parents=True, exist_ok=True)
     for salt in QC_SEED_SALTS:
         seed = locked_seed(f"{story_id}:{seed_key}", salt)
-        png = client.generate(
-            {
-                "model": IMAGE_MODEL,
-                "prompt": styled,
-                "negative_prompt": style_negative(negatives, base=bible_negative),
-                "seed": seed,
-                "image_size": STILL_IMAGE_SIZE,
-                "_styled": True,
-                "_kind": "keyframe",
-                "_label": label,
-            }
-        )
+        payload: dict = {
+            "model": IMAGE_MODEL,
+            "prompt": styled,
+            "negative_prompt": style_negative(negatives, base=bible_negative),
+            "seed": seed,
+            "image_size": STILL_IMAGE_SIZE,
+            "_styled": True,
+            "_kind": "keyframe",
+            "_label": label,
+        }
+        if parent_png:
+            payload["_parent_png"] = parent_png
+            payload["_parent_kind"] = parent_kind or "scene_plate"
+        png = client.generate(payload)
         assert_still_blob(
             png,
             width=STILL_WIDTH,
@@ -408,6 +474,7 @@ def ensure_keyframe(
                 f"segment {segment.get('id')} has no first_frame_prompt; refusing to draw a keyframe "
                 "from the segment id"
             )
+        plate_png = locked_plate_png(segment, assets_index, story_root)
         _mint_still(
             dest=dest,
             prompt=visual,
@@ -418,6 +485,8 @@ def ensure_keyframe(
             period_md=period_md,
             world_mode=world_mode,
             story_root=story_root,
+            parent_png=plate_png,
+            parent_kind="scene_plate" if plate_png else None,
         )
     if not _file_ok(dest):
         raise RuntimeError(f"keyframe missing on disk after generate: {rel}")
@@ -428,6 +497,7 @@ def ensure_keyframe(
         cuts = ensure_cuts_for_segment(segment)
     except Exception:  # noqa: BLE001
         cuts = [c for c in (segment.get("cuts") or []) if isinstance(c, dict)]
+    plate_png = locked_plate_png(segment, assets_index, story_root)
     for cut in cuts:
         seq = int(cut.get("seq") or 0)
         if seq <= 0:
@@ -446,6 +516,8 @@ def ensure_keyframe(
             period_md=period_md,
             world_mode=world_mode,
             story_root=story_root,
+            parent_png=plate_png,
+            parent_kind="scene_plate" if plate_png else None,
         )
         cut["keyframe_path"] = join_story(
             story_id,

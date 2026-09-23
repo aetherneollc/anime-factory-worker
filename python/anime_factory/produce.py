@@ -1398,6 +1398,11 @@ def _try_one_lease(stage_flags: dict[str, str]) -> dict[str, Any]:
         "STUDIO_USER": os.environ.get("STUDIO_USER") or "studio",
         "STUDIO_PASSWORD": os.environ.get("STUDIO_PASSWORD") or "",
     }
+    # Master vision QC (Qwen3.5-4B) needs SiliconFlow on the GPU box.
+    for sf_key in ("SILICONFLOW_API_KEY", "SILICONFLOW_API_KEYS"):
+        sf_val = (os.environ.get(sf_key) or "").strip()
+        if sf_val:
+            env[sf_key] = sf_val
     hf_token = (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or "").strip()
     if hf_token:
         env["HF_TOKEN"] = hf_token
