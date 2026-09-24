@@ -48,8 +48,8 @@ def _footwear_mismatch_scorer(*, model_id: str = "test-clip") -> ScriptedClipSco
     foot_calls = {"n": 0}
 
     def image_embed(img):
-        w, h = getattr(img, "size", (832, 1216))
-        # FOOTWEAR_CROP on 832×1216 is ~366×194 — short and wide near the bottom.
+        w, h = getattr(img, "size", (768, 1344))
+        # FOOTWEAR_CROP is a short wide band near the bottom of the sheet.
         if h < 220 and w > 200:
             foot_calls["n"] += 1
             # Child footwear then parent footwear → cosine 0.

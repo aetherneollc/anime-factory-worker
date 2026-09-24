@@ -100,7 +100,7 @@ def test_kolors_view_derive_keeps_ipadapter(monkeypatch):
     spec = still_payload_to_prompt(
         {
             "prompt": "side view",
-            "image_size": "832x1216",
+            "image_size": "768x1344",
             "seed": 4,
             "_kind": "character_view_derive",
             "kind": "character_view_derive",

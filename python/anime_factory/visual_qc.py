@@ -32,7 +32,10 @@ CLIP_MODEL_ID = f"open_clip:{CLIP_ARCH}:{CLIP_PRETRAINED}"
 QC_SEED_SALTS = (0, 1, 2)
 MAX_QC_ATTEMPTS = len(QC_SEED_SALTS)
 
-CHARACTER_SIZE = (832, 1216)
+# Taller than 832×1216 (~1.46): Kolors ChatGLM stills were locking as busts on
+# that canvas even with full-body prompt locks. 768×1344 (~1.75) is an SDXL-safe
+# tall portrait; retries may escalate further via design.CHAR_CANVAS_LADDER.
+CHARACTER_SIZE = (768, 1344)
 SCENE_SIZE = (STILL_WIDTH, STILL_HEIGHT)  # 1344x768
 TURNAROUND_SIZE = (CHARACTER_SIZE[0] * 3, CHARACTER_SIZE[1])
 PROP_SIZE = (768, 768)
@@ -41,6 +44,12 @@ ENTROPY_MIN = 2.5
 DOMINANT_BIN_MAX = 0.55
 # Character sheets sit on a near-white studio drop. Count figure pixels only.
 STUDIO_BACKDROP_LUMA = 235
+# Geometric full-body gate (fractions of canvas height). Busts/cowboy shots leave
+# the lower band empty ivory; head-to-toe masters reach near the bottom edge.
+FIGURE_SPAN_MIN = 0.65
+FIGURE_TOP_MAX = 0.20
+FIGURE_BOTTOM_MIN = 0.85
+FIGURE_MIN_PIXELS = 500
 NAVY_TORSO_LUMA_MAX = 150.0
 # Khaki/olive joggers on live 6454ab7 sheets sat at luma ~133–182 in this crop.
 BLACK_PANTS_LUMA_MAX = 110.0
@@ -65,7 +74,7 @@ CLOTHING_IDENTITY_MIN = 0.28
 FOOTWEAR_IDENTITY_MIN = 0.28
 ALIGNMENT_MIN = 0.18
 
-# Fixed fractions of the 832×1216 character sheet (left, top, right, bottom).
+# Fixed fractions of the character sheet (left, top, right, bottom).
 TORSO_CROP = (0.30, 0.28, 0.70, 0.72)
 LEGS_CROP = (0.34, 0.55, 0.66, 0.82)
 FOOTWEAR_CROP = (0.28, 0.82, 0.72, 0.98)
@@ -489,6 +498,64 @@ def _result(
     )
 
 
+def figure_content_bbox(
+    image: Any,
+    *,
+    luma_threshold: float = STUDIO_BACKDROP_LUMA,
+) -> tuple[int, int, int, int] | None:
+    """Axis-aligned bbox of non-studio pixels. None when the canvas is empty drop."""
+    width, height = image.size
+    pixels = image.load()
+    min_x, min_y = width, height
+    max_x, max_y = -1, -1
+    count = 0
+    for y in range(height):
+        for x in range(width):
+            r, g, b = pixels[x, y][:3]
+            if (0.299 * r + 0.587 * g + 0.114 * b) >= luma_threshold:
+                continue
+            count += 1
+            if x < min_x:
+                min_x = x
+            if y < min_y:
+                min_y = y
+            if x > max_x:
+                max_x = x
+            if y > max_y:
+                max_y = y
+    if count < FIGURE_MIN_PIXELS or max_x < min_x or max_y < min_y:
+        return None
+    return (min_x, min_y, max_x + 1, max_y + 1)
+
+
+def figure_full_body_metrics(image: Any) -> dict[str, float]:
+    """Vertical occupancy of the figure on a tall character canvas."""
+    width, height = image.size
+    bbox = figure_content_bbox(image)
+    if bbox is None or height <= 0:
+        return {"span": 0.0, "top": 1.0, "bottom": 0.0, "pixels": 0.0}
+    _left, top_px, _right, bottom_px = bbox
+    top = top_px / float(height)
+    bottom = bottom_px / float(height)
+    return {
+        "span": float(bottom - top),
+        "top": float(top),
+        "bottom": float(bottom),
+        "pixels": float((bbox[2] - bbox[0]) * (bbox[3] - bbox[1])),
+    }
+
+
+def figure_is_full_body(image: Any) -> tuple[bool, dict[str, float]]:
+    """True when the inked figure is head-near-top and feet-near-bottom."""
+    metrics = figure_full_body_metrics(image)
+    ok = (
+        metrics["span"] >= FIGURE_SPAN_MIN
+        and metrics["top"] <= FIGURE_TOP_MAX
+        and metrics["bottom"] >= FIGURE_BOTTOM_MIN
+    )
+    return ok, metrics
+
+
 def structure_check(
     blob: bytes | bytearray | Path | str,
     *,
@@ -497,7 +564,7 @@ def structure_check(
     label: str = "still",
 ) -> VisualQcResult:
     """PNG/size via assert_still_blob, then grayscale entropy / dominant-bin."""
-    from anime_factory.design import StillBlobError, assert_still_blob, png_dimensions
+    from anime_factory.design import StillBlobError, assert_still_blob, is_placeholder_still, png_dimensions
 
     if isinstance(blob, (Path, str)):
         data = Path(blob).read_bytes()
@@ -540,6 +607,18 @@ def structure_check(
         reasons.append("low_entropy")
     if dominant > DOMINANT_BIN_MAX:
         reasons.append("dominant_bin")
+    # Geometric full-body gate for single-view masters. Skip placeholders (noise
+    # fills the frame) and turnaround composites (already QC'd per panel).
+    if (
+        kind in {"character_sheet", "character_view_derive", "costume_derive"}
+        and not is_placeholder_still(data)
+    ):
+        ok, metrics = figure_is_full_body(image)
+        scores["figure_span"] = metrics["span"]
+        scores["figure_top"] = metrics["top"]
+        scores["figure_bottom"] = metrics["bottom"]
+        if not ok:
+            reasons.append("not_full_body")
     if reasons:
         return _result("fail", reasons=reasons, scores=scores, kind=kind)
     return _result("pass", scores=scores, kind=kind)

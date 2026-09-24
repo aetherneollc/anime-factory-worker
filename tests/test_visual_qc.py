@@ -25,6 +25,7 @@ from anime_factory.visual_qc import (
     ScriptedClipScorer,
     cosine,
     dominant_bin_ratio,
+    figure_is_full_body,
     identity_attribute_probes,
     load_clip_scorer,
     score_still,
@@ -93,12 +94,23 @@ def test_character_sheet_studio_backdrop_passes_structure():
 
     img = Image.new("RGB", CHARACTER_SIZE, (242, 242, 242))
     draw = ImageDraw.Draw(img)
-    draw.rectangle([260, 180, 570, 1080], fill=(28, 36, 72))
-    draw.rectangle([300, 220, 520, 520], fill=(210, 180, 140))
-    draw.rectangle([320, 560, 500, 900], fill=(40, 50, 90))
+    # Head-to-toe figure on the tall canvas (fractions match FIGURE_* gates).
+    w, h = CHARACTER_SIZE
+    draw.rectangle(
+        [int(w * 0.31), int(h * 0.08), int(w * 0.69), int(h * 0.92)],
+        fill=(28, 36, 72),
+    )
+    draw.rectangle(
+        [int(w * 0.36), int(h * 0.12), int(w * 0.64), int(h * 0.32)],
+        fill=(210, 180, 140),
+    )
+    draw.rectangle(
+        [int(w * 0.38), int(h * 0.40), int(w * 0.62), int(h * 0.72)],
+        fill=(40, 50, 90),
+    )
     pix = img.load()
-    for x in range(260, 570, 2):
-        for y in range(180, 1080, 2):
+    for x in range(int(w * 0.31), int(w * 0.69), 2):
+        for y in range(int(h * 0.08), int(h * 0.92), 2):
             r, g, b = pix[x, y]
             jitter = ((x * 13 + y * 7) % 41) - 20
             pix[x, y] = (
@@ -114,6 +126,7 @@ def test_character_sheet_studio_backdrop_passes_structure():
     assert result.verdict == "pass"
     assert result.scores["dominant_bin"] <= 0.55
     assert result.scores["entropy"] >= 2.5
+    assert result.scores.get("figure_span", 0) >= 0.65
 
 
 def test_character_turnaround_studio_backdrop_passes_structure():
@@ -122,13 +135,21 @@ def test_character_turnaround_studio_backdrop_passes_structure():
     width, height = visual_qc.TURNAROUND_SIZE
     img = Image.new("RGB", (width, height), (248, 248, 248))
     draw = ImageDraw.Draw(img)
+    panel_w = CHARACTER_SIZE[0]
     for panel in range(3):
-        left = panel * CHARACTER_SIZE[0] + 290
-        draw.ellipse([left + 60, 120, left + 190, 260], fill=(190, 150, 120))
-        for band in range(10):
-            top = 260 + band * 80
+        left = panel * panel_w + int(panel_w * 0.35)
+        head_top = int(height * 0.08)
+        draw.ellipse(
+            [left + 40, head_top, left + 160, head_top + 120],
+            fill=(190, 150, 120),
+        )
+        for band in range(12):
+            top = head_top + 120 + band * int(height * 0.06)
             color = (30 + band * 5, 42 + band * 4, 62 + band * 3)
-            draw.rectangle([left, top, left + 250, top + 79], fill=color)
+            draw.rectangle(
+                [left, top, left + 200, min(height - 8, top + int(height * 0.06) - 1)],
+                fill=color,
+            )
     buf = BytesIO()
     img.save(buf, format="PNG")
     blob = _pad_png(buf.getvalue())
@@ -145,6 +166,54 @@ def test_structure_rejects_3to1_character_canvas():
     assert result.verdict == "fail"
     blob_text = " ".join(result.reasons)
     assert "1536x512" in blob_text or "character_canvas_3to1" in result.reasons
+
+
+def _drawn_char_png(*, top_frac: float, bottom_frac: float) -> bytes:
+    """Non-placeholder RGB sheet with a solid figure band for geometric span tests."""
+    from PIL import ImageDraw
+
+    img = Image.new("RGB", CHARACTER_SIZE, (245, 245, 245))
+    draw = ImageDraw.Draw(img)
+    w, h = CHARACTER_SIZE
+    draw.rectangle(
+        [int(w * 0.30), int(h * top_frac), int(w * 0.70), int(h * bottom_frac)],
+        fill=(40, 50, 100),
+    )
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    return _pad_png(buf.getvalue())
+
+
+def test_figure_is_full_body_accepts_head_to_toe():
+    blob = _drawn_char_png(top_frac=0.06, bottom_frac=0.94)
+    img = Image.open(BytesIO(blob)).convert("RGB")
+    ok, metrics = figure_is_full_body(img)
+    assert ok
+    assert metrics["span"] >= 0.65
+    assert metrics["bottom"] >= 0.85
+
+
+def test_structure_rejects_bust_crop_as_not_full_body():
+    # Upper-body poster: figure ends mid-canvas, lower band is empty studio.
+    blob = _drawn_char_png(top_frac=0.05, bottom_frac=0.48)
+    result = structure_check(blob, kind="character_sheet", allow_placeholder=True)
+    assert result.verdict == "fail"
+    assert "not_full_body" in result.reasons
+    assert result.scores["figure_bottom"] < 0.85
+
+
+def test_structure_rejects_cowboy_shot_missing_feet():
+    blob = _drawn_char_png(top_frac=0.04, bottom_frac=0.72)
+    result = structure_check(blob, kind="character_view_derive", allow_placeholder=True)
+    assert result.verdict == "fail"
+    assert "not_full_body" in result.reasons
+
+
+def test_placeholder_noise_skips_geometric_full_body_gate():
+    # Offline placeholders are full-frame noise; geometric gate must not block dry-runs.
+    blob = synthetic_still_png(*CHARACTER_SIZE, tag="placeholder-skip", placeholder=True)
+    result = structure_check(blob, kind="character_sheet", allow_placeholder=True)
+    assert "not_full_body" not in result.reasons
 
 
 def test_clip_unavailable_fail_closed_when_required():
@@ -536,14 +605,19 @@ def test_black_pants_ok_accepts_live_warm_shadow_samples(rgb):
 def _navy_khaki_sheet_png(*, pants=(160, 150, 110)) -> bytes:
     from PIL import ImageDraw
 
+    w, h = CHARACTER_SIZE
     img = Image.new("RGB", CHARACTER_SIZE, (242, 242, 242))
     draw = ImageDraw.Draw(img)
-    draw.rectangle([260, 180, 570, 1080], fill=(28, 36, 72))
-    draw.rectangle([300, 220, 520, 520], fill=(210, 180, 140))
-    draw.rectangle([320, 560, 500, 990], fill=pants)
+    # Head-to-toe figure so structure clears FIGURE_* before palette probes run.
+    body = [int(w * 0.31), int(h * 0.08), int(w * 0.69), int(h * 0.92)]
+    head = [int(w * 0.36), int(h * 0.10), int(w * 0.64), int(h * 0.28)]
+    legs = [int(w * 0.38), int(h * 0.48), int(w * 0.62), int(h * 0.90)]
+    draw.rectangle(body, fill=(28, 36, 72))
+    draw.rectangle(head, fill=(210, 180, 140))
+    draw.rectangle(legs, fill=pants)
     pix = img.load()
-    for x in range(260, 570, 2):
-        for y in range(180, 1080, 2):
+    for x in range(body[0], body[2], 2):
+        for y in range(body[1], body[3], 2):
             r, g, b = pix[x, y]
             jitter = ((x * 13 + y * 7) % 41) - 20
             pix[x, y] = (

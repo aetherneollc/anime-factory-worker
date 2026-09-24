@@ -80,7 +80,7 @@ def test_view_derive_raises_ipadapter_weight_and_end_at():
         {
             "prompt": "1boy, navy jacket, from side",
             "_kind": "character_view_derive",
-            "image_size": "832x1216",
+            "image_size": "768x1344",
             "reference_image": "parent.png",
         }
     )
@@ -91,14 +91,14 @@ def test_view_derive_raises_ipadapter_weight_and_end_at():
 
 
 def test_reference_image_is_uploaded_and_bound_to_ipadapter():
-    parent = synthetic_still_png(832, 1216, tag="parent-sheet")
+    parent = synthetic_still_png(768, 1344, tag="parent-sheet")
     router = FakeRouter()
     payload = {
         "prompt": "rain-soaked coat, same face",
         "_kind": "costume_derive",
         "_parent_id": "char_ke_sheet",
         "_parent_png": parent,
-        "image_size": "832x1216",
+        "image_size": "768x1344",
     }
     template = _template()
     name = bind_reference_image(payload, template, router)
@@ -158,7 +158,7 @@ def test_reference_without_an_ipadapter_node_fails_closed():
         prompt.pop(nid)
     with pytest.raises(RuntimeError) as exc:
         bind_reference_image(
-            {"_kind": "costume_derive", "_parent_png": synthetic_still_png(832, 1216, tag="p")},
+            {"_kind": "costume_derive", "_parent_png": synthetic_still_png(768, 1344, tag="p")},
             template,
             FakeRouter(),
         )
@@ -201,7 +201,7 @@ def test_luminous_preset_reaches_unstyled_gpu_location_and_keyframe_payloads(mon
     scene = still_payload_to_prompt({"prompt": "rainy alley", "_kind": "scene_plate"})
     keyframe = still_payload_to_prompt({"prompt": "rainy alley first frame", "_kind": "keyframe"})
     character = still_payload_to_prompt(
-        {"prompt": "1boy, navy jacket, from side", "_kind": "character_view_derive", "image_size": "832x1216"}
+        {"prompt": "1boy, navy jacket, from side", "_kind": "character_view_derive", "image_size": "768x1344"}
     )
     assert "clear luminous atmosphere" in scene["prompt"]
     assert "clear luminous atmosphere" in keyframe["prompt"]

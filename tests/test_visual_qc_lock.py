@@ -182,7 +182,7 @@ def test_derive_waits_for_parent_qc_pass(tmp_path):
             "prompt": "1boy, adult, short black hair, brown eyes, wet cloak, lean build",
             "path": "assets/characters/hero_wet/sheet_turnaround.png",
             "seed": 1,
-            "image_size": "832x1216",
+            "image_size": "768x1344",
         }
     }
     client = KolorsClient(["k"], opener=sized_placeholder_opener("derive"), live=False)

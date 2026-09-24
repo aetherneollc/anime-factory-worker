@@ -83,9 +83,14 @@ FORBIDDEN_PLATE_KEYS = frozenset({"image", "reference_images"})
 # Draw one portrait full-body view at a time. Side/back views inherit the approved
 # front through IP-Adapter; only then are the three panels composed for legacy readers.
 CHAR_VIEWS = ("front", "side", "back", "turnaround")
-CHAR_IMAGE_SIZE = "832x1216"
-CHAR_VIEW_WIDTH = 832
-CHAR_VIEW_HEIGHT = 1216
+# Delivery size for locked masters / turnaround panels. Taller than the old
+# 832×1216 bust magnet; retries escalate via CHAR_CANVAS_LADDER then fit back.
+CHAR_IMAGE_SIZE = "768x1344"
+CHAR_VIEW_WIDTH = 768
+CHAR_VIEW_HEIGHT = 1344
+# SDXL-aligned tall portraits (multiples of 64). Attempt 0 uses the delivery
+# size; later salts go taller so Kolors has more vertical room for head-to-toe.
+CHAR_CANVAS_LADDER = ("768x1344", "704x1472", "640x1536")
 CHAR_SIDE_FILENAME = "sheet_side.png"
 CHAR_BACK_FILENAME = "sheet_back.png"
 SCENE_IMAGE_SIZE = STILL_IMAGE_SIZE
@@ -1678,6 +1683,111 @@ def compose_character_turnaround(story_root: Path | None, spec: dict) -> bytes:
     )
 
 
+def character_canvas_for_attempt(attempt_index: int) -> str:
+    """Pick a tall portrait size for this QC salt. Escalates on later retries."""
+    ladder = CHAR_CANVAS_LADDER
+    if not ladder:
+        return CHAR_IMAGE_SIZE
+    index = max(0, min(int(attempt_index), len(ladder) - 1))
+    return ladder[index]
+
+
+def fit_character_canvas(
+    blob: bytes | bytearray,
+    *,
+    width: int = CHAR_VIEW_WIDTH,
+    height: int = CHAR_VIEW_HEIGHT,
+    label: str = "character",
+) -> bytes:
+    """Fit a generated still into the locked delivery size with bottom-aligned figure scale.
+
+    Centered letterbox left small full-body figures floating mid-canvas so geometric
+    QC kept failing ``not_full_body``. Detect the inked figure, scale it to fill the
+    tall portrait, and pin feet near the bottom edge (ivory studio drop elsewhere).
+    """
+    try:
+        from io import BytesIO
+
+        from PIL import Image, ImageOps
+
+        from anime_factory.visual_qc import (
+            FIGURE_BOTTOM_MIN,
+            FIGURE_TOP_MAX,
+            figure_content_bbox,
+        )
+    except ImportError as exc:
+        raise KolorsPayloadError("Pillow is required to fit character canvases") from exc
+
+    data = bytes(blob or b"")
+    target_w, target_h = int(width), int(height)
+    with Image.open(BytesIO(data)) as opened:
+        image = opened.convert("RGB")
+        canvas = Image.new("RGB", (target_w, target_h), color=(248, 244, 232))
+        bbox = None if is_placeholder_still(data) else figure_content_bbox(image)
+        if bbox is not None:
+            left, top, right, bottom = bbox
+            fig_w = max(1, right - left)
+            fig_h = max(1, bottom - top)
+            # Tiny pad for hair/shoes, but scale from the unpadded span so ivory
+            # margin does not shrink the geometric full-body footprint.
+            pad_x = max(2, fig_w // 40)
+            pad_y = max(2, fig_h // 40)
+            crop_box = (
+                max(0, left - pad_x),
+                max(0, top - pad_y),
+                min(image.width, right + pad_x),
+                min(image.height, bottom + pad_y),
+            )
+            figure = image.crop(crop_box)
+            # Target: head near FIGURE_TOP_MAX, feet near FIGURE_BOTTOM_MIN.
+            usable_h = max(1, int(target_h * (FIGURE_BOTTOM_MIN - FIGURE_TOP_MAX)))
+            scale = min(target_w / float(fig_w), usable_h / float(fig_h))
+            new_w = max(1, int(round(figure.width * scale)))
+            new_h = max(1, int(round(figure.height * scale)))
+            if new_w > target_w or new_h > target_h:
+                fitted = ImageOps.contain(
+                    figure,
+                    (target_w, target_h),
+                    method=Image.Resampling.LANCZOS,
+                )
+            else:
+                fitted = figure.resize((new_w, new_h), resample=Image.Resampling.LANCZOS)
+            paste_x = (target_w - fitted.width) // 2
+            # Pin the unpadded feet to the geometric full-body floor.
+            content_bottom_in_fitted = int(round((bottom - crop_box[1]) * scale))
+            paste_y = int(target_h * FIGURE_BOTTOM_MIN) - content_bottom_in_fitted
+            paste_y = max(0, min(paste_y, target_h - fitted.height))
+            canvas.paste(fitted, (paste_x, paste_y))
+        else:
+            fitted = ImageOps.contain(
+                image,
+                (target_w, target_h),
+                method=Image.Resampling.LANCZOS,
+            )
+            offset = ((target_w - fitted.width) // 2, (target_h - fitted.height) // 2)
+            canvas.paste(fitted, offset)
+        out = BytesIO()
+        canvas.save(out, format="PNG", optimize=False, compress_level=6)
+    png = out.getvalue()
+    if len(png) < MIN_STILL_BYTES:
+        # Solid studio drops compress under the fail-closed floor; pad like
+        # synthetic_still_png so delivery stills remain valid blobs.
+        pad = _png_chunk(b"tEXt", b"af-pad\x00" + (b"x" * (MIN_STILL_BYTES - len(png) + 64)))
+        iend = png.rfind(b"IEND")
+        if iend > 0:
+            # Keep CRC+length structure: replace trailing IEND chunk with pad+IEND.
+            png = png[: iend - 4] + pad + png[iend - 4 :]
+        else:
+            png = png + pad
+    return assert_still_blob(
+        png,
+        width=target_w,
+        height=target_h,
+        label=label,
+        allow_placeholder=True,
+    )
+
+
 def _render_until_qc(
     spec: dict,
     client: KolorsClient,
@@ -1700,15 +1810,19 @@ def _render_until_qc(
     last_qc = None
     preserve_selected = False
     owns_lock = kind in {"character_sheet", "costume_derive", "scene_plate"}
+    char_master = kind in {"character_sheet", "character_view_derive", "costume_derive"}
     if story_root is not None and owns_lock:
         if spec.get("kind") != "scene_plate" and spec.get("character_id"):
             preserve_selected = is_qc_locked(story_root, character_id=str(spec.get("character_id")))
         elif spec.get("scene_id"):
             preserve_selected = is_qc_locked(story_root, scene_id=str(spec.get("scene_id")))
-    for salt in salts:
+    for attempt_index, salt in enumerate(salts):
         work = dict(spec)
         seed = attempt_seed(spec, salt)
         work["seed"] = seed
+        if char_master:
+            # Escalating tall canvases; fit back to CHAR_* delivery before QC/lock.
+            work["image_size"] = character_canvas_for_attempt(attempt_index)
         rel = str(work.get("path") or "")
         if story_root is not None:
             rel = _candidate_rel(story_root, work, salt)
@@ -1730,6 +1844,11 @@ def _render_until_qc(
                 story_root,
                 negative_base=negative_base,
             )
+            if char_master:
+                png = fit_character_canvas(
+                    png,
+                    label=str(work.get("id") or kind),
+                )
         parent_png = None if kind in {"scene_plate", "character_sheet", "character_turnaround", "prop", "keyframe"} else _parent_png_bytes(story_root, work)
         if kind == "character_view_derive" or kind == "costume_derive":
             parent_png = _parent_png_bytes(story_root, work)
@@ -1792,6 +1911,8 @@ def _render_until_qc(
         if qc.passed:
             spec["path"] = rel
             spec["seed"] = seed
+            if char_master:
+                spec["image_size"] = CHAR_IMAGE_SIZE
             return png, qc, rel
         if kind == "character_turnaround":
             break

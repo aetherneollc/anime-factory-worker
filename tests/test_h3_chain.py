@@ -183,7 +183,7 @@ def test_chain_tail_skips_flux_keyframe(tmp_path):
     assert key.endswith("prev_last.png")
 
 
-PNG_STUB = synthetic_still_png(832, 1216, tag="h3-chain-sheet", placeholder=True)
+PNG_STUB = synthetic_still_png(768, 1344, tag="h3-chain-sheet", placeholder=True)
 
 
 def test_ref2va_graph_loads_sheets_not_dummy_f1():

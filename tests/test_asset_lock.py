@@ -137,7 +137,7 @@ def test_plan_library_generates_front_then_reference_views_and_composite():
     turnaround = specs["char_hero_turnaround"]
     assert front["path"] == character_asset_rel("hero", FRONT_ALIAS_FILENAME)
     assert front["view"] == "front"
-    assert front["image_size"] == CHAR_IMAGE_SIZE == "832x1216"
+    assert front["image_size"] == CHAR_IMAGE_SIZE == "768x1344"
     assert side["path"] == character_asset_rel("hero", CHAR_SIDE_FILENAME)
     assert back["path"] == character_asset_rel("hero", CHAR_BACK_FILENAME)
     assert side["parent_id"] == back["parent_id"] == "hero"
