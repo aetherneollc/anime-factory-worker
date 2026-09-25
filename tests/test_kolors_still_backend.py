@@ -153,6 +153,7 @@ def test_kolors_character_negative_puts_bust_bans_first(monkeypatch):
 
 def test_animagine_character_prompt_keeps_booru_sheet(monkeypatch):
     monkeypatch.setenv("STILL_BACKEND", "animagine")
+    monkeypatch.setenv("CHARACTER_STILL_BACKEND", "animagine")
     prompt = style_prompt(
         "1boy, young adult, short black hair, brown eyes, grey hoodie",
         kind="character_sheet",

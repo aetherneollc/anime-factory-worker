@@ -12,4 +12,26 @@ sys.path.insert(0, str(ROOT / "python"))
 def _clear_video_backend_lock(monkeypatch):
     monkeypatch.delenv("AF_VIDEO_BACKEND_LOCKED", raising=False)
     monkeypatch.delenv("ANIME_FACTORY_GPU_STILLS", raising=False)
+    # Host shells sometimes export IMAGE_BACKEND=siliconflow; unit tests must not inherit it.
+    monkeypatch.delenv("IMAGE_BACKEND", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _unit_tests_use_kolors_characters(request, monkeypatch):
+    """Production default is CHARACTER_STILL_BACKEND=hunyuan; unit tests inject Kolors/GPU fakes.
+
+    Mark a test with ``@pytest.mark.qwen_character_default`` to assert the real default
+    (or other hosted character backends).
+    """
+    if request.node.get_closest_marker("qwen_character_default"):
+        monkeypatch.delenv("CHARACTER_STILL_BACKEND", raising=False)
+        return
+    monkeypatch.setenv("CHARACTER_STILL_BACKEND", "kolors")
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "qwen_character_default: exercise production CHARACTER_STILL_BACKEND (hunyuan/qwen)",
+    )
 

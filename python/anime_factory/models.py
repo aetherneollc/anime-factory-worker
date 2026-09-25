@@ -11,10 +11,22 @@ QC_MODEL = "Qwen/Qwen3.5-4B"
 # guidance-distilled, so cfg=1 silently dropped FIXED_NEGATIVE; real CFG needs SDXL.
 IMAGE_MODEL = "cagliostrolab/animagine-xl-4.0"
 IMAGE_CKPT = "animagine-xl-4.0.safetensors"
-# GPU stills default to local Kwai Kolors. Animagine stays selectable.
+# GPU stills: scene plates / keyframes stay on Kwai Kolors (backup for characters too).
+# Character sheets default to HunyuanImage (commercial open-weight family; TokenHub interim,
+# self-host on leased GPU is the target). Qwen open-weight 2.1 is research-licensed — not default.
 # Kolors is not an SDXL checkpoint: ChatGLM3 encodes text, so it cannot reuse anime_t2i.
 STILL_BACKENDS = ("kolors", "animagine")
 DEFAULT_STILL_BACKEND = "kolors"
+CHARACTER_STILL_BACKENDS = ("hunyuan", "qwen", "kolors", "animagine")
+DEFAULT_CHARACTER_STILL_BACKEND = "hunyuan"
+HUNYUAN_IMAGE_MODEL = "hy-image-v3"
+QWEN_IMAGE_MODEL = "qwen-image-2.0-pro"
+DASHSCOPE_MULTIMODAL_URL = (
+    "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
+)
+TOKENHUB_HUNYUAN_URL = (
+    "https://tokenhub.tencentmaas.com/v1/wand/hunyuan-image/v3-generation"
+)
 KOLORS_UNET_FILE = "kolors_unet_fp16.safetensors"
 KOLORS_VAE_FILE = "kolors_vae_fp16.safetensors"
 KOLORS_CHATGLM_FILE = "chatglm3-fp16.safetensors"
@@ -112,14 +124,44 @@ class StillBackendError(ValueError):
     """STILL_BACKEND is not kolors or animagine. Never silently pick one."""
 
 
+class CharacterStillBackendError(ValueError):
+    """CHARACTER_STILL_BACKEND is not hunyuan, qwen, kolors, or animagine."""
+
+
+class QwenImageError(ValueError):
+    """DashScope Qwen-Image call failed or returned no art."""
+
+
 def still_backend() -> str:
-    """Active GPU still backend. Invalid values fail closed."""
+    """Active GPU still backend (plates / keyframes). Invalid values fail closed."""
     raw = (os.environ.get("STILL_BACKEND") or DEFAULT_STILL_BACKEND).strip().lower()
     if raw not in STILL_BACKENDS:
         raise StillBackendError(
             f"STILL_BACKEND must be one of {STILL_BACKENDS}, got {raw!r}"
         )
     return raw
+
+
+def character_still_backend() -> str:
+    """Backend for character_sheet / view_derive / costume_derive. Default: hunyuan."""
+    raw = (
+        os.environ.get("CHARACTER_STILL_BACKEND") or DEFAULT_CHARACTER_STILL_BACKEND
+    ).strip().lower()
+    if raw not in CHARACTER_STILL_BACKENDS:
+        raise CharacterStillBackendError(
+            f"CHARACTER_STILL_BACKEND must be one of {CHARACTER_STILL_BACKENDS}, got {raw!r}"
+        )
+    return raw
+
+
+def qwen_image_model() -> str:
+    return (os.environ.get("QWEN_IMAGE_MODEL") or QWEN_IMAGE_MODEL).strip() or QWEN_IMAGE_MODEL
+
+
+def hunyuan_image_model() -> str:
+    return (
+        os.environ.get("HUNYUAN_IMAGE_MODEL") or HUNYUAN_IMAGE_MODEL
+    ).strip() or HUNYUAN_IMAGE_MODEL
 
 
 def still_model_id() -> str:
@@ -201,8 +243,13 @@ LONGLIVE_SHORT_MAX_SECONDS = 60.0
 LONGLIVE_SHORT_TARGET_SECONDS = 120.0
 LONGLIVE_SHORT_MIN_TAKES = 2
 LONGLIVE_SHORT_MAX_TAKES = 3
-VIDEO_BACKENDS = ("h3", "longlive")
+VIDEO_BACKENDS = ("h3", "longlive", "hunyuan15")
 DEFAULT_VIDEO_BACKEND = "h3"
+# Pluggable stills-strategy backends (see anime_factory.backends).
+IMAGE_BACKENDS = ("hunyuan21", "kolors")
+DEFAULT_IMAGE_BACKEND = "hunyuan21"
+CONTROL_BACKENDS = ("kolors_ipadapter", "ip_adapter", "composite", "none")
+DEFAULT_CONTROL_BACKEND = "kolors_ipadapter"
 H3_MAX_REFS = 9
 H3_MAX_RETRIES = 2
 STORY_KINDS = ("film", "series", "short")

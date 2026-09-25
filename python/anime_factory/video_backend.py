@@ -1,12 +1,13 @@
-"""Per-story video line: MiniMax H3 (default) or LongLive 2.0.
+"""Per-story video line: MiniMax H3 (default), LongLive 2.0, or HunyuanVideo-1.5.
 
 Selection is story-scoped so an in-flight H3 shoot cannot be flipped by a
 global Worker secret. Missing factory.json / env → h3.
 
+Preferred env: VIDEO_BACKEND (stills strategy). Legacy adapter: AF_VIDEO_BACKEND.
 AF_VIDEO_BACKEND must be resolved and locked before any video-weight task.
 Image capability (AF_IMAGE_CAPABILITY / catalog) that disagrees with the
 requested backend fails closed — H3 images never pull LongLive, LongLive
-images never pull H3.
+images never pull H3. hunyuan15 is scaffolded alongside; H3 path stays.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from typing import Any, Mapping
 
 from anime_factory.models import H3_MAX_SECONDS, LONGLIVE_MAX_SECONDS, LONGLIVE_SHORT_MAX_SECONDS
 
-VIDEO_BACKENDS = ("h3", "longlive")
+VIDEO_BACKENDS = ("h3", "longlive", "hunyuan15")
 DEFAULT_VIDEO_BACKEND = "h3"
 FACTORY_JSON_NAME = "factory.json"
 LOCKED_ENV = "AF_VIDEO_BACKEND_LOCKED"
@@ -34,6 +35,18 @@ LONGLIVE_ALIASES = frozenset(
         "longlive-2.0-5b",
     }
 )
+HUNYUAN15_ALIASES = frozenset(
+    {
+        "hunyuan15",
+        "hunyuan-15",
+        "hunyuan_1.5",
+        "hunyuan-1.5",
+        "hunyuanvideo15",
+        "hunyuanvideo-1.5",
+        "hunyuanvideo_1.5",
+        "hy15",
+    }
+)
 
 
 class VideoBackendLockError(RuntimeError):
@@ -44,6 +57,9 @@ def normalize_video_backend(value: Any) -> str:
     raw = str(value or "").strip().lower().replace(" ", "")
     if raw.startswith("longlive") or raw in LONGLIVE_ALIASES:
         return "longlive"
+    if raw in HUNYUAN15_ALIASES or raw.startswith("hunyuan15"):
+        return "hunyuan15"
+    # Prefer VIDEO_BACKEND env alias when callers pass through select_video_backend.
     return DEFAULT_VIDEO_BACKEND
 
 
@@ -118,7 +134,7 @@ def select_video_backend(
     root: Path | None = None,
     env: Mapping[str, str] | None = None,
 ) -> str:
-    """Locked env → shot override → story factory.json → AF_VIDEO_BACKEND → h3."""
+    """Locked env → shot override → story factory.json → VIDEO_BACKEND → AF_VIDEO_BACKEND → h3."""
     mapping = env if env is not None else os.environ
     locked = str(mapping.get(LOCKED_ENV) or "").strip()
     if locked:
@@ -130,6 +146,10 @@ def select_video_backend(
     from_file = read_factory_backend(root)
     if from_file:
         return from_file
+    # New stills-strategy name first; AF_VIDEO_BACKEND remains the legacy adapter.
+    preferred = str(mapping.get("VIDEO_BACKEND") or "").strip()
+    if preferred:
+        return normalize_video_backend(preferred)
     return normalize_video_backend(mapping.get("AF_VIDEO_BACKEND"))
 
 

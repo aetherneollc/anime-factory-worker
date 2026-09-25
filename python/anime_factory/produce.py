@@ -1386,6 +1386,8 @@ def _try_one_lease(stage_flags: dict[str, str]) -> dict[str, Any]:
         "AF_STORY_ID": os.environ.get("AF_STORY_ID") or "",
         "AF_START_COMFY": "1",
         "ANIME_FACTORY_GPU_STILLS": "1",
+        "CHARACTER_STILL_BACKEND": "hunyuan",
+        "HUNYUAN_IMAGE_MODEL": os.environ.get("HUNYUAN_IMAGE_MODEL") or "hy-image-v3",
         "VAST_DRY_RUN": "0",
         "ANIME_FACTORY_LIVE_VAST": "1",
         "VAST_ALLOW_REPLACE": "0",
@@ -1403,6 +1405,12 @@ def _try_one_lease(stage_flags: dict[str, str]) -> dict[str, Any]:
         sf_val = (os.environ.get(sf_key) or "").strip()
         if sf_val:
             env[sf_key] = sf_val
+    ds_key = (os.environ.get("DASHSCOPE_API_KEY") or "").strip()
+    if ds_key:
+        env["DASHSCOPE_API_KEY"] = ds_key
+    th_key = (os.environ.get("TOKENHUB_API_KEY") or os.environ.get("HUNYUAN_API_KEY") or "").strip()
+    if th_key:
+        env["TOKENHUB_API_KEY"] = th_key
     hf_token = (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or "").strip()
     if hf_token:
         env["HF_TOKEN"] = hf_token

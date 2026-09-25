@@ -2,9 +2,10 @@
 
 Identity is ONE four-view turnaround (`sheet_turnaround.png`), not three
 independent rolls. `sheet_front.png` is a copy alias for old lookups.
-Locked seed + assets/index.json selected pointer. GPU stills use anime SDXL
-(Animagine XL 4.0) via Comfy. SiliconFlow Kolors remains a hosted fallback.
-TTS never uses Vast.
+Locked seed + assets/index.json selected pointer. Character sheets default to
+HunyuanImage (CHARACTER_STILL_BACKEND=hunyuan; TokenHub interim, GPU self-host
+target). Scene plates / keyframes stay on GPU Kolors. Kolors remains character
+rollback. TTS never uses Vast.
 
 Every blob that reaches disk goes through `assert_still_blob`: PNG magic, the
 requested pixel size, and `MIN_STILL_BYTES`. The 3-byte `f1.png` files on disk
@@ -60,8 +61,12 @@ from anime_factory.models import (
     STILL_WIDTH,
     STYLE_PREFIX,
     STYLE_PREFIX_CHARACTER,
+    QwenImageError,
     animagine_quality_suffix,
+    character_still_backend,
+    hunyuan_image_model,
     normalize_style_preset,
+    qwen_image_model,
     scrub_copycat,
     still_backend,
     still_model_id,
@@ -157,6 +162,22 @@ KOLORS_CHARACTER_NEGATIVE_TAIL = (
     "bust, cropped feet, missing shoes, not full body, "
     "半身，特写，大头照，上半身，裁掉双腿，裁掉脚，看不见鞋子"
 )
+# Qwen / Hunyuan are not ChatGLM-pooled — English framing + light Chinese crop lock.
+QWEN_CHARACTER_FRAMING = (
+    "original anime character reference sheet, solo, cel shaded, clean lineart, "
+    "warm ivory studio background, full body shot, long shot, zoomed out, head to toe, "
+    "the whole figure from the top of the head to both shoes fits inside the frame, "
+    "both feet and shoes fully visible, standing with empty space below the shoes"
+)
+QWEN_CHARACTER_CROP_LOCK = "全身立绘，从头顶到两只鞋完整入画，双脚和鞋子都完整可见，脚下留白"
+QWEN_CHARACTER_NEGATIVE = (
+    "close-up, portrait, headshot, bust, cowboy shot, upper body, half body, "
+    "cropped legs, cropped feet, missing shoes, zoomed in, photorealistic, 3d render, "
+    "extra limbs, watermark, text"
+)
+HUNYUAN_CHARACTER_FRAMING = QWEN_CHARACTER_FRAMING
+HUNYUAN_CHARACTER_CROP_LOCK = QWEN_CHARACTER_CROP_LOCK
+HUNYUAN_CHARACTER_NEGATIVE = QWEN_CHARACTER_NEGATIVE + ", nude, bare legs, missing pants"
 ESTABLISHING_PLATE_LOOK = (
     "anime location background, wide establishing shot, no characters, "
     "foreground, midground, background, architectural perspective, "
@@ -498,6 +519,12 @@ def _kolors_append_tail(text: str, tail: str, *, budget: int = _KOLORS_TOKEN_BUD
     return f"{body}, {tail}"
 
 
+def _character_backend_for_kind(kind: str | None) -> str | None:
+    if str(kind or "") not in _CHARACTER_STILL_KINDS:
+        return None
+    return character_still_backend()
+
+
 def style_prompt(
     user_prompt: str,
     period_positive: list[str] | None = None,
@@ -510,8 +537,17 @@ def style_prompt(
     if period_positive:
         extra = ", " + ", ".join(period_positive)
     head = scrub_copycat(prefix if prefix is not None else style_prefix_for_kind(kind))
-    kolors_character = still_backend() == "kolors" and str(kind or "") in _CHARACTER_STILL_KINDS
-    if kolors_character:
+    char_backend = _character_backend_for_kind(kind)
+    kolors_character = char_backend == "kolors"
+    open_character = char_backend in {"qwen", "hunyuan"}
+    if open_character:
+        framing = HUNYUAN_CHARACTER_FRAMING if char_backend == "hunyuan" else QWEN_CHARACTER_FRAMING
+        crop_lock = HUNYUAN_CHARACTER_CROP_LOCK if char_backend == "hunyuan" else QWEN_CHARACTER_CROP_LOCK
+        if not head or head == STYLE_PREFIX_CHARACTER or head.startswith("original anime character design"):
+            head = framing
+        elif "full body shot" not in head.lower():
+            head = f"{framing}, {head}"
+    elif kolors_character:
         # "character design" / "character reference" are bust-poster cues. Framing leads.
         if not head or head == STYLE_PREFIX_CHARACTER or head.startswith("original anime character design"):
             head = f"{KOLORS_CHARACTER_FRAMING}, {KOLORS_CHARACTER_PREFIX}"
@@ -524,7 +560,10 @@ def style_prompt(
         composed = f"{body}{extra}"
     else:
         composed = f"{head}, {body}{extra}"
-    if still_backend() == "animagine":
+    if open_character:
+        if crop_lock not in composed:
+            composed = f"{composed}, {crop_lock}"
+    elif char_backend == "animagine" or (char_backend is None and still_backend() == "animagine"):
         tail = animagine_quality_suffix(kind, gender_tag=gender_tag)
         if tail.lower() not in composed.lower():
             composed = f"{composed}, {tail}"
@@ -546,7 +585,14 @@ def style_negative(
     base_text = scrub_copycat(base) if base else FIXED_NEGATIVE
     extra_text = str(extra or "").strip()
     period = [str(item).strip() for item in (period_negative or []) if str(item).strip()]
-    if still_backend() == "kolors" and str(kind or "") in _CHARACTER_STILL_KINDS:
+    char_backend = _character_backend_for_kind(kind)
+    if char_backend == "hunyuan":
+        terms = [HUNYUAN_CHARACTER_NEGATIVE, extra_text, base_text, *period]
+        return ", ".join(term for term in terms if term)
+    if char_backend == "qwen":
+        terms = [QWEN_CHARACTER_NEGATIVE, extra_text, base_text, *period]
+        return ", ".join(term for term in terms if term)
+    if char_backend == "kolors":
         terms = [KOLORS_CHARACTER_NEGATIVE_LEAD, extra_text, base_text, *period]
         joined = ", ".join(term for term in terms if term)
         return _kolors_append_tail(joined, KOLORS_CHARACTER_NEGATIVE_TAIL)
@@ -787,8 +833,31 @@ class KolorsClient:
             assert_no_reference_images(payload)
             if payload.get("_parent_png"):
                 raise KolorsPayloadError("scene plate must not bind a parent sheet as a reference image")
+        kind = str(payload.get("_kind") or "")
         parent_png = payload.get("_parent_png")
-        if parent_png and payload.get("_kind") not in {"scene_plate", "scene_derive"}:
+        char_backend = character_still_backend() if kind in _CHARACTER_STILL_KINDS else None
+        # Hunyuan: T2I or reference-image derive (TokenHub images[] / future GPU).
+        if char_backend == "hunyuan":
+            clean = {k: v for k, v in payload.items() if k not in {"image", "reference_images"}}
+            ref = parent_png if isinstance(parent_png, (bytes, bytearray)) else None
+            if ref:
+                clean["_parent_png"] = bytes(ref)
+            clean["model"] = hunyuan_image_model()
+            self.last_payloads.append({k: v for k, v in clean.items() if k != "_parent_png"})
+            Counters.kolors_requests += 1
+            width, height = parse_image_size(payload.get("image_size"), default=(CHAR_VIEW_WIDTH, CHAR_VIEW_HEIGHT))
+            label = str(payload.get("_label") or kind or "still")
+            return self._generate_hunyuan_character(clean, width, height, label)
+        # Qwen character path is T2I (no IP-Adapter). Drop parent refs before routing.
+        if char_backend == "qwen":
+            clean = {k: v for k, v in payload.items() if k not in {"image", "reference_images", "_parent_png"}}
+            clean["model"] = qwen_image_model()
+            self.last_payloads.append(clean)
+            Counters.kolors_requests += 1
+            width, height = parse_image_size(payload.get("image_size"), default=(CHAR_VIEW_WIDTH, CHAR_VIEW_HEIGHT))
+            label = str(payload.get("_label") or kind or "still")
+            return self._generate_qwen_character(clean, width, height, label)
+        if parent_png and kind not in {"scene_plate", "scene_derive"}:
             blob = parent_png if isinstance(parent_png, (bytes, bytearray)) else None
             if blob:
                 payload = _with_parent_reference(dict(payload), bytes(blob))
@@ -836,6 +905,82 @@ class KolorsClient:
             raise KolorsPayloadError(f"kolors returned no image url: keys={keys}")
         with urlopen(url, timeout=120) as img:
             blob = img.read()
+        return self._checked(blob, width, height, label)
+
+    def _generate_hunyuan_character(self, payload: dict, width: int, height: int, label: str) -> bytes:
+        from anime_factory.hunyuan_image import HunyuanImageError, generate_hunyuan_image
+
+        attempt = dict(payload)
+        attempt["model"] = hunyuan_image_model()
+        # TokenHub area ≤ 1024² — clamp ladder retries that would 400.
+        area = int(width) * int(height)
+        if area > 1024 * 1024:
+            width, height = CHAR_VIEW_WIDTH, CHAR_VIEW_HEIGHT
+        attempt["image_size"] = f"{width}x{height}"
+        parent = payload.get("_parent_png")
+        ref_bytes = bytes(parent) if isinstance(parent, (bytes, bytearray)) else None
+        if self.opener:
+            try:
+                blob = generate_hunyuan_image(
+                    prompt=str(payload.get("prompt") or ""),
+                    negative_prompt=str(payload.get("negative_prompt") or ""),
+                    image_size=attempt["image_size"],
+                    seed=payload.get("seed"),
+                    reference_pngs=[ref_bytes] if ref_bytes else None,
+                    opener=self.opener,
+                )
+            except HunyuanImageError:
+                blob = self._offline_still(attempt, width, height)
+            return self._checked(blob, width, height, label)
+        if not self.live:
+            return self._checked(self._offline_still(attempt, width, height), width, height, label)
+        self._throttle()
+        try:
+            blob = generate_hunyuan_image(
+                prompt=str(payload.get("prompt") or ""),
+                negative_prompt=str(payload.get("negative_prompt") or ""),
+                image_size=attempt["image_size"],
+                seed=payload.get("seed"),
+                reference_pngs=[ref_bytes] if ref_bytes else None,
+            )
+        except HunyuanImageError as exc:
+            self._last_call = time.time()
+            raise KolorsPayloadError(str(exc)) from exc
+        self._last_call = time.time()
+        return self._checked(blob, width, height, label)
+
+    def _generate_qwen_character(self, payload: dict, width: int, height: int, label: str) -> bytes:
+        from anime_factory.qwen_image import generate_qwen_image
+
+        attempt = dict(payload)
+        attempt["model"] = qwen_image_model()
+        attempt["image_size"] = f"{width}x{height}"
+        if self.opener:
+            try:
+                blob = generate_qwen_image(
+                    prompt=str(payload.get("prompt") or ""),
+                    negative_prompt=str(payload.get("negative_prompt") or ""),
+                    image_size=attempt["image_size"],
+                    seed=payload.get("seed"),
+                    opener=self.opener,
+                )
+            except QwenImageError:
+                blob = self._offline_still(attempt, width, height)
+            return self._checked(blob, width, height, label)
+        if not self.live:
+            return self._checked(self._offline_still(attempt, width, height), width, height, label)
+        self._throttle()
+        try:
+            blob = generate_qwen_image(
+                prompt=str(payload.get("prompt") or ""),
+                negative_prompt=str(payload.get("negative_prompt") or ""),
+                image_size=attempt["image_size"],
+                seed=payload.get("seed"),
+            )
+        except QwenImageError as exc:
+            self._last_call = time.time()
+            raise KolorsPayloadError(str(exc)) from exc
+        self._last_call = time.time()
         return self._checked(blob, width, height, label)
 
     def _offline_still(self, payload: dict, width: int, height: int) -> bytes:

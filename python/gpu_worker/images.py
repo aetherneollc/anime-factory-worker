@@ -310,6 +310,16 @@ CAPABILITY_PROFILES: dict[str, CapabilityProfile] = {
         expected_flash_attn=LONGLIVE_STACK.flash_attn,
         note="LongLive NVFP4 on Blackwell sm_120; wheels must be baked.",
     ),
+    "hy-cu128-sm120": CapabilityProfile(
+        profile_id="hy-cu128-sm120",
+        supported_sm=("sm_120",),
+        min_disk_gb=120.0,
+        min_mem_gb=32.0,
+        require_torch=True,
+        require_flash_attn=False,
+        require_fouroversix=False,
+        note="HunyuanImage-2.1 T2I on CUDA 12.8 / sm_120. Weights are not baked. SDPA fallback, no flash-attn.",
+    ),
     # 4090 sm_89 is intentionally absent until a validated sm_89 image exists.
 }
 
@@ -318,9 +328,11 @@ def default_profile_id() -> str:
     raw = (os.environ.get("AF_GPU_PROFILE") or "").strip()
     if raw in CAPABILITY_PROFILES:
         return raw
-    backend = (os.environ.get("AF_VIDEO_BACKEND") or "h3").strip().lower()
+    backend = (os.environ.get("AF_VIDEO_BACKEND") or os.environ.get("VIDEO_BACKEND") or "h3").strip().lower()
     if backend == "longlive":
         return "longlive-nvfp4-sm120"
+    if backend == "hunyuan15":
+        return "hy-cu128-sm120"
     return "h3-comfy-cu130-sm120"
 
 

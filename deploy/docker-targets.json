@@ -17,6 +17,14 @@
       "image_name": "anime-factory-worker-longlive",
       "platforms": ["linux/amd64"],
       "capabilities": ["longlive", "comfy", "kolors", "image-gen", "agent"]
+    },
+    {
+      "id": "hy",
+      "enabled": true,
+      "dockerfile": "deploy/gpu-worker/Dockerfile.hy",
+      "image_name": "anime-factory-worker-hy",
+      "platforms": ["linux/amd64"],
+      "capabilities": ["hunyuan21", "image-gen", "agent", "hunyuan15-scaffold"]
     }
   ]
 }
