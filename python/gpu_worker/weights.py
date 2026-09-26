@@ -479,11 +479,12 @@ def runtime_weight_bytes(comfy_dir: Path | str | None = None) -> int:
     """Count completed and in-progress local model bytes for the selected backend."""
     backend = ""
     try:
-        from anime_factory.video_backend import locked_video_backend, select_video_backend
+        from anime_factory.legacy_backends import select_legacy_video_backend
+        from anime_factory.video_backend import locked_video_backend
 
-        backend = locked_video_backend() or select_video_backend()
+        backend = locked_video_backend() or select_legacy_video_backend()
     except Exception:  # noqa: BLE001 — accounting must not crash boot
-        backend = (os.environ.get("AF_VIDEO_BACKEND") or "h3").strip().lower()
+        backend = (os.environ.get("AF_VIDEO_BACKEND") or "skyreels_v3_r2v").strip().lower()
     total = 0
     if backend != "longlive":
         root = Path(comfy_dir or os.environ.get("COMFYUI_DIR") or "/opt/ComfyUI") / "models"
@@ -576,9 +577,10 @@ def ensure_still_weights(
 
 def _refuse_h3_on_longlive() -> None:
     try:
-        from anime_factory.video_backend import locked_video_backend, select_video_backend
+        from anime_factory.legacy_backends import select_legacy_video_backend
+        from anime_factory.video_backend import locked_video_backend
 
-        backend = locked_video_backend() or select_video_backend()
+        backend = locked_video_backend() or select_legacy_video_backend()
     except Exception:  # noqa: BLE001
         backend = (os.environ.get("AF_VIDEO_BACKEND") or "").strip().lower()
     cap = (os.environ.get("AF_IMAGE_CAPABILITY") or "").strip().lower()

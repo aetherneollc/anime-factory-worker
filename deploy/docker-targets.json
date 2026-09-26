@@ -8,23 +8,47 @@
       "dockerfile": "deploy/gpu-worker/Dockerfile",
       "image_name": "anime-factory-worker-h3",
       "platforms": ["linux/amd64"],
-      "capabilities": ["comfy", "h3", "kolors", "image-gen", "agent"]
+      "capabilities": ["comfy", "h3", "kolors", "image-gen", "agent"],
+      "watch_paths": [
+        "deploy/gpu-worker/Dockerfile",
+        "deploy/gpu-worker/start.sh",
+        "deploy/gpu-worker/moss_sfx_runner.py",
+        "workflows",
+        "schema",
+        "config"
+      ]
     },
     {
       "id": "longlive",
-      "enabled": true,
+      "enabled": false,
       "dockerfile": "deploy/gpu-worker/Dockerfile.longlive",
       "image_name": "anime-factory-worker-longlive",
       "platforms": ["linux/amd64"],
-      "capabilities": ["longlive", "comfy", "kolors", "image-gen", "agent"]
+      "capabilities": ["longlive", "comfy", "kolors", "image-gen", "agent"],
+      "watch_paths": [
+        "deploy/gpu-worker/Dockerfile.longlive",
+        "deploy/gpu-worker/start.sh",
+        "deploy/gpu-worker/moss_sfx_runner.py",
+        "deploy/gpu-worker/fetch_pinned_wheel.sh",
+        "workflows",
+        "schema",
+        "config"
+      ]
     },
     {
-      "id": "hy",
+      "id": "sr3",
       "enabled": true,
-      "dockerfile": "deploy/gpu-worker/Dockerfile.hy",
-      "image_name": "anime-factory-worker-hy",
+      "dockerfile": "deploy/gpu-worker/Dockerfile.sr3",
+      "image_name": "anime-factory-worker-sr3",
       "platforms": ["linux/amd64"],
-      "capabilities": ["hunyuan21", "image-gen", "agent", "hunyuan15-scaffold"]
+      "capabilities": ["flux2_klein4b", "skyreels_v3_r2v", "image-gen", "agent"],
+      "watch_paths": [
+        "deploy/gpu-worker/Dockerfile.sr3",
+        "deploy/gpu-worker/start-sr3.sh",
+        "python/",
+        "schema/",
+        "config/"
+      ]
     }
   ]
 }

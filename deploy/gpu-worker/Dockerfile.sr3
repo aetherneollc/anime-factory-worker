@@ -1,0 +1,121 @@
+# Anime Factory GPU worker — SkyReels V3 R2V + FLUX.2 Klein 4B (anime-factory-worker-sr3).
+#
+# Standalone image: does not depend on the Moss or H3/Comfy images.
+# Base is the same cu128 PyTorch runtime as the old hy image. Docker Hub
+# layer list for this digest copies /usr/local/lib/python3.12 (Python >= 3.12).
+# Model weights are NOT baked — first generate pulls Hugging Face onto
+# instance-local disk.
+#
+# SkyReels-V3 is pinned to commit 28c771e8456341be6a213e3d1133ed1fd19bf75d.
+# Do not pip-install the upstream dependency pin file: it re-pins torch==2.8.0.
+# diffusers==0.38.0 ships Flux2KleinPipeline (added in 0.37.0) and the
+# GHSA-98h9-4798-4q5v fix that 0.37.1 did not have.
+#
+# Env defaults:
+#   IMAGE_BACKEND=flux2_klein4b
+#   CONTROL_BACKEND=flux2_klein_ref
+#   VIDEO_BACKEND=skyreels_v3_r2v
+#   AF_GPU_PROFILE=sr3-cu128-sm120
+#   AF_START_COMFY=0
+
+FROM pytorch/pytorch:2.10.0-cuda12.8-cudnn9-runtime@sha256:b85566342b86d13a67712e9315d40cdc2dad7f8d86df1aff3831f80835edbcca
+
+ARG TARGETARCH=amd64
+ARG SKYREELS_REPO=https://github.com/SkyworkAI/SkyReels-V3.git
+ARG SKYREELS_REF=28c771e8456341be6a213e3d1133ed1fd19bf75d
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:$PATH \
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
+    IMAGE_BACKEND=flux2_klein4b \
+    CONTROL_BACKEND=flux2_klein_ref \
+    VIDEO_BACKEND=skyreels_v3_r2v \
+    AF_VIDEO_BACKEND=skyreels_v3_r2v \
+    AF_IMAGE_CAPABILITY=skyreels_v3_r2v \
+    AF_GPU_PROFILE=sr3-cu128-sm120 \
+    AF_START_COMFY=0 \
+    AF_PRODUCTION_STACK=0 \
+    FLUX2_KLEIN_DRY_RUN=0 \
+    SKYREELS_DRY_RUN=0 \
+    SKYREELS_LOW_VRAM=1 \
+    PYTHONPATH=/opt/SkyReels-V3:/opt/anime-factory-worker/python \
+    HF_HOME=/workspace/huggingface \
+    AF_WEIGHTS_DIR=/workspace/weights \
+    SKYREELS_ROOT=/opt/SkyReels-V3 \
+    HF_HUB_DISABLE_XET=1
+
+LABEL org.opencontainers.image.title="anime-factory-worker-sr3" \
+      af.capability.image-gen="true" \
+      af.capability.flux2-klein4b="true" \
+      af.capability.skyreels-v3-r2v="true" \
+      af.capability.h3="false" \
+      af.capability.comfy="false"
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+         ca-certificates curl ffmpeg git git-lfs libsndfile1 \
+         fontconfig fonts-noto-cjk python3-venv wget \
+    && case "${TARGETARCH}" in amd64|x86_64) cf_arch=amd64 ;; arm64|aarch64) cf_arch=arm64 ;; *) cf_arch=amd64 ;; esac \
+    && curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}" \
+         -o /usr/local/bin/cloudflared \
+    && chmod +x /usr/local/bin/cloudflared \
+    && git lfs install \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python -m venv --system-site-packages /opt/venv \
+    || { rm -rf /opt/venv && python -m venv --system-site-packages --without-pip /opt/venv; } \
+    && /opt/venv/bin/python -m pip install --no-cache-dir --upgrade pip \
+    && /opt/venv/bin/python -c "import torch; print('venv torch', torch.__version__, torch.version.cuda); assert torch.__version__.startswith('2.10')"
+
+# Pinned SkyReels source. The upstream pin file re-pins torch — do not install it.
+RUN git init /opt/SkyReels-V3 \
+    && git -C /opt/SkyReels-V3 remote add origin "${SKYREELS_REPO}" \
+    && git -C /opt/SkyReels-V3 fetch --depth 1 origin "${SKYREELS_REF}" \
+    && git -C /opt/SkyReels-V3 checkout --detach FETCH_HEAD \
+    && rm -rf /opt/SkyReels-V3/.git
+
+# Manual pins. torch / torchvision / flash_attn stay on the base image.
+# xfuser and yunchang are USP-only and are omitted (--low_vram cannot combine with --use_usp).
+RUN /opt/venv/bin/python -m pip install --no-cache-dir \
+        "diffusers==0.38.0" \
+        "transformers==4.53.2" \
+        "tokenizers==0.21.4" \
+        "accelerate==1.8.1" \
+        "safetensors==0.8.0" \
+        "huggingface_hub==0.34.0" \
+        "numpy==1.26.4" \
+        "Pillow>=10,<12" \
+        "opencv-python-headless==4.11.0.86" \
+        "imageio==2.37.0" \
+        "imageio-ffmpeg==0.5.1" \
+        "av==14.2.0" \
+        "ftfy==6.3.1" \
+        "regex" \
+        "tqdm==4.67.1" \
+        "easydict" \
+        "omegaconf==2.3.0" \
+        "kornia" \
+        "torchao==0.10.0" \
+        "sentencepiece" \
+        "protobuf" \
+        "einops==0.8.0" \
+        "wget==3.2" \
+        "moviepy==2.2.1" \
+        "librosa" \
+        "pyloudnorm" \
+    && /opt/venv/bin/python -c "import torch; from diffusers import Flux2KleinPipeline; assert torch.__version__.startswith('2.10'), torch.__version__; print('flux2 klein pipeline', Flux2KleinPipeline.__name__)" \
+    && rm -rf /root/.cache/pip
+
+WORKDIR /opt/anime-factory-worker
+COPY python/ /opt/anime-factory-worker/python/
+COPY schema/ /opt/anime-factory-worker/schema/
+COPY config/ /opt/anime-factory-worker/config/
+
+COPY deploy/gpu-worker/start-sr3.sh /usr/local/bin/af-start
+RUN chmod +x /usr/local/bin/af-start \
+    && mkdir -p /work /workspace/weights /workspace/huggingface \
+    && python -c "import anime_factory.flux2_klein, anime_factory.skyreels_r2v, anime_factory.stills_phase, torch; print('sr3 worker import ok', torch.__version__)"
+
+WORKDIR /workspace
+CMD ["/usr/local/bin/af-start"]

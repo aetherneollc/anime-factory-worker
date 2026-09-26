@@ -1,4 +1,4 @@
-"""Control backends: single-ref identity (Phase B). Pluggable — not Kolors-only."""
+"""Control backends: Klein multi-ref (default), composite, Kolors IP-Adapter rollback."""
 
 from __future__ import annotations
 
@@ -9,12 +9,13 @@ from typing import Any, Mapping, Sequence
 
 from anime_factory.contracts import CharacterRefError, assert_character_refs, is_master_ref
 
-CONTROL_BACKENDS = ("kolors_ipadapter", "ip_adapter", "composite", "none")
-DEFAULT_CONTROL_BACKEND = "kolors_ipadapter"
+CONTROL_BACKENDS = ("flux2_klein_ref", "composite", "kolors_ipadapter", "none")
+DEFAULT_CONTROL_BACKEND = "flux2_klein_ref"
+MAX_CONTROL_REFS = 4
 
 
 class ControlBackendError(ValueError):
-    """CONTROL_BACKEND invalid or request violates single-ref master contract."""
+    """CONTROL_BACKEND invalid or the reference contract was violated."""
 
 
 @dataclass
@@ -31,10 +32,10 @@ class ControlRequest:
 
     def __post_init__(self) -> None:
         self.character_refs = assert_character_refs(self.character_refs)
-        if len(self.character_refs) > 1:
+        if len(self.character_refs) > MAX_CONTROL_REFS:
             raise ControlBackendError(
-                "Phase B control accepts a single master.png ref; "
-                f"got {len(self.character_refs)} refs"
+                f"control accepts at most {MAX_CONTROL_REFS} master.png refs; "
+                f"got {len(self.character_refs)}"
             )
         for ref in self.character_refs:
             if not is_master_ref(ref):
@@ -68,6 +69,39 @@ def select_control_backend(env: Mapping[str, str] | None = None) -> str:
     return raw
 
 
+class Flux2KleinRefControlBackend(ControlBackend):
+    """Klein multi-reference edit. 1–4 master.png refs. Dry-run via FLUX2_KLEIN_DRY_RUN."""
+
+    name = "flux2_klein_ref"
+
+    def apply(self, request: ControlRequest) -> ControlResult:
+        refs = list(request.character_refs)
+        pngs = [p for p in request.reference_pngs if p]
+        if not refs and not pngs:
+            raise ControlBackendError("flux2_klein_ref requires at least one master.png or PNG bytes")
+        if len(refs) > MAX_CONTROL_REFS or len(pngs) > MAX_CONTROL_REFS:
+            raise ControlBackendError(f"flux2_klein_ref accepts at most {MAX_CONTROL_REFS} refs")
+        from anime_factory.flux2_klein import edit_klein_refs
+
+        payload: list[Any] = list(pngs) if pngs else list(refs)
+        dry = request.meta.get("dry_run")
+        png = edit_klein_refs(
+            request.prompt,
+            payload,
+            request.width,
+            request.height,
+            seed=request.seed,
+            dry_run=True if dry else None,
+        )
+        return ControlResult(
+            png=png,
+            backend=self.name,
+            control_mode=request.control_mode or "identity",
+            used_refs=refs,
+            meta={"model": "black-forest-labs/FLUX.2-klein-4B", **dict(request.meta)},
+        )
+
+
 class NoneControlBackend(ControlBackend):
     """No-op: Control disabled (tier A)."""
 
@@ -94,6 +128,11 @@ class KolorsIpAdapterControlBackend(ControlBackend):
                 "Phase B stub only implements identity control; "
                 f"got {request.control_mode!r}"
             )
+        if len(request.character_refs) > 1:
+            raise ControlBackendError(
+                "Kolors IP-Adapter rollback accepts a single master.png ref; "
+                f"got {len(request.character_refs)}"
+            )
         if not request.character_refs and not request.reference_pngs:
             raise ControlBackendError("identity control requires one master.png ref or PNG bytes")
         # Dry stub PNG (valid header only) — production wires Comfy IP-Adapter.
@@ -104,23 +143,6 @@ class KolorsIpAdapterControlBackend(ControlBackend):
             control_mode="identity",
             used_refs=list(request.character_refs),
             meta={"stub": True, **dict(request.meta)},
-        )
-
-
-class IpAdapterControlBackend(ControlBackend):
-    """Generic IP-Adapter slot — same single-ref contract, different adapter name."""
-
-    name = "ip_adapter"
-
-    def apply(self, request: ControlRequest) -> ControlResult:
-        # Delegate contract checks to the Kolors stub shape for now.
-        inner = KolorsIpAdapterControlBackend().apply(request)
-        return ControlResult(
-            png=inner.png,
-            backend=self.name,
-            control_mode=inner.control_mode,
-            used_refs=inner.used_refs,
-            meta={**inner.meta, "adapter": "ip_adapter"},
         )
 
 
@@ -151,9 +173,9 @@ def _stub_png(width: int, height: int, *, tag: bytes) -> bytes:
 
 
 _BACKENDS: dict[str, type[ControlBackend]] = {
-    "kolors_ipadapter": KolorsIpAdapterControlBackend,
-    "ip_adapter": IpAdapterControlBackend,
+    "flux2_klein_ref": Flux2KleinRefControlBackend,
     "composite": CompositeControlBackend,
+    "kolors_ipadapter": KolorsIpAdapterControlBackend,
     "none": NoneControlBackend,
 }
 

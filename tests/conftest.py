@@ -12,8 +12,10 @@ sys.path.insert(0, str(ROOT / "python"))
 def _clear_video_backend_lock(monkeypatch):
     monkeypatch.delenv("AF_VIDEO_BACKEND_LOCKED", raising=False)
     monkeypatch.delenv("ANIME_FACTORY_GPU_STILLS", raising=False)
-    # Host shells sometimes export IMAGE_BACKEND=siliconflow; unit tests must not inherit it.
+    # Host shells sometimes export IMAGE_BACKEND / VIDEO_BACKEND; unit tests must not inherit them.
     monkeypatch.delenv("IMAGE_BACKEND", raising=False)
+    monkeypatch.delenv("VIDEO_BACKEND", raising=False)
+    monkeypatch.delenv("AF_VIDEO_BACKEND", raising=False)
 
 
 @pytest.fixture(autouse=True)

@@ -1,14 +1,12 @@
-"""Pluggable image / control / video backends for the stills strategy pipeline.
+"""Production image and video backends for the stills pipeline.
 
-Env (preferred):
-  IMAGE_BACKEND=hunyuan21|kolors
-  CONTROL_BACKEND=kolors_ipadapter|ip_adapter|composite|none
-  VIDEO_BACKEND=hunyuan15|h3|longlive
+Env:
+  IMAGE_BACKEND=flux2_klein4b
+  VIDEO_BACKEND=skyreels_v3_r2v
 
-Legacy adapters (do not break existing tests):
-  IMAGE_BACKEND unset → STILL_BACKEND=kolors → kolors; else hunyuan21
-  VIDEO_BACKEND unset → AF_VIDEO_BACKEND (via anime_factory.video_backend)
-  CHARACTER_STILL_BACKEND remains character-sheet TokenHub/Qwen path — not IMAGE_BACKEND
+``STILL_BACKEND=kolors`` does not override IMAGE_BACKEND.
+``CONTROL_BACKEND`` is an asset-generation knob, not part of the video lease.
+H3 / LongLive / Kolors are not production selections.
 """
 
 from __future__ import annotations
@@ -63,10 +61,9 @@ __all__ = [
 
 
 def resolve_backend_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
-    """Snapshot of active IMAGE / CONTROL / VIDEO backend names."""
+    """Production IMAGE / VIDEO snapshot. Control is not a video-path setting."""
     mapping = env if env is not None else os.environ
     return {
         "IMAGE_BACKEND": select_image_backend(env=mapping),
-        "CONTROL_BACKEND": select_control_backend(env=mapping),
         "VIDEO_BACKEND": select_pluggable_video_backend(env=mapping),
     }

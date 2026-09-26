@@ -896,14 +896,9 @@ def handshake_payload(
 
 
 def select_profile_id() -> str:
-    from anime_factory.video_backend import select_video_backend
+    from gpu_worker.images import default_profile_id
 
-    explicit = (os.environ.get("AF_GPU_PROFILE") or "").strip()
-    if explicit:
-        return explicit
-    if select_video_backend() == "longlive":
-        return "longlive-nvfp4-sm120"
-    return "h3-comfy-cu130-sm120"
+    return default_profile_id()
 
 
 __all__ = [

@@ -234,6 +234,8 @@ VIDEO_FPS = 24
 TARGET_EPISODE_SECONDS = 600
 DEFAULT_SHORT_SECONDS = 120.0
 H3_MAX_SECONDS = 8.0
+# SkyReels V3 R2V recommended shot unit.
+SKYREELS_MAX_SECONDS = 5.0
 # NVlabs LongLive inference.yaml default num_output_frames=384 latent frames.
 # (384-1)*4+1 = 1533 video frames ≈ 63.9s @ 24fps; 64s snaps exactly to 384 latents.
 # 5090 + local_attn_size=32 is the AR window, not an 8s H3 slice.
@@ -243,13 +245,13 @@ LONGLIVE_SHORT_MAX_SECONDS = 60.0
 LONGLIVE_SHORT_TARGET_SECONDS = 120.0
 LONGLIVE_SHORT_MIN_TAKES = 2
 LONGLIVE_SHORT_MAX_TAKES = 3
-VIDEO_BACKENDS = ("h3", "longlive", "hunyuan15")
-DEFAULT_VIDEO_BACKEND = "h3"
-# Pluggable stills-strategy backends (see anime_factory.backends).
-IMAGE_BACKENDS = ("hunyuan21", "kolors")
-DEFAULT_IMAGE_BACKEND = "hunyuan21"
-CONTROL_BACKENDS = ("kolors_ipadapter", "ip_adapter", "composite", "none")
-DEFAULT_CONTROL_BACKEND = "kolors_ipadapter"
+VIDEO_BACKENDS = ("skyreels_v3_r2v",)
+DEFAULT_VIDEO_BACKEND = "skyreels_v3_r2v"
+# Production stills backend. Kolors is not selectable here.
+IMAGE_BACKENDS = ("flux2_klein4b",)
+DEFAULT_IMAGE_BACKEND = "flux2_klein4b"
+CONTROL_BACKENDS = ("flux2_klein_ref", "composite", "kolors_ipadapter", "none")
+DEFAULT_CONTROL_BACKEND = "flux2_klein_ref"
 H3_MAX_REFS = 9
 H3_MAX_RETRIES = 2
 STORY_KINDS = ("film", "series", "short")

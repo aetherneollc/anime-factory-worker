@@ -1342,7 +1342,7 @@ def _try_one_lease(stage_flags: dict[str, str]) -> dict[str, Any]:
         assert_pre_lease,
         request_lease,
     )
-    from gpu_worker.images import AGENT_IMAGE, image_capabilities
+    from gpu_worker.images import image_capabilities, lease_image_for_backend
     from gpu_worker.offers import offer_sample, pick_one_offer
     from gpu_worker.vast_client import VastClient
 
@@ -1355,7 +1355,8 @@ def _try_one_lease(stage_flags: dict[str, str]) -> dict[str, Any]:
 
     key = os.environ.get("VAST_API_KEY") or ""
     client = VastClient(api_key=key, dry_run=False)
-    caps = image_capabilities(AGENT_IMAGE)
+    lease_image = lease_image_for_backend("skyreels_v3_r2v")
+    caps = image_capabilities(lease_image)
     try:
         assert_lease_capabilities(caps)
     except ImageCapabilityError as exc:
@@ -1384,10 +1385,13 @@ def _try_one_lease(stage_flags: dict[str, str]) -> dict[str, Any]:
     env = {
         "CONTROL_PLANE_URL": os.environ.get("CONTROL_PLANE_URL") or "",
         "AF_STORY_ID": os.environ.get("AF_STORY_ID") or "",
-        "AF_START_COMFY": "1",
+        "AF_START_COMFY": "0",
         "ANIME_FACTORY_GPU_STILLS": "1",
-        "CHARACTER_STILL_BACKEND": "hunyuan",
-        "HUNYUAN_IMAGE_MODEL": os.environ.get("HUNYUAN_IMAGE_MODEL") or "hy-image-v3",
+        "IMAGE_BACKEND": "flux2_klein4b",
+        "VIDEO_BACKEND": "skyreels_v3_r2v",
+        "AF_VIDEO_BACKEND": "skyreels_v3_r2v",
+        "AF_IMAGE_CAPABILITY": "skyreels_v3_r2v",
+        "AF_GPU_PROFILE": "sr3-cu128-sm120",
         "VAST_DRY_RUN": "0",
         "ANIME_FACTORY_LIVE_VAST": "1",
         "VAST_ALLOW_REPLACE": "0",
@@ -1419,10 +1423,11 @@ def _try_one_lease(stage_flags: dict[str, str]) -> dict[str, Any]:
     torch_index = (os.environ.get("TORCH_INDEX_URL") or "").strip()
     if torch_index:
         env["TORCH_INDEX_URL"] = torch_index
-    session = LeaseSession(image=f"{AGENT_IMAGE}:main", capabilities=caps, lease_env=env)
+    tagged = f"{lease_image}:main"
+    session = LeaseSession(image=tagged, capabilities=caps, lease_env=env)
     try:
         leased = request_lease(client, offer_id, session, flags)
-        leased["lease_image"] = f"{AGENT_IMAGE}:main"
+        leased["lease_image"] = tagged
         leased["offer"] = {
             "id": offer_id,
             "gpu": chosen.get("gpu_name") or chosen.get("gpu"),

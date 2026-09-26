@@ -1368,6 +1368,8 @@ def test_new_batch_episode_rows_do_not_reset_completed_resume(tmp_path, monkeypa
             f'{{"shots": [{{"id": "{shot_id}", "duration": 8}}]}}',
             encoding="utf-8",
         )
+    # 8s shots are the H3 rollback unit; the R2V default splits at 5s.
+    monkeypatch.setenv("AF_VIDEO_BACKEND", "h3")
     monkeypatch.setattr(session, "EP", "EP001")
     conn = session.ensure_story_db("story-1", tmp_path)
     conn.execute("UPDATE segments SET status = 'completed' WHERE id = 'E01-01'")

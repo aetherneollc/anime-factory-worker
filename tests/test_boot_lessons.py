@@ -212,6 +212,17 @@ def test_hub_image_comfy_h3_kolors_can_lease():
     assert_lease_capabilities(caps)
 
 
+def test_sr3_image_leases_without_comfy():
+    caps = image_capabilities("ghcr.io/aetherneollc/anime-factory-worker-sr3:main")
+    assert caps["comfy"] is False
+    assert caps["h3"] is False
+    assert caps["image_gen"] is True
+    assert caps["video_backend"] == "skyreels_v3_r2v"
+    assert image_can_lease(caps) is True
+    assert should_probe_comfy(None, caps) is False
+    assert_lease_capabilities(caps)
+
+
 def test_refuse_lease_when_image_gen_false():
     try:
         assert_lease_capabilities({"comfy": True, "h3": True, "kolors": False, "image_gen": False})
@@ -428,9 +439,12 @@ def test_hf_local_dir_does_not_nest_under_dest_parent():
     assert hf_local_dir_for(dest) == "/opt/ComfyUI/models"
 
 
-def test_ensure_story_db_rebuilds_segments_from_board(tmp_path):
+def test_ensure_story_db_rebuilds_segments_from_board(tmp_path, monkeypatch):
     """Hosted path may not upload story.sqlite; GPU must rebuild from board.json."""
     from gpu_worker.session import ensure_story_db
+
+    # 8s board shots are the H3 rollback unit; the R2V default splits at 5s.
+    monkeypatch.setenv("AF_VIDEO_BACKEND", "h3")
 
     root = tmp_path / "story"
     board = root / "episodes" / "EP001" / "board.json"
@@ -447,12 +461,20 @@ def test_ensure_story_db_rebuilds_segments_from_board(tmp_path):
     assert (root / "story.sqlite").is_file()
 
 
+def _pin_h3_image(monkeypatch):
+    """Frozen H3 image env (Dockerfile sets AF_IMAGE_CAPABILITY=h3). Default is now sr3."""
+    monkeypatch.delenv("AF_VIDEO_BACKEND", raising=False)
+    monkeypatch.delenv("VIDEO_BACKEND", raising=False)
+    monkeypatch.setenv("AF_IMAGE_CAPABILITY", "h3")
+
+
 def test_blackwell_torch_index_is_cu130(monkeypatch):
     """H3 Blackwell production stack uses cu130 wheels."""
     from gpu_worker import stack
 
     monkeypatch.delenv("TORCH_INDEX_URL", raising=False)
     monkeypatch.delenv("AF_GPU_PROFILE", raising=False)
+    _pin_h3_image(monkeypatch)
     assert stack.torch_index_url("sm_120") == stack.TORCH_CU130
     monkeypatch.setenv("AF_GPU_PROFILE", "longlive-nvfp4-sm120")
     assert stack.torch_index_url("sm_120") == stack.TORCH_CU128
@@ -467,6 +489,7 @@ def test_blackwell_nvidia_smi_fallback_picks_cu130(monkeypatch):
 
     monkeypatch.delenv("TORCH_INDEX_URL", raising=False)
     monkeypatch.delenv("AF_GPU_PROFILE", raising=False)
+    _pin_h3_image(monkeypatch)
     monkeypatch.setattr(stack, "cuda_sm", lambda: None)
     monkeypatch.setattr(stack, "_nvidia_smi_sm", lambda: "sm_120")
     assert stack.torch_index_url("sm_120") == stack.TORCH_CU130
@@ -522,6 +545,7 @@ def test_comfy_launch_args_disable_cuda_malloc(monkeypatch):
     from gpu_worker import stack
 
     monkeypatch.delenv("AF_GPU_PROFILE", raising=False)
+    _pin_h3_image(monkeypatch)
     args = stack.comfy_launch_args()
     assert "--disable-cuda-malloc" in args
     assert "--disable-pinned-memory" in args

@@ -393,7 +393,7 @@ def test_dockerfile_longlive_contract():
     assert "pip install --no-cache-dir --index-url https://download.pytorch.org/whl" not in text
     targets = json.loads((root / "deploy" / "docker-targets.json").read_text(encoding="utf-8"))
     ll = next(t for t in targets["targets"] if t["id"] == "longlive")
-    assert ll["enabled"] is True
+    assert ll["enabled"] is False
     assert "h3" not in ll["capabilities"]
     assert "longlive" in ll["capabilities"]
     h3 = next(t for t in targets["targets"] if t["id"] == "h3")

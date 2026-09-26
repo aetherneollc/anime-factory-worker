@@ -1,4 +1,4 @@
-"""Video line selection: MiniMax H3 (default) vs LongLive 2.0."""
+"""Video line selection: SkyReels V3 R2V (default), MiniMax H3, or LongLive 2.0."""
 
 from __future__ import annotations
 
@@ -64,40 +64,51 @@ def _clear_backend_env(monkeypatch):
     monkeypatch.delenv("CUDA_PATH", raising=False)
 
 
-def test_normalize_defaults_to_h3():
-    assert normalize_video_backend(None) == "h3"
-    assert normalize_video_backend("") == "h3"
-    assert normalize_video_backend("H3") == "h3"
-    assert normalize_video_backend("wan") == "h3"
-    assert DEFAULT_VIDEO_BACKEND == "h3"
+def test_normalize_defaults_to_skyreels():
+    from anime_factory.video_backend import ProductionBackendError
+
+    assert normalize_video_backend(None) == "skyreels_v3_r2v"
+    assert normalize_video_backend("") == "skyreels_v3_r2v"
+    assert DEFAULT_VIDEO_BACKEND == "skyreels_v3_r2v"
+    for legacy in ("H3", "wan", "h3", "longlive"):
+        with pytest.raises(ProductionBackendError):
+            normalize_video_backend(legacy)
 
 
 def test_normalize_longlive_aliases():
-    assert normalize_video_backend("longlive") == "longlive"
-    assert normalize_video_backend("LongLive 2.0") == "longlive"
-    assert normalize_video_backend("longlive-2.0-5b") == "longlive"
+    from anime_factory.video_backend import ProductionBackendError
+
+    for alias in ("longlive", "LongLive 2.0", "longlive-2.0-5b"):
+        with pytest.raises(ProductionBackendError):
+            normalize_video_backend(alias)
 
 
 def test_select_priority_segment_over_file_over_env(tmp_path: Path, monkeypatch):
+    from anime_factory.video_backend import ProductionBackendError
+
     monkeypatch.setenv("AF_VIDEO_BACKEND", "longlive")
     write_factory_backend(tmp_path, "h3")
-    assert select_video_backend(root=tmp_path) == "h3"
-    assert select_video_backend({"video_backend": "longlive"}, root=tmp_path) == "longlive"
-    assert select_video_backend(root=tmp_path / "missing") == "longlive"
+    with pytest.raises(ProductionBackendError):
+        select_video_backend(root=tmp_path)
+    with pytest.raises(ProductionBackendError):
+        select_video_backend({"video_backend": "longlive"}, root=tmp_path)
+    with pytest.raises(ProductionBackendError):
+        select_video_backend(root=tmp_path / "missing")
     monkeypatch.delenv("AF_VIDEO_BACKEND")
-    assert select_video_backend() == "h3"
+    assert select_video_backend() == "skyreels_v3_r2v"
 
 
-def test_missing_factory_keeps_in_flight_h3(tmp_path: Path):
-    """Live 舔狗 shoot has no factory.json — must stay H3."""
+def test_missing_factory_defaults_to_skyreels(tmp_path: Path):
+    """No factory.json and no explicit backend selects SkyReels. Pin h3 in factory.json to roll back."""
     assert not (tmp_path / "factory.json").exists()
-    assert select_video_backend(root=tmp_path) == "h3"
+    assert select_video_backend(root=tmp_path) == "skyreels_v3_r2v"
 
 
 def test_max_seconds_longlive_does_not_split_12s(tmp_path: Path):
-    write_factory_backend(tmp_path, "longlive")
+    del tmp_path
     assert max_seconds_for_backend("longlive") == LONGLIVE_MAX_SECONDS
     assert max_seconds_for_backend("h3") == H3_MAX_SECONDS
+    assert max_seconds_for_backend("skyreels_v3_r2v") == 5.0
     shots = [{"id": "S01", "duration": 12.0, "scene_id": "sc01"}]
     segs = expand_shots_to_segments(shots, max_s=max_seconds_for_backend("longlive"))
     assert len(segs) == 1
@@ -525,7 +536,10 @@ def test_write_inference_yaml_i2v_flags(tmp_path: Path):
 
 
 def test_h3_backend_unchanged_by_longlive_defaults():
-    assert normalize_video_backend("h3") == "h3"
+    from anime_factory.video_backend import ProductionBackendError
+
+    with pytest.raises(ProductionBackendError):
+        normalize_video_backend("h3")
     assert max_seconds_for_backend("h3") == H3_MAX_SECONDS
 
 

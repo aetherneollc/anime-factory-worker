@@ -112,11 +112,11 @@ from gpu_worker.h3_session import (
     plan_h3_mode_groups,
 )
 from gpu_worker.weights import ensure_h3_dits_for_shots, join_h3_weights
+from anime_factory.legacy_backends import select_legacy_video_backend as select_video_backend
 from anime_factory.video_backend import (
     VideoBackendLockError,
     lock_video_backend,
     max_seconds_for_backend,
-    select_video_backend,
 )
 
 # Default keeps existing EP001 artifacts; override via AF_EPISODE / run_gpu_episode(episode_code=).
@@ -3031,8 +3031,8 @@ def run_compose(
     # H3 stops Comfy without setting longlive_owns_gpu so Comfy can restore.
     try:
         video_backend = select_video_backend(root=root)
-    except Exception:  # noqa: BLE001 — compose can still proceed with H3 default
-        video_backend = "h3"
+    except Exception:  # noqa: BLE001 — compose still proceeds on the production line
+        video_backend = "skyreels_v3_r2v"
     moss_handoff_done = {"done": False}
 
     def _before_moss_sfx() -> None:

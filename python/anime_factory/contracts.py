@@ -1,12 +1,17 @@
 """Stable Asset / Shot / Keyframe / Video / QC contracts for the stills pipeline.
 
-Models are pluggable; these shapes must not drift with IMAGE_BACKEND /
-CONTROL_BACKEND / VIDEO_BACKEND swaps.
+The story layer does not cap how many references a shot may carry. A video
+backend may truncate for its own model; that limit does not live here.
 
 B-tier hard rule: ``character_refs`` are production Master paths only
 (``…/master.png``). Sheets stay in ``sheet_refs`` (docs / registry) and must
 not be fed into Control or Video by default. Workers must not scan a whole
 character directory.
+
+Video consumes a QC-passed reference pack (``references: ReferenceAsset[]``)
+plus prompt, camera, motion, duration, resolution, and seed. Character images
+in that pack must be ``master.png``. The preview keyframe is for QC and
+review; it is not a video reference and not a forced first frame.
 """
 
 from __future__ import annotations
@@ -119,6 +124,7 @@ class ShotContract:
     negative_prompt: str = ""
     character_refs: list[str] = field(default_factory=list)
     sheet_refs: list[str] = field(default_factory=list)
+    scene_refs: list[str] = field(default_factory=list)
     control_mode: ControlMode = "none"
     seed: int | None = None
     meta: dict[str, Any] = field(default_factory=dict)
@@ -126,6 +132,7 @@ class ShotContract:
     def __post_init__(self) -> None:
         self.character_refs = assert_character_refs(self.character_refs)
         self.sheet_refs = [_posix(x) for x in self.sheet_refs if _posix(x)]
+        self.scene_refs = [_posix(x) for x in self.scene_refs if _posix(x)]
         tier = str(self.tier or "A").strip().upper()
         if tier not in {"A", "B", "C"}:
             raise ValueError(f"shot tier must be A|B|C, got {self.tier!r}")
@@ -151,6 +158,9 @@ class ShotContract:
         sheets = obj.get("sheet_refs") or []
         if isinstance(sheets, (str, Path)):
             sheets = [sheets]
+        scenes = obj.get("scene_refs") or obj.get("scene_ref") or []
+        if isinstance(scenes, (str, Path)):
+            scenes = [scenes]
         seed = obj.get("seed")
         try:
             seed_i = int(seed) if seed is not None and str(seed).strip() != "" else None
@@ -163,6 +173,7 @@ class ShotContract:
             negative_prompt=str(obj.get("negative_prompt") or ""),
             character_refs=list(refs),
             sheet_refs=list(sheets),
+            scene_refs=list(scenes),
             control_mode=str(obj.get("control_mode") or "none"),  # type: ignore[arg-type]
             seed=seed_i,
             meta=dict(obj.get("meta") or {}),
@@ -211,7 +222,7 @@ class QcReport:
 
 @dataclass
 class KeyframeContract:
-    """Generated composition still + QC state. Video consumes keyframe_final only."""
+    """Generated composition still + QC state. Review only; not a video reference."""
 
     shot_id: str
     path: str = ""
@@ -259,9 +270,16 @@ class KeyframeContract:
 
 @dataclass
 class VideoContract:
-    """Video job bound to a QC-passed keyframe_final.png."""
+    """Video job. ``keyframe_final`` is a review pointer, not a reference image."""
 
     shot_id: str
+    prompt: str = ""
+    camera: str = ""
+    motion: str = ""
+    duration: float = 5.0
+    resolution: str = "720P"
+    seed: int | None = None
+    references: list[str] = field(default_factory=list)
     keyframe_final: str = ""
     path: str = ""
     status: VideoStatus = "pending"
@@ -269,15 +287,53 @@ class VideoContract:
     rife: bool = False
     meta: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        self.references = [_posix(x) for x in self.references if _posix(x)]
+        try:
+            self.duration = float(self.duration)
+        except (TypeError, ValueError):
+            self.duration = 5.0
+        if self.seed is not None:
+            try:
+                self.seed = int(self.seed)
+            except (TypeError, ValueError):
+                self.seed = None
+
+    @property
+    def ref_images(self) -> list[str]:
+        return list(self.references)
+
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        data["ref_images"] = list(self.references)
+        data["images"] = list(self.references)
+        return data
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any] | None) -> VideoContract:
         obj = dict(raw or {})
+        refs = obj.get("references")
+        if refs is None:
+            refs = obj.get("ref_images") or obj.get("images") or []
+        seed = obj.get("seed")
+        try:
+            seed_i = int(seed) if seed is not None and str(seed).strip() != "" else None
+        except (TypeError, ValueError):
+            seed_i = None
+        try:
+            duration = float(obj.get("duration") if obj.get("duration") is not None else obj.get("duration_s") or 5.0)
+        except (TypeError, ValueError):
+            duration = 5.0
         return cls(
             shot_id=str(obj.get("shot_id") or obj.get("id") or ""),
-            keyframe_final=str(obj.get("keyframe_final") or obj.get("first_frame") or ""),
+            prompt=str(obj.get("prompt") or ""),
+            camera=str(obj.get("camera") or ""),
+            motion=str(obj.get("motion") or ""),
+            duration=duration,
+            resolution=str(obj.get("resolution") or "720P"),
+            seed=seed_i,
+            references=[_posix(x) for x in refs if _posix(str(x) if not isinstance(x, Mapping) else x.get("path") or "")],
+            keyframe_final=str(obj.get("keyframe_final") or ""),
             path=str(obj.get("path") or ""),
             status=str(obj.get("status") or "pending"),  # type: ignore[arg-type]
             backend=str(obj.get("backend") or ""),
@@ -286,19 +342,221 @@ class VideoContract:
         )
 
 
-def assert_keyframe_allows_video(keyframe: KeyframeContract | Mapping[str, Any] | None) -> KeyframeContract:
-    """Hard gate: FAIL / missing QC blocks video GPU time."""
-    kf = keyframe if isinstance(keyframe, KeyframeContract) else KeyframeContract.from_dict(keyframe)
-    if not kf.qc_passed:
-        reasons = (kf.qc.reasons if kf.qc else []) or ["qc_missing_or_fail"]
-        raise KeyframeQcGateError(
-            f"keyframe QC gate blocked video for shot {kf.shot_id!r}: {', '.join(reasons)}"
+REF_PACK_ROLES = ("character", "scene", "prop", "preview")
+RefPackQcStatus = Literal["pass", "fail", "skip", "pending"]
+
+
+class RefPackQcGateError(KeyframeQcGateError):
+    """Video must not run unless the ref pack passed QC."""
+
+
+@dataclass
+class ReferenceAsset:
+    """One story-layer reference. Character slots are master.png only.
+
+    The story layer does not cap how many of these a pack may hold.
+    """
+
+    path: str
+    role: str = "character"
+    qc_status: RefPackQcStatus = "pending"
+    asset_id: str = ""
+
+    def __post_init__(self) -> None:
+        self.path = _posix(self.path)
+        self.asset_id = str(self.asset_id or "").strip()
+        role = str(self.role or "").strip().lower()
+        if role not in REF_PACK_ROLES:
+            raise ValueError(f"reference role must be {REF_PACK_ROLES}, got {self.role!r}")
+        self.role = role
+        status = str(self.qc_status or "pending").strip().lower()
+        if status not in {"pass", "fail", "skip", "pending"}:
+            status = "fail"
+        self.qc_status = status  # type: ignore[assignment]
+        if self.role == "character" and not is_master_ref(self.path):
+            raise CharacterRefError(
+                f"reference character image must be {MASTER_FILENAME}, got {self.path!r}"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any] | None) -> ReferenceAsset:
+        obj = dict(raw or {})
+        return cls(
+            path=str(obj.get("path") or ""),
+            role=str(obj.get("role") or "character"),
+            qc_status=str(obj.get("qc_status") or obj.get("qc") or "pending"),  # type: ignore[arg-type]
+            asset_id=str(obj.get("asset_id") or obj.get("id") or ""),
         )
+
+
+# Compatibility alias while call sites migrate off the old image record name.
+RefPackImage = ReferenceAsset
+
+
+def _as_reference(item: Any) -> ReferenceAsset:
+    if isinstance(item, ReferenceAsset):
+        return item
+    if isinstance(item, Mapping):
+        return ReferenceAsset.from_dict(item)
+    raise CharacterRefError(f"reference must be a path record, got {item!r}")
+
+
+@dataclass(init=False)
+class RefPackContract:
+    """QC'd reference pack. ``references`` is unbounded at this layer.
+
+    Character images are ``master.png``. ``images`` is a compatibility alias
+    for ``references``. A preview keyframe path is review metadata only.
+    """
+
+    shot_id: str
+    references: list[ReferenceAsset] = field(default_factory=list)
+    qc_status: RefPackQcStatus = "fail"
+    preview_path: str = ""
+    meta: dict[str, Any] = field(default_factory=dict)
+
+    def __init__(
+        self,
+        shot_id: str,
+        references: Sequence[Any] | None = None,
+        qc_status: str = "fail",
+        preview_path: str = "",
+        meta: Mapping[str, Any] | None = None,
+        images: Sequence[Any] | None = None,
+    ) -> None:
+        chosen = references if references is not None else images
+        self.shot_id = str(shot_id or "")
+        self.references = [_as_reference(item) for item in (chosen or [])]
+        self.qc_status = str(qc_status or "fail")  # type: ignore[assignment]
+        self.preview_path = preview_path
+        self.meta = dict(meta or {})
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        status = str(self.qc_status or "fail").strip().lower()
+        if status not in {"pass", "fail", "skip", "pending"}:
+            status = "fail"
+        self.qc_status = status  # type: ignore[assignment]
+        self.preview_path = _posix(self.preview_path)
+
+    @property
+    def images(self) -> list[ReferenceAsset]:
+        """Compatibility alias for ``references``."""
+        return self.references
+
+    @images.setter
+    def images(self, value: Sequence[Any]) -> None:
+        self.references = [_as_reference(item) for item in (value or [])]
+
+    def to_dict(self) -> dict[str, Any]:
+        data = {
+            "shot_id": self.shot_id,
+            "references": [item.to_dict() for item in self.references],
+            "qc_status": self.qc_status,
+            "preview_path": self.preview_path,
+            "meta": dict(self.meta),
+        }
+        data["images"] = list(data["references"])
+        return data
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any] | None) -> RefPackContract:
+        obj = dict(raw or {})
+        refs = obj.get("references")
+        if refs is None:
+            refs = obj.get("images") or []
+        return cls(
+            shot_id=str(obj.get("shot_id") or obj.get("id") or ""),
+            references=list(refs),
+            qc_status=str(obj.get("qc_status") or "fail"),
+            preview_path=str(obj.get("preview_path") or ""),
+            meta=dict(obj.get("meta") or {}),
+        )
+
+
+@dataclass
+class VideoRequest:
+    """Story-layer video request. Reference count is not capped here."""
+
+    shot_id: str
+    references: list[ReferenceAsset] = field(default_factory=list)
+    prompt: str = ""
+    camera: str = ""
+    motion: str = ""
+    duration: float = 5.0
+    resolution: str = "720P"
+    seed: int | None = None
+    meta: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        normalized: list[ReferenceAsset] = []
+        for item in self.references:
+            normalized.append(_as_reference(item))
+        self.references = normalized
+        try:
+            self.duration = float(self.duration)
+        except (TypeError, ValueError):
+            self.duration = 5.0
+        if self.seed is not None:
+            try:
+                self.seed = int(self.seed)
+            except (TypeError, ValueError):
+                self.seed = None
+
+    def to_dict(self) -> dict[str, Any]:
+        data = asdict(self)
+        data["references"] = [item.to_dict() for item in self.references]
+        return data
+
+
+def assert_ref_pack_allows_video(
+    pack: RefPackContract | Mapping[str, Any] | None,
+) -> RefPackContract:
+    """Hard gate: no video GPU unless the reference pack QC passed.
+
+    Does not cap reference count. Character slots must be ``master.png`` and
+    themselves QC-passed. An empty pack is not a count error here; the video
+    backend refuses to invent a preview frame.
+    """
+    ref = pack if isinstance(pack, RefPackContract) else RefPackContract.from_dict(pack)
+    if ref.qc_status != "pass":
+        raise RefPackQcGateError(
+            f"ref pack QC gate blocked video for shot {ref.shot_id!r}: qc_status={ref.qc_status!r}"
+        )
+    for image in ref.references:
+        if image.role == "character":
+            if not is_master_ref(image.path):
+                raise CharacterRefError(
+                    f"ref pack character image must be {MASTER_FILENAME}, got {image.path!r}"
+                )
+            if image.qc_status != "pass":
+                raise RefPackQcGateError(
+                    f"character master {image.path!r} qc_status={image.qc_status!r} blocks video"
+                )
+    return ref
+
+
+def ref_pack_from_keyframe(keyframe: KeyframeContract | Mapping[str, Any] | None) -> RefPackContract:
+    """QC status from a keyframe. The still is not copied into ``references``."""
+    kf = keyframe if isinstance(keyframe, KeyframeContract) else KeyframeContract.from_dict(keyframe)
     final = _posix(kf.final_path or kf.path)
-    if not final or PurePosixPath(final).name not in {KEYFRAME_FINAL_NAME, "f1.png"}:
-        # Allow legacy f1.png as interim path; prefer keyframe_final.png.
-        if not final:
-            raise KeyframeQcGateError(f"keyframe final path missing for shot {kf.shot_id!r}")
+    status: RefPackQcStatus = "pass" if kf.qc_passed else "fail"
+    return RefPackContract(
+        shot_id=kf.shot_id,
+        references=[],
+        qc_status=status,
+        preview_path=final,
+        meta=dict(kf.meta),
+    )
+
+
+def assert_keyframe_allows_video(keyframe: KeyframeContract | Mapping[str, Any] | None) -> KeyframeContract:
+    """QC gate for a keyframe. Does not turn the preview into a video reference."""
+    kf = keyframe if isinstance(keyframe, KeyframeContract) else KeyframeContract.from_dict(keyframe)
+    assert_ref_pack_allows_video(ref_pack_from_keyframe(kf))
     return kf
 
 

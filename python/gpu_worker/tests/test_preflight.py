@@ -82,6 +82,14 @@ def test_capability_profiles_default_5090_and_longlive():
     assert ll.expected_torchvision == "0.25.0+cu128"
     assert ll.expected_torchaudio == "2.10.0+cu128"
     assert ll.expected_flash_attn == "2.8.3"
+    sr3 = resolve_capability_profile("sr3-cu128-sm120")
+    assert sr3.min_disk_gb == 200
+    assert sr3.min_mem_gb == 64.0
+    assert sr3.require_flash_attn is False
+    assert sr3.expected_torch == "2.10.0+cu128"
+    assert sr3.expected_torchvision == "0.25.0+cu128"
+    assert sr3.expected_torchaudio == "2.10.0+cu128"
+    assert "hy-cu128-sm120" not in CAPABILITY_PROFILES
     assert MIN_DISK_GB == 200
     assert "h3-comfy-cu128-sm89" not in CAPABILITY_PROFILES
     assert "4090_48" not in CAPABILITY_PROFILES
@@ -123,6 +131,10 @@ def test_validate_profile_longlive_rejects_wrong_flash_attn(monkeypatch):
 
 def test_select_profile_id_respects_video_backend(monkeypatch):
     monkeypatch.delenv("AF_GPU_PROFILE", raising=False)
+    monkeypatch.delenv("AF_VIDEO_BACKEND", raising=False)
+    monkeypatch.delenv("VIDEO_BACKEND", raising=False)
+    monkeypatch.delenv("AF_IMAGE_CAPABILITY", raising=False)
+    assert select_profile_id() == "sr3-cu128-sm120"
     monkeypatch.setenv("AF_VIDEO_BACKEND", "longlive")
     assert select_profile_id() == "longlive-nvfp4-sm120"
     monkeypatch.setenv("AF_VIDEO_BACKEND", "h3")
@@ -512,6 +524,8 @@ def test_ensure_torchaudio_accepts_baked_211(monkeypatch):
     fake = types.ModuleType("torchaudio")
     fake.__version__ = "2.11.0+cu130"
     monkeypatch.setitem(sys.modules, "torchaudio", fake)
+    # H3 image pins; the unset default profile is now sr3 (cu128).
+    monkeypatch.setenv("AF_GPU_PROFILE", "h3-comfy-cu130-sm120")
     stack_mod.ensure_torchaudio()
 
 

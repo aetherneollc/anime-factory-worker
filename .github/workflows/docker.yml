@@ -13,6 +13,11 @@ on:
       - "config/**"
       - ".github/workflows/docker.yml"
   workflow_dispatch:
+    inputs:
+      force_all:
+        description: Build every docker target even when watch_paths did not change
+        type: boolean
+        default: false
 
 concurrency:
   group: docker-${{ github.ref }}
@@ -29,20 +34,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - id: load
-        name: Load enabled docker targets
+        name: Load docker targets whose watch_paths changed
+        env:
+          BEFORE: ${{ github.event.before }}
+          FORCE_ALL: ${{ github.event_name == 'workflow_dispatch' && inputs.force_all }}
         run: |
-          python3 - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          data = json.loads(Path("deploy/docker-targets.json").read_text(encoding="utf-8"))
-          enabled = [t for t in data.get("targets", []) if t.get("enabled")]
-          github_output = os.environ["GITHUB_OUTPUT"]
-          with open(github_output, "a", encoding="utf-8") as fh:
-              fh.write(f"targets={json.dumps(enabled)}\n")
-          print(json.dumps(enabled, indent=2))
-          PY
+          set -eu
+          before="${BEFORE:-}"
+          if [ -n "$before" ] && [ "$before" != "0000000000000000000000000000000000000000" ]; then
+            git fetch --depth=1 origin "$before" || true
+          fi
+          python3 deploy/filter_docker_targets.py
 
   moss:
     runs-on: ubuntu-latest

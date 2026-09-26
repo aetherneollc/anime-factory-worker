@@ -67,22 +67,33 @@ class GpuImage:
     note: str
     digest: str | None = None
     longlive: bool = False
+    skyreels: bool = False
 
     def capabilities(self) -> dict:
+        if self.skyreels:
+            video = "skyreels_v3_r2v"
+        elif self.longlive and not self.h3:
+            video = "longlive"
+        elif self.h3:
+            video = "h3"
+        else:
+            video = ""
         return {
             "comfy": self.comfy,
             "h3": self.h3,
             "longlive": self.longlive,
+            "skyreels": self.skyreels,
             "kolors": self.kolors,
             "image_gen": self.image_gen,
             "agent": self.agent,
             "install_comfy": self.install_comfy,
-            "video_backend": "longlive" if self.longlive and not self.h3 else "h3" if self.h3 else "",
+            "video_backend": video,
         }
 
 
 AGENT_IMAGE = "docker.io/aetherneo/anime-factory-gpu"
 LONGLIVE_IMAGE = "docker.io/aetherneo/anime-factory-gpu-longlive"
+SR3_IMAGE = "ghcr.io/aetherneollc/anime-factory-worker-sr3"
 LEGACY_AGENT_ONLY_IMAGE = "docker.io/aetherneo/anime-factory-gpu-agent"
 PYTORCH_IMAGE = "pytorch/pytorch"
 COMFY_TEMPLATE_IMAGE = "vast-template/comfy-h3"
@@ -132,6 +143,18 @@ IMAGE_CATALOG: dict[str, GpuImage] = {
         install_comfy=True,
         note="Base CUDA/pytorch. May install Comfy/H3/Flux on the same instance; do not lease until flags flip true.",
     ),
+    SR3_IMAGE: GpuImage(
+        name=SR3_IMAGE,
+        comfy=False,
+        h3=False,
+        kolors=False,
+        image_gen=True,
+        agent=True,
+        install_comfy=False,
+        note="SkyReels V3 R2V + FLUX.2 Klein 4B. No Comfy. Weights are not baked.",
+        longlive=False,
+        skyreels=True,
+    ),
     COMFY_TEMPLATE_IMAGE: GpuImage(
         name=COMFY_TEMPLATE_IMAGE,
         comfy=True,
@@ -153,6 +176,9 @@ _ALIASES = {
     "docker.io/aetherneo/anime-factory-gpu-longlive": LONGLIVE_IMAGE,
     "docker.io/aetherneo/anime-factory-gpu-longlive:main": LONGLIVE_IMAGE,
     "anime-factory-gpu-longlive": LONGLIVE_IMAGE,
+    "ghcr.io/aetherneollc/anime-factory-worker-sr3": SR3_IMAGE,
+    "ghcr.io/aetherneollc/anime-factory-worker-sr3:main": SR3_IMAGE,
+    "anime-factory-worker-sr3": SR3_IMAGE,
     "aetherneo/anime-factory-gpu-agent": LEGACY_AGENT_ONLY_IMAGE,
     "docker.io/aetherneo/anime-factory-gpu-agent": LEGACY_AGENT_ONLY_IMAGE,
     "pytorch/pytorch": PYTORCH_IMAGE,
@@ -169,8 +195,13 @@ def normalize_image(image: str | None) -> str:
         return _ALIASES[no_tag]
     if no_tag in IMAGE_CATALOG:
         return no_tag
+    if "anime-factory-worker-sr3" in raw.lower():
+        return SR3_IMAGE
     if "longlive" in raw.lower():
         return LONGLIVE_IMAGE
+    lowered = raw.lower()
+    if "anime-factory-worker-sr3" in lowered or lowered.endswith("/anime-factory-gpu-sr3"):
+        return SR3_IMAGE
     return AGENT_IMAGE
 
 
@@ -194,9 +225,14 @@ def stills_capable(capabilities: dict | None) -> bool:
 
 
 def video_capability(capabilities: dict | None) -> str:
-    """Return the video line this image may run: h3, longlive, or empty."""
+    """Return the video line this image may run: skyreels_v3_r2v, h3, longlive, or empty."""
     if not capabilities:
         return ""
+    explicit = str(capabilities.get("video_backend") or "").strip().lower()
+    if explicit in {"skyreels_v3_r2v", "h3", "longlive"}:
+        return explicit
+    if capabilities.get("skyreels"):
+        return "skyreels_v3_r2v"
     if capabilities.get("longlive") and not capabilities.get("h3"):
         return "longlive"
     if capabilities.get("h3"):
@@ -213,13 +249,16 @@ def image_supports_backend(capabilities: dict | None, backend: str) -> bool:
 
 
 def image_can_lease(capabilities: dict | None) -> bool:
-    """Lease when the image can run Comfy + 生图 and exactly one video line."""
+    """Lease a Comfy+H3/LongLive card, or the sr3 Klein+R2V image (no Comfy)."""
     if not capabilities:
         return False
+    video = video_capability(capabilities)
+    if video == "skyreels_v3_r2v" and stills_capable(capabilities):
+        return True
     return bool(
         capabilities.get("comfy")
         and stills_capable(capabilities)
-        and video_capability(capabilities) in {"h3", "longlive"}
+        and video in {"h3", "longlive"}
     )
 
 
@@ -232,9 +271,9 @@ def running_image_name() -> str | None:
 
 
 def running_image_capability() -> str:
-    """Video line baked into this container. Fail closed when unset on mismatch checks."""
+    """Video line baked into this container. Unset still reports h3 for the hub image."""
     raw = (os.environ.get(IMAGE_CAPABILITY_ENV) or "").strip().lower()
-    if raw in {"h3", "longlive"}:
+    if raw in {"h3", "longlive", "skyreels_v3_r2v"}:
         return raw
     image = running_image_name()
     if image:
@@ -251,11 +290,17 @@ def should_probe_comfy(image: str | None = None, capabilities: dict | None = Non
 
 def default_register_capabilities() -> dict:
     name = running_image_name()
-    if running_image_capability() == "longlive":
+    cap = running_image_capability()
+    if cap == "longlive":
         caps = image_capabilities(name or LONGLIVE_IMAGE)
         caps["h3"] = False
         caps["longlive"] = True
         caps["video_backend"] = "longlive"
+    elif cap == "skyreels_v3_r2v":
+        caps = image_capabilities(name or SR3_IMAGE)
+        caps["h3"] = False
+        caps["longlive"] = False
+        caps["video_backend"] = "skyreels_v3_r2v"
     else:
         caps = image_capabilities(name or AGENT_IMAGE)
         caps.setdefault("longlive", False)
@@ -310,30 +355,54 @@ CAPABILITY_PROFILES: dict[str, CapabilityProfile] = {
         expected_flash_attn=LONGLIVE_STACK.flash_attn,
         note="LongLive NVFP4 on Blackwell sm_120; wheels must be baked.",
     ),
-    "hy-cu128-sm120": CapabilityProfile(
-        profile_id="hy-cu128-sm120",
+    "sr3-cu128-sm120": CapabilityProfile(
+        profile_id="sr3-cu128-sm120",
         supported_sm=("sm_120",),
-        min_disk_gb=120.0,
-        min_mem_gb=32.0,
+        min_disk_gb=200.0,
+        min_mem_gb=64.0,
         require_torch=True,
         require_flash_attn=False,
         require_fouroversix=False,
-        note="HunyuanImage-2.1 T2I on CUDA 12.8 / sm_120. Weights are not baked. SDPA fallback, no flash-attn.",
+        # Official pytorch/pytorch:2.10.0-cuda12.8 runtime. Do not inherit the H3 cu130 pins.
+        expected_torch="2.10.0+cu128",
+        expected_torchvision="0.25.0+cu128",
+        expected_torchaudio="2.10.0+cu128",
+        note="FLUX.2 Klein 4B + SkyReels V3 R2V 14B on CUDA 12.8 / sm_120. Python 3.12. Weights are not baked. Offload needs 64GB RAM.",
     ),
     # 4090 sm_89 is intentionally absent until a validated sm_89 image exists.
 }
+
+
+def profile_for_video_backend(backend: str) -> str:
+    raw = str(backend or "").strip().lower()
+    if raw == "longlive" or raw.startswith("longlive"):
+        return "longlive-nvfp4-sm120"
+    if raw in {"h3", "wan"} or raw.startswith("h3"):
+        return "h3-comfy-cu130-sm120"
+    return "sr3-cu128-sm120"
+
+
+def lease_image_for_backend(backend: str) -> str:
+    """Catalog image for a video line. Same mechanism as AGENT_IMAGE / LONGLIVE_IMAGE."""
+    raw = str(backend or "").strip().lower()
+    if raw == "longlive" or raw.startswith("longlive"):
+        return LONGLIVE_IMAGE
+    if raw in {"h3", "wan"} or raw.startswith("h3"):
+        return AGENT_IMAGE
+    return SR3_IMAGE
 
 
 def default_profile_id() -> str:
     raw = (os.environ.get("AF_GPU_PROFILE") or "").strip()
     if raw in CAPABILITY_PROFILES:
         return raw
-    backend = (os.environ.get("AF_VIDEO_BACKEND") or os.environ.get("VIDEO_BACKEND") or "h3").strip().lower()
-    if backend == "longlive":
-        return "longlive-nvfp4-sm120"
-    if backend == "hunyuan15":
-        return "hy-cu128-sm120"
-    return "h3-comfy-cu130-sm120"
+    backend = (os.environ.get("AF_VIDEO_BACKEND") or os.environ.get("VIDEO_BACKEND") or "").strip().lower()
+    if backend:
+        return profile_for_video_backend(backend)
+    cap = (os.environ.get(IMAGE_CAPABILITY_ENV) or "").strip().lower()
+    if cap in {"h3", "longlive", "skyreels_v3_r2v"}:
+        return profile_for_video_backend(cap)
+    return "sr3-cu128-sm120"
 
 
 def resolve_capability_profile(profile_id: str | None = None) -> CapabilityProfile:

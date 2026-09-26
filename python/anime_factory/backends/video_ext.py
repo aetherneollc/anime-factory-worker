@@ -1,7 +1,8 @@
-"""Pluggable video generate backends (H3 kept; HunyuanVideo-1.5 scaffold).
+"""Production video generate backend: SkyReels V3 R2V only.
 
-Selection prefers VIDEO_BACKEND, then AF_VIDEO_BACKEND via video_backend.normalize.
-H3 path is never deleted — hunyuan15 is an additional backend.
+H3 and LongLive live in ``anime_factory.legacy_backends`` and are not registered
+here. A missing reference pack is a refusal; ``keyframe_final`` is never used
+as a substitute image.
 """
 
 from __future__ import annotations
@@ -9,28 +10,26 @@ from __future__ import annotations
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
 from anime_factory.contracts import (
-    KEYFRAME_FINAL_NAME,
     KeyframeContract,
+    RefPackContract,
     VideoContract,
-    assert_keyframe_allows_video,
+    assert_ref_pack_allows_video,
+    ref_pack_from_keyframe,
 )
 
-PLUGGABLE_VIDEO_BACKENDS = ("h3", "longlive", "hunyuan15")
-DEFAULT_PLUGGABLE_VIDEO_BACKEND = "h3"
-HUNYUAN15_ALIASES = frozenset(
+PLUGGABLE_VIDEO_BACKENDS = ("skyreels_v3_r2v",)
+DEFAULT_PLUGGABLE_VIDEO_BACKEND = "skyreels_v3_r2v"
+SKYREELS_ALIASES = frozenset(
     {
-        "hunyuan15",
-        "hunyuan-15",
-        "hunyuan_1.5",
-        "hunyuan-1.5",
-        "hunyuanvideo15",
-        "hunyuanvideo-1.5",
-        "hunyuanvideo_1.5",
-        "hy15",
+        "skyreels_v3_r2v",
+        "skyreels",
+        "skyreels_v3",
+        "skyreels-v3",
+        "skyreels-v3-r2v",
+        "r2v",
     }
 )
 
@@ -42,12 +41,32 @@ class VideoGenerateBackendError(ValueError):
 @dataclass
 class VideoGenerateRequest:
     shot_id: str
-    keyframe_final: str
-    keyframe_png: bytes | None = None
-    duration_s: float = 5.0
     prompt: str = ""
+    camera: str = ""
+    motion: str = ""
+    duration: float = 5.0
+    resolution: str = "720P"
+    seed: int | None = None
+    references: list[Any] = field(default_factory=list)
+    keyframe_final: str = ""
+    keyframe_png: bytes | None = None
+    ref_images: list[str] = field(default_factory=list)
+    duration_s: float = 5.0
+    aspect: str = "16:9"
     rife: bool = False
     meta: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.duration != self.duration_s:
+            if self.duration != 5.0:
+                self.duration_s = float(self.duration)
+            else:
+                self.duration = float(self.duration_s)
+        else:
+            self.duration = float(self.duration)
+            self.duration_s = self.duration
+        if self.seed is not None:
+            self.seed = int(self.seed)
 
 
 @dataclass
@@ -68,12 +87,11 @@ class VideoGenerateBackend(ABC):
 
 
 def select_pluggable_video_backend(env: Mapping[str, str] | None = None) -> str:
-    """VIDEO_BACKEND → AF_VIDEO_BACKEND → h3. Recognizes hunyuan15 aliases."""
+    """VIDEO_BACKEND → AF_VIDEO_BACKEND → skyreels_v3_r2v."""
     mapping = env if env is not None else os.environ
     raw = str(mapping.get("VIDEO_BACKEND") or "").strip().lower().replace(" ", "")
     if raw:
         return normalize_pluggable_video_backend(raw)
-    # Legacy adapter — keep AF_VIDEO_BACKEND / lock behavior intact.
     from anime_factory.video_backend import select_video_backend
 
     return select_video_backend(env=mapping)
@@ -81,109 +99,99 @@ def select_pluggable_video_backend(env: Mapping[str, str] | None = None) -> str:
 
 def normalize_pluggable_video_backend(value: Any) -> str:
     raw = str(value or "").strip().lower().replace(" ", "")
-    if raw in HUNYUAN15_ALIASES or raw.startswith("hunyuan15") or raw.startswith("hunyuanvideo"):
-        return "hunyuan15"
+    folded = raw.replace("-", "_")
+    if folded in SKYREELS_ALIASES or folded.startswith("skyreels") or folded == "r2v":
+        return "skyreels_v3_r2v"
     from anime_factory.video_backend import normalize_video_backend
 
     return normalize_video_backend(raw)
 
 
-def _assert_keyframe_final_only(path: str) -> str:
-    text = str(path or "").replace("\\", "/").strip()
-    if not text:
-        raise VideoGenerateBackendError("hunyuan15 requires keyframe_final.png path")
-    name = PurePosixPath(text).name
-    if name != KEYFRAME_FINAL_NAME:
-        raise VideoGenerateBackendError(
-            f"hunyuan15 consumes only {KEYFRAME_FINAL_NAME}, got {name!r}"
-        )
-    return text
+class SkyReelsV3R2VBackend(VideoGenerateBackend):
+    """Official generate_video.py --task_type reference_to_video. Frees Klein first."""
 
-
-class H3VideoGenerateBackend(VideoGenerateBackend):
-    """Thin wrapper marking H3 as the Phase-A video path (real work stays in session)."""
-
-    name = "h3"
+    name = "skyreels_v3_r2v"
 
     def generate(self, request: VideoGenerateRequest) -> VideoGenerateResult:
-        # Scaffold only — GPU session still owns MiniMax H3 submit.
-        return VideoGenerateResult(
-            path=str(request.meta.get("out_path") or f"video/{request.shot_id}.mp4"),
-            backend=self.name,
-            status="pending",
-            meta={"delegated": "gpu_worker.h3", **dict(request.meta)},
+        from anime_factory.skyreels_r2v import generate_reference_video, truncate_references
+
+        source: list[Any] = list(request.references or [])
+        if not source:
+            raw = request.ref_images or request.meta.get("references") or request.meta.get("ref_images") or []
+            source = list(raw)
+        kept, trunc = truncate_references(source)
+        dry = request.meta.get("dry_run")
+        seed = request.seed if request.seed is not None else request.meta.get("seed")
+        seed_i = 42 if seed is None else int(seed)
+        resolution = str(request.resolution or "720P")
+        produced = generate_reference_video(
+            ref_imgs=kept,
+            prompt=request.prompt,
+            duration_s=float(request.duration or request.duration_s or 5),
+            resolution=resolution,
+            aspect=request.aspect or "16:9",
+            seed=seed_i,
+            out_path=request.meta.get("out_path"),
+            dry_run=None if dry is None else bool(dry),
         )
-
-
-class LongliveVideoGenerateBackend(VideoGenerateBackend):
-    name = "longlive"
-
-    def generate(self, request: VideoGenerateRequest) -> VideoGenerateResult:
         return VideoGenerateResult(
-            path=str(request.meta.get("out_path") or f"video/{request.shot_id}.mp4"),
+            path=produced.path,
             backend=self.name,
-            status="pending",
-            meta={"delegated": "gpu_worker.longlive", **dict(request.meta)},
-        )
-
-
-class Hunyuan15VideoGenerateBackend(VideoGenerateBackend):
-    """HunyuanVideo-1.5 I2V scaffold: keyframe_final only → 720p → optional RIFE."""
-
-    name = "hunyuan15"
-
-    def generate(self, request: VideoGenerateRequest) -> VideoGenerateResult:
-        final = _assert_keyframe_final_only(request.keyframe_final)
-        out = str(request.meta.get("out_path") or f"video/{request.shot_id}_hy15.mp4")
-        rife_meta = rife_hook(enabled=bool(request.rife), video_path=out)
-        return VideoGenerateResult(
-            path=out,
-            backend=self.name,
-            status="pending",
-            rife_applied=bool(rife_meta.get("applied")),
+            status="ready",
             meta={
-                "stub": True,
-                "keyframe_final": final,
-                "target": "720p_i2v",
-                "rife": rife_meta,
-                **dict(request.meta),
+                "argv": list(produced.argv),
+                "dry_run": produced.dry_run,
+                "aspect": produced.aspect,
+                "fps": produced.fps,
+                "resolution": produced.resolution,
+                "duration_s": produced.duration_s,
+                "duration": float(request.duration or produced.duration_s),
+                "camera": request.camera,
+                "motion": request.motion,
+                "seed": seed_i,
+                "low_vram": produced.low_vram,
+                "offload": produced.offload,
+                "model_id": produced.model_id,
+                "ref_images": kept,
+                "references": kept,
+                **dict(produced.meta),
+                **trunc,
             },
         )
 
 
-def rife_hook(*, enabled: bool, video_path: str) -> dict[str, Any]:
-    """Optional RIFE interpolation stub (Phase C). Does not run weights."""
-    if not enabled:
-        return {"enabled": False, "applied": False, "path": video_path}
-    # Scaffold: pretend a sibling *_rife.mp4 without touching disk.
-    stem = Path(video_path)
-    out = str(stem.with_name(stem.stem + "_rife" + stem.suffix)) if stem.suffix else video_path + "_rife"
-    return {"enabled": True, "applied": False, "stub": True, "path": out}
+def _pack_from_subject(subject: RefPackContract | KeyframeContract | Mapping[str, Any]) -> RefPackContract:
+    if isinstance(subject, RefPackContract):
+        return subject
+    if isinstance(subject, Mapping) and (
+        "references" in subject or "images" in subject or "ref_images" in subject
+    ):
+        return RefPackContract.from_dict(subject)
+    from anime_factory.contracts import ref_pack_from_keyframe
+
+    kf = subject if isinstance(subject, KeyframeContract) else KeyframeContract.from_dict(subject)  # type: ignore[arg-type]
+    return ref_pack_from_keyframe(kf)
 
 
 def gated_video_generate(
-    keyframe: KeyframeContract | Mapping[str, Any],
+    subject: RefPackContract | KeyframeContract | Mapping[str, Any],
     request: VideoGenerateRequest,
     *,
     backend: VideoGenerateBackend | None = None,
     env: Mapping[str, str] | None = None,
 ) -> VideoGenerateResult:
-    """QC gate then video_backend.generate(). FAIL never reaches GPU video."""
-    assert_keyframe_allows_video(keyframe)
+    """QC-passed ref pack, then video_backend.generate()."""
+    pack = assert_ref_pack_allows_video(_pack_from_subject(subject))
+    request.references = list(pack.references)
+    request.ref_images = [img.path for img in pack.references]
+    request.meta["references"] = [img.to_dict() for img in pack.references]
+    request.meta["ref_images"] = list(request.ref_images)
     impl = backend or get_video_generate_backend(env=env)
-    if impl.name == "hunyuan15":
-        request.keyframe_final = _assert_keyframe_final_only(
-            request.keyframe_final
-            or (keyframe.final_path if isinstance(keyframe, KeyframeContract) else "")
-            or KEYFRAME_FINAL_NAME
-        )
     return impl.generate(request)
 
 
 _BACKENDS: dict[str, type[VideoGenerateBackend]] = {
-    "h3": H3VideoGenerateBackend,
-    "longlive": LongliveVideoGenerateBackend,
-    "hunyuan15": Hunyuan15VideoGenerateBackend,
+    "skyreels_v3_r2v": SkyReelsV3R2VBackend,
 }
 
 
@@ -204,9 +212,26 @@ def video_contract_from_result(
     shot_id: str,
     keyframe_final: str,
     result: VideoGenerateResult,
+    *,
+    ref_images: list[str] | None = None,
+    request: VideoGenerateRequest | None = None,
 ) -> VideoContract:
+    refs = list(ref_images or result.meta.get("references") or result.meta.get("ref_images") or [])
+    seed = request.seed if request is not None else result.meta.get("seed")
+    try:
+        seed_i = int(seed) if seed is not None and str(seed).strip() != "" else None
+    except (TypeError, ValueError):
+        seed_i = None
+    duration = float(request.duration if request is not None else result.meta.get("duration") or result.meta.get("duration_s") or 5)
     return VideoContract(
         shot_id=shot_id,
+        prompt=request.prompt if request is not None else str(result.meta.get("prompt") or ""),
+        camera=request.camera if request is not None else str(result.meta.get("camera") or ""),
+        motion=request.motion if request is not None else str(result.meta.get("motion") or ""),
+        duration=duration,
+        resolution=request.resolution if request is not None else str(result.meta.get("resolution") or "720P"),
+        seed=seed_i,
+        references=[str(x) for x in refs],
         keyframe_final=keyframe_final,
         path=result.path,
         status=result.status if result.status in {"blocked", "pending", "generating", "ready", "failed"} else "pending",  # type: ignore[arg-type]

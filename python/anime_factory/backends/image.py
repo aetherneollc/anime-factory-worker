@@ -1,4 +1,4 @@
-"""Image backends: HunyuanImage-2.1 (primary T2I) and Kolors (legacy / fallback)."""
+"""Production image backend: FLUX.2 Klein 4B only."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
-IMAGE_BACKENDS = ("hunyuan21", "kolors")
-DEFAULT_IMAGE_BACKEND = "hunyuan21"
+IMAGE_BACKENDS = ("flux2_klein4b",)
+DEFAULT_IMAGE_BACKEND = "flux2_klein4b"
 
 
 class ImageBackendError(ValueError):
@@ -19,10 +19,9 @@ class ImageBackendError(ValueError):
 class ImageGenerateRequest:
     prompt: str
     negative_prompt: str = ""
-    width: int = 1344
-    height: int = 768
+    width: int = 1280
+    height: int = 720
     seed: int | None = None
-    # Tier-A identity lives in the prompt; refs are for Control (B/C), not multi-ref T2I.
     meta: dict[str, Any] = field(default_factory=dict)
 
 
@@ -43,27 +42,24 @@ class ImageBackend(ABC):
 
 
 def select_image_backend(env: Mapping[str, str] | None = None) -> str:
-    """IMAGE_BACKEND wins; else STILL_BACKEND=kolors → kolors; else hunyuan21."""
+    """Production T2I is Klein. ``STILL_BACKEND=kolors`` does not override it."""
     mapping = env if env is not None else os.environ
     raw = str(mapping.get("IMAGE_BACKEND") or "").strip().lower()
     if not raw:
-        still = str(mapping.get("STILL_BACKEND") or "").strip().lower()
-        if still == "kolors":
-            return "kolors"
         return DEFAULT_IMAGE_BACKEND
     if raw not in IMAGE_BACKENDS:
         raise ImageBackendError(f"IMAGE_BACKEND must be one of {IMAGE_BACKENDS}, got {raw!r}")
     return raw
 
 
-class Hunyuan21ImageBackend(ImageBackend):
-    """HunyuanImage-2.1 T2I. Real GPU path via hunyuan21 module; stub when dry."""
+class Flux2KleinImageBackend(ImageBackend):
+    """FLUX.2 Klein 4B T2I. Dry-run when FLUX2_KLEIN_DRY_RUN=1."""
 
-    name = "hunyuan21"
+    name = "flux2_klein4b"
 
     def __init__(self, *, dry_run: bool | None = None) -> None:
         if dry_run is None:
-            dry_run = str(os.environ.get("HUNYUAN21_DRY_RUN") or "").strip().lower() in {
+            dry_run = str(os.environ.get("FLUX2_KLEIN_DRY_RUN") or "").strip().lower() in {
                 "1",
                 "true",
                 "yes",
@@ -71,13 +67,12 @@ class Hunyuan21ImageBackend(ImageBackend):
         self.dry_run = dry_run
 
     def generate(self, request: ImageGenerateRequest) -> ImageGenerateResult:
-        from anime_factory.hunyuan21 import generate_hunyuan21_t2i
+        from anime_factory.flux2_klein import generate_klein_t2i
 
-        png = generate_hunyuan21_t2i(
-            prompt=request.prompt,
-            negative_prompt=request.negative_prompt,
-            width=request.width,
-            height=request.height,
+        png = generate_klein_t2i(
+            request.prompt,
+            request.width,
+            request.height,
             seed=request.seed,
             dry_run=self.dry_run,
         )
@@ -89,25 +84,8 @@ class Hunyuan21ImageBackend(ImageBackend):
         )
 
 
-class KolorsImageBackend(ImageBackend):
-    """Kolors T2I adapter stub for the pluggable IMAGE_BACKEND slot.
-
-    Production Kolors stills remain on the Comfy / STILL_BACKEND path; this
-    backend exists so IMAGE_BACKEND=kolors resolves without rewriting Docker.
-    """
-
-    name = "kolors"
-
-    def generate(self, request: ImageGenerateRequest) -> ImageGenerateResult:
-        raise ImageBackendError(
-            "KolorsImageBackend is a selection stub; use STILL_BACKEND=kolors "
-            "Comfy path or set IMAGE_BACKEND=hunyuan21 for Phase-A T2I"
-        )
-
-
 _BACKENDS: dict[str, type[ImageBackend]] = {
-    "hunyuan21": Hunyuan21ImageBackend,
-    "kolors": KolorsImageBackend,
+    "flux2_klein4b": Flux2KleinImageBackend,
 }
 
 
@@ -115,4 +93,9 @@ def get_image_backend(name: str | None = None, *, env: Mapping[str, str] | None 
     chosen = (name or select_image_backend(env=env)).strip().lower()
     if chosen not in _BACKENDS:
         raise ImageBackendError(f"IMAGE_BACKEND must be one of {IMAGE_BACKENDS}, got {chosen!r}")
+    if chosen == "flux2_klein4b":
+        dry: bool | None = None
+        if env is not None and "FLUX2_KLEIN_DRY_RUN" in env:
+            dry = str(env.get("FLUX2_KLEIN_DRY_RUN") or "").strip().lower() in {"1", "true", "yes"}
+        return Flux2KleinImageBackend(dry_run=dry)
     return _BACKENDS[chosen]()

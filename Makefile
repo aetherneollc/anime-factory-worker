@@ -16,3 +16,4 @@ docker-check:
 	docker buildx build --check --file deploy/gpu-worker/Dockerfile.kv-dequant --progress=plain .
 	docker buildx build --check --file deploy/gpu-worker/Dockerfile --build-arg MOSS_IMAGE=$(MOSS_CHECK_IMAGE) --progress=plain .
 	docker buildx build --check --file deploy/gpu-worker/Dockerfile.longlive --build-arg MOSS_IMAGE=$(MOSS_CHECK_IMAGE) --build-arg KV_DEQUANT_IMAGE=$(KV_DEQUANT_CHECK_IMAGE) --progress=plain .
+	docker buildx build --check --file deploy/gpu-worker/Dockerfile.sr3 --progress=plain .
