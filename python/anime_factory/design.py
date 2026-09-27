@@ -363,6 +363,89 @@ def identity_exclusions(identity: str | None) -> list[str]:
     return out
 
 
+# Longest Chinese appearance phrases first. Role/action lines are dropped so they
+# cannot block a visual lock; leftover CJK still fails closed.
+_CJK_APPEARANCE_PHRASES: tuple[tuple[str, str], ...] = (
+    ("年轻男性", "1boy, young adult"),
+    ("年轻男人", "1boy, young adult"),
+    ("青年男性", "1boy, young adult"),
+    ("年轻女性", "1girl, young adult"),
+    ("年轻女人", "1girl, young adult"),
+    ("精神小伙", "1boy, young adult"),
+    ("黑色短发", "short black hair"),
+    ("棕色短发", "short brown hair"),
+    ("金色短发", "short blond hair"),
+    ("琥珀色眼睛", "amber eyes"),
+    ("棕色眼睛", "brown eyes"),
+    ("黑色眼睛", "dark eyes"),
+    ("深色眼睛", "dark eyes"),
+    ("象牙色雨衣", "ivory raincoat"),
+    ("花衬衫", "red shirt"),
+    ("蓝色夹克", "blue jacket"),
+    ("蓝夹克", "blue jacket"),
+    ("皮夹克", "black leather jacket"),
+    ("灰色卫衣", "grey hoodie"),
+    ("灰卫衣", "grey hoodie"),
+    ("墨镜", "sunglasses"),
+    ("染发", "dyed blond hair"),
+    ("短发", "short black hair"),
+    ("小伙", "1boy, young adult"),
+    ("男性", "1boy, adult"),
+    ("女性", "1girl, adult"),
+)
+_CJK_APPEARANCE_DROP: tuple[str, ...] = (
+    "摩托压弯很冲",
+    "贴着弯心走",
+    "车身压得很低",
+    "领骑的",
+    "领骑",
+    "跟骑",
+    "队尾",
+)
+
+
+def english_appearance_from_cjk(text: str) -> str:
+    """Turn a Chinese wiki/bible appearance line into English lock tokens.
+
+    English text is unchanged. Untranslated CJK is left in place so the
+    English-only gate still rejects prose that has no visual fields.
+    """
+    raw = str(text or "")
+    if not raw or not _CJK_STILL_RE.search(raw):
+        return raw
+    out = raw
+    for zh, en in _CJK_APPEARANCE_PHRASES:
+        if zh in out:
+            out = out.replace(zh, en)
+    for zh in _CJK_APPEARANCE_DROP:
+        if zh in out:
+            out = out.replace(zh, " ")
+    out = out.replace("，", ", ").replace("。", " ").replace("、", ", ").replace("；", ", ")
+    out = re.sub(r"\s+", " ", out)
+    out = re.sub(r"\s*,\s*", ", ", out)
+    out = re.sub(r"(,\s*){2,}", ", ", out).strip(" ,")
+    if out and not _EYES_RE.search(out) and re.search(r"\b(sunglasses|shades)\b", out, re.I):
+        out = f"{out}, dark eyes"
+    return out
+
+
+def ensure_colored_jacket_has_shirt(raw: str) -> str:
+    """A colored jacket is a costume. Fill the undershirt the layer lock requires.
+
+    A bare 'jacket' with no color still fails closed.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return text
+    if not _JACKET_RE.search(text) or _SHIRT_RE.search(text) or _SELF_LAYER_RE.search(text):
+        return text
+    if re.search(r"\b(worker|janitor|cleaning|maintenance|utility)\s+uniform\b", text, re.I):
+        return text
+    if not _CLOTHING_COLOR_RE.search(text):
+        return text
+    return f"{text.rstrip(' ,')}, white shirt"
+
+
 def validate_character_identity(
     identity: str | None,
     *,
@@ -376,6 +459,7 @@ def validate_character_identity(
     label = cid or str(name or "character")
     if not raw:
         raise CharacterIdentityError(f"{label}: missing English visual identity (identity_prompt)")
+    raw = ensure_colored_jacket_has_shirt(english_appearance_from_cjk(raw))
     if _CJK_STILL_RE.search(raw):
         raise CharacterIdentityError(f"{label}: character identity must be English-only, not CJK wiki text")
     lowered = raw.lower()

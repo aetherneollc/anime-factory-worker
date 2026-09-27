@@ -224,7 +224,7 @@ def test_extract_wiki_identity_strips_chinese_labels_from_r2_example():
     assert "navy scarf" in validated.lower()
 
 
-def test_extract_wiki_identity_rejects_cjk_identity_value():
+def test_extract_wiki_identity_translates_cjk_identity_value():
     wiki = """# 周野
 
 - **编号**：`zhou_ye`
@@ -232,8 +232,11 @@ def test_extract_wiki_identity_rejects_cjk_identity_value():
 """
     extracted = _extract_wiki_identity(wiki)
     assert "年轻" in extracted
-    with pytest.raises(CharacterIdentityError, match="English-only"):
-        validate_character_identity(extracted, character_id="zhou_ye", name="周野")
+    validated = validate_character_identity(extracted, character_id="zhou_ye", name="周野")
+    assert "short black hair" in validated
+    assert "amber eyes" in validated
+    assert "ivory raincoat" in validated
+    assert not any("\u4e00" <= ch <= "\u9fff" for ch in validated)
 
 
 def test_seed_cast_from_story_root_accepts_chinese_wiki_labels(tmp_path):
@@ -262,7 +265,7 @@ def test_seed_cast_from_story_root_accepts_chinese_wiki_labels(tmp_path):
     assert row["identity_prompt"].startswith("1girl")
 
 
-def test_seed_cast_from_story_root_rejects_cjk_wiki_identity(tmp_path):
+def test_seed_cast_from_story_root_translates_cjk_wiki_identity(tmp_path):
     from anime_factory.db import migrate, open_db
 
     wiki_dir = tmp_path / "canon" / "wiki" / "characters"
@@ -278,9 +281,80 @@ def test_seed_cast_from_story_root_rejects_cjk_wiki_identity(tmp_path):
     conn = open_db(tmp_path / "story.sqlite")
     migrate(conn)
     result = seed_cast_from_story_root(conn, tmp_path)
-    assert result["characters"] == 0
-    row = conn.execute("SELECT id FROM characters WHERE id = ?", ("zhou_ye",)).fetchone()
-    assert row is None
+    assert result["characters"] == 1
+    row = conn.execute(
+        "SELECT id, identity_prompt FROM characters WHERE id = ?",
+        ("zhou_ye",),
+    ).fetchone()
+    assert row is not None
+    assert "short black hair" in row["identity_prompt"]
+    assert "ivory raincoat" in row["identity_prompt"]
+    assert not any("\u4e00" <= ch <= "\u9fff" for ch in row["identity_prompt"])
+
+
+def test_seed_cast_unlocks_c2_when_wiki_is_chinese_and_script_has_blue_jacket(tmp_path):
+    """骊山压弯 c2: Chinese wiki, camera first-frame, English cast jacket without a shirt."""
+    import json
+
+    from anime_factory.db import migrate, open_db
+
+    wiki_dir = tmp_path / "canon" / "wiki" / "characters"
+    wiki_dir.mkdir(parents=True)
+    wiki_dir.joinpath("c2.md").write_text(
+        """# 小磊
+
+- **编号**：`c2`
+- **身份**：跟骑，染发，贴着弯心走
+""",
+        encoding="utf-8",
+    )
+    ep = tmp_path / "episodes" / "EP001"
+    ep.mkdir(parents=True)
+    (ep / "board.json").write_text(
+        json.dumps(
+            {
+                "shots": [
+                    {
+                        "id": "s002",
+                        "character_id": "c2",
+                        "first_frame_prompt": "MS, Low Angle, @c2 rides behind @c1 on @loc_shan_road",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (ep / "script.json").write_text(
+        json.dumps(
+            {
+                "cast": [
+                    {
+                        "id": "c2",
+                        "name": "小磊",
+                        "gender": "male",
+                        "identity_prompt": "1boy, young adult, bleached blond hair, dark eyes, blue jacket, slim build",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    conn = open_db(tmp_path / "story.sqlite")
+    migrate(conn)
+    result = seed_cast_from_story_root(conn, tmp_path)
+    assert result["characters"] == 1
+    row = conn.execute(
+        "SELECT id, name, identity_prompt FROM characters WHERE id = ?",
+        ("c2",),
+    ).fetchone()
+    assert row is not None
+    assert row["name"] == "小磊"
+    prompt = row["identity_prompt"]
+    assert "blue jacket" in prompt
+    assert "white shirt" in prompt
+    assert "bleached blond hair" in prompt
+    assert "Low Angle" not in prompt
+    assert not any("\u4e00" <= ch <= "\u9fff" for ch in prompt)
 
 
 def test_seed_cast_from_story_root_plain_english_wiki_fallback(tmp_path):
@@ -320,11 +394,21 @@ def test_validate_character_identity_requires_color_and_layer_tokens():
             "1boy, adult, short black hair, brown eyes, jacket, lean build",
             character_id="hero",
         )
-    with pytest.raises(CharacterIdentityError, match="jacket/shirt layer"):
-        validate_character_identity(
-            "1boy, adult, short black hair, brown eyes, navy jacket, lean build",
-            character_id="hero",
-        )
+    jacket = validate_character_identity(
+        "1boy, adult, short black hair, brown eyes, navy jacket, lean build",
+        character_id="hero",
+    )
+    assert "navy jacket" in jacket
+    assert "white shirt" in jacket
+    rider = validate_character_identity(
+        "1boy, young adult, bleached blond hair, dark eyes, blue jacket, slim build",
+        character_id="c2",
+        name="小磊",
+        gender="male",
+    )
+    assert "blue jacket" in rider
+    assert "white shirt" in rider
+    assert "bleached blond hair" in rider
     hoodie = validate_character_identity(
         "1girl, young adult, short black hair, brown eyes, grey hoodie, lean build",
         character_id="ke",
