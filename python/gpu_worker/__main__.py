@@ -43,6 +43,31 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def ensure_r2_client() -> None:
+    """sr3 images omitted boto3, so R2 pull returned nothing and preprod ran again."""
+    if not (os.environ.get("R2_ACCESS_KEY_ID") and os.environ.get("R2_SECRET_ACCESS_KEY")):
+        return
+    try:
+        import boto3  # noqa: F401
+    except ImportError:
+        import subprocess
+
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--no-cache-dir", "boto3==1.35.81"]
+        )
+
+
+def production_without_comfy() -> bool:
+    """SkyReels sr3 image sets AF_START_COMFY=0. It still has to dial the tunnel and poll work."""
+    backend = (
+        os.environ.get("AF_VIDEO_BACKEND")
+        or os.environ.get("VIDEO_BACKEND")
+        or ""
+    ).strip().lower()
+    capability = (os.environ.get("AF_IMAGE_CAPABILITY") or "").strip().lower()
+    return backend == "skyreels_v3_r2v" or capability == "skyreels_v3_r2v"
+
+
 def _post_json(url: str, payload: dict) -> dict:
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
@@ -126,6 +151,9 @@ class _HeartbeatLoop:
         self.thread = threading.Thread(target=self._run, name="gpu-heartbeat", daemon=True)
 
     def _notify(self) -> None:
+        from gpu_worker.stack import probe_tunnel_status
+
+        self.tunnel = probe_tunnel_status()
         events = maybe_notify_control_plane(
             self.instance_id,
             self.runtime.status,
@@ -228,6 +256,7 @@ def _install_sigbus_guard(instance_id: str) -> None:
 
 
 def main() -> int:
+    ensure_r2_client()
     lease_started = time.monotonic()
     instance_id = _instance_id()
     _install_sigbus_guard(instance_id)
@@ -560,6 +589,18 @@ def main() -> int:
         heartbeat.tunnel = tunnel
         runtime.set_handshake(stack_info.get("handshake"))
         runtime.complete_startup(bool(stack_info.get("router_ready")))
+    elif production_without_comfy():
+        from gpu_worker.stack import start_tunnel, verify_tunnel_connection
+
+        # Do not mark_idle here. adopt_batch already marked the card busy, and an
+        # immediate idle is what self-destroyed sr3 leases after ~15 minutes.
+        runtime.record_startup_stage("start_tunnel")
+        token_set = bool((os.environ.get("CLOUDFLARE_TUNNEL_TOKEN") or "").strip())
+        start_tunnel()
+        tunnel = verify_tunnel_connection(timeout_s=None if token_set else 0)
+        heartbeat.tunnel = tunnel
+        if not runtime.batch_id:
+            runtime.mark_idle()
     else:
         runtime.mark_idle()
 
@@ -618,12 +659,14 @@ def main() -> int:
     idle_comfy = ComfyRouter() if start_comfy_enabled and not stack_info.get("comfy_skipped_longlive") else None
     control = maybe_pm_control()
     once = _env_bool("AF_ONCE", False)
-    can_run = start_comfy_enabled and not stack_failed
+    can_run = (start_comfy_enabled or production_without_comfy()) and not stack_failed
     wanted_story = (os.environ.get("AF_STORY_ID") or "").strip()
     processed_legacy: set[tuple[str, str]] = set()
     pending_reports: dict[str, Any] | None = None
     pending_destroy: dict[str, Any] | None = None
-    last_queue_depth = 0
+    # Until the first successful /gpu/work, keep the sr3 card from idle-destroy.
+    # The old loop never polled, so last_queue_depth stayed 0 and idle_ttl fired.
+    last_queue_depth = 1 if production_without_comfy() else 0
     recycle_error = recycle_failure_class(runtime.last_error)
     destroy_blocked = stack_failed and (
         str(runtime.last_error or "").startswith("install_failure") and not recycle_error

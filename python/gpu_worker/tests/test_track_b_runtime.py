@@ -107,7 +107,53 @@ def test_worker_once_without_comfy_remains_a_safe_dry_run(monkeypatch):
     monkeypatch.setenv("VAST_DRY_RUN", "1")
     monkeypatch.delenv("CONTROL_PLANE_URL", raising=False)
     monkeypatch.delenv("AF_STORY_ID", raising=False)
+    monkeypatch.delenv("VIDEO_BACKEND", raising=False)
+    monkeypatch.delenv("AF_VIDEO_BACKEND", raising=False)
+    monkeypatch.delenv("AF_IMAGE_CAPABILITY", raising=False)
     assert worker_main.main() == 0
+
+
+def test_sr3_without_comfy_starts_tunnel_and_polls_work(monkeypatch):
+    monkeypatch.setenv("AF_ONCE", "1")
+    monkeypatch.setenv("AF_START_COMFY", "0")
+    monkeypatch.setenv("VAST_DRY_RUN", "1")
+    monkeypatch.setenv("VIDEO_BACKEND", "skyreels_v3_r2v")
+    monkeypatch.setenv("AF_IMAGE_CAPABILITY", "skyreels_v3_r2v")
+    monkeypatch.setenv("CONTROL_PLANE_URL", "https://control.example")
+    monkeypatch.setenv("CLOUDFLARE_TUNNEL_TOKEN", "token")
+    monkeypatch.delenv("AF_STORY_ID", raising=False)
+    started = []
+    fetched = []
+
+    monkeypatch.setattr(stack, "start_tunnel", lambda: started.append("start") or None)
+    monkeypatch.setattr(
+        stack,
+        "verify_tunnel_connection",
+        lambda **_k: {"connected": True, "hostname": "gpu.example", "checked_at": "2026-09-27T00:00:00Z"},
+    )
+    monkeypatch.setattr(stack, "probe_tunnel_status", lambda: {"connected": True, "hostname": "gpu.example"})
+    monkeypatch.setattr(stack, "current_tunnel_status", lambda: {"connected": False, "hostname": ""})
+
+    def fetch(_base, _instance):
+        fetched.append(_instance)
+        return {"ok": True, "batch": None, "jobs": [], "workers": []}
+
+    monkeypatch.setattr(poll, "fetch_work", fetch)
+    monkeypatch.setattr(worker_main, "maybe_notify_control_plane", lambda *_a, **_k: [])
+    assert worker_main.main() == 0
+    assert started == ["start"]
+    # Startup fetch plus the work loop. AF_START_COMFY=0 used to skip the loop.
+    assert len(fetched) >= 2
+
+
+def test_start_tunnel_does_not_spawn_twice(monkeypatch):
+    monkeypatch.setenv("CLOUDFLARE_TUNNEL_TOKEN", "token")
+    monkeypatch.setattr(stack, "_tunnel_metrics_connected", lambda: False)
+    monkeypatch.setattr(stack, "_cloudflared_running", lambda: True)
+    spawned = []
+    monkeypatch.setattr(stack, "_popen", lambda *_a, **_k: spawned.append(1))
+    assert stack.start_tunnel() is None
+    assert spawned == []
 
 
 def test_classified_comfy_startup_failure_destroys_without_waiting_for_probe(monkeypatch):

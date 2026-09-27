@@ -1190,6 +1190,34 @@ def verify_tunnel_connection(timeout_s: float | None = None, interval_s: float =
         time.sleep(min(interval_s, remaining))
 
 
+def _cloudflared_running() -> bool:
+    """True when a cloudflared binary is already running, not when a script mentions it."""
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return False
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            argv0 = (entry / "cmdline").read_bytes().split(b"\0", 1)[0]
+        except OSError:
+            continue
+        if not argv0:
+            continue
+        name = Path(argv0.decode("utf-8", "replace")).name
+        if name == "cloudflared":
+            return True
+    return False
+
+
+def probe_tunnel_status() -> dict:
+    """Re-read cloudflared /ready. Heartbeats must not keep the boot-time snapshot."""
+    configured = bool((os.environ.get("CLOUDFLARE_TUNNEL_TOKEN") or "").strip())
+    if not configured:
+        return _set_tunnel_status(False, configured=False)
+    return _set_tunnel_status(_tunnel_metrics_connected(), configured=True)
+
+
 def start_tunnel() -> subprocess.Popen | None:
     token = (os.environ.get("CLOUDFLARE_TUNNEL_TOKEN") or "").strip()
     if not token:
@@ -1199,6 +1227,10 @@ def start_tunnel() -> subprocess.Popen | None:
     if _tunnel_metrics_connected():
         _set_tunnel_status(True, configured=True)
         print(json.dumps({"tunnel": "already_up"}), flush=True)
+        return None
+    if _cloudflared_running():
+        _set_tunnel_status(False, configured=True)
+        print(json.dumps({"tunnel": "process_starting"}), flush=True)
         return None
     cf = shutil.which("cloudflared") or "/usr/local/bin/cloudflared"
     if not Path(cf).is_file() and not shutil.which("cloudflared"):

@@ -21,4 +21,19 @@ export SKYREELS_LOW_VRAM="${SKYREELS_LOW_VRAM:-1}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export HF_HUB_DISABLE_XET=1
 mkdir -p "${AF_WORK_DIR:-/work}" "${AF_WEIGHTS_DIR:-/workspace/weights}" "${HF_HOME:-/workspace/huggingface}"
+
+# Comfy boot used to be the only caller of start_tunnel(). This image forces
+# AF_START_COMFY=0, so cloudflared must be launched here or the control plane
+# records tunnel_connected=0 for the whole lease.
+if [ -n "${CLOUDFLARE_TUNNEL_TOKEN:-}" ]; then
+  cf=""
+  if [ -x /usr/local/bin/cloudflared ]; then
+    cf=/usr/local/bin/cloudflared
+  elif command -v cloudflared >/dev/null 2>&1; then
+    cf=$(command -v cloudflared)
+  fi
+  if [ -n "$cf" ]; then
+    "$cf" tunnel --no-autoupdate --metrics 127.0.0.1:49312 run --token "$CLOUDFLARE_TUNNEL_TOKEN" >>/tmp/cloudflared.log 2>&1 &
+  fi
+fi
 exec python -m gpu_worker

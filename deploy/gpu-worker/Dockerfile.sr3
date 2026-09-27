@@ -104,6 +104,7 @@ RUN /opt/venv/bin/python -m pip install --no-cache-dir \
         "moviepy==2.2.1" \
         "librosa" \
         "pyloudnorm" \
+        "boto3==1.35.81" \
     && /opt/venv/bin/python -c "import torch; from diffusers import Flux2KleinPipeline; assert torch.__version__.startswith('2.10'), torch.__version__; print('flux2 klein pipeline', Flux2KleinPipeline.__name__)" \
     && rm -rf /root/.cache/pip
 
