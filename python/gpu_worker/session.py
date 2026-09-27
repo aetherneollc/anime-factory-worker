@@ -1315,6 +1315,113 @@ def _upload_story_media(
     return failed
 
 
+_CHAR_GATE_SUFFIXES = ("_turnaround", "_sheet", "_side", "_back")
+
+
+def _character_id_from_gate(asset_id: str) -> str | None:
+    text = str(asset_id or "").strip()
+    if not text.startswith("char_"):
+        return None
+    body = text[len("char_") :]
+    for suffix in _CHAR_GATE_SUFFIXES:
+        if body.endswith(suffix) and len(body) > len(suffix):
+            return body[: -len(suffix)]
+    return None
+
+
+def _promote_unattended_character_sheets(root: Path) -> list[str]:
+    """Lock every on-disk front sheet and register master.png for SkyReels."""
+    from anime_factory.contracts import MASTER_FILENAME
+    from anime_factory.design import accept_unattended_character_front, gpu_stills_unattended
+    from anime_factory.design import _character_front_file
+    from anime_factory.stills_phase import register_character_master
+
+    if not gpu_stills_unattended():
+        return []
+    folder = Path(root) / "assets" / "characters"
+    if not folder.is_dir():
+        return []
+    published: list[str] = []
+    for child in sorted(folder.iterdir()):
+        if not child.is_dir():
+            continue
+        cid = child.name
+        src = _character_front_file(root, cid)
+        if src is None:
+            continue
+        accept_unattended_character_front(root, cid, src)
+        dest = child / MASTER_FILENAME
+        if not dest.is_file() or dest.stat().st_size < 4096:
+            shutil.copy2(src, dest)
+        rel = f"assets/characters/{cid}/{MASTER_FILENAME}"
+        register_character_master(root, cid, rel, qc_status="pass")
+        published.append(rel)
+    return published
+
+
+def _blocking_human_gate(root: Path, needs_human: list[str]) -> list[str]:
+    """Drop character-sheet gates when an unattended GPU front master already exists."""
+    from anime_factory.design import _character_front_file, gpu_stills_unattended
+
+    if not gpu_stills_unattended():
+        return list(needs_human)
+    blocking: list[str] = []
+    for asset_id in needs_human:
+        cid = _character_id_from_gate(asset_id)
+        if cid and _character_front_file(root, cid):
+            continue
+        blocking.append(asset_id)
+    return blocking
+
+
+def _seed_skyreels_keyframes_from_sheets(root: Path, shot: dict) -> None:
+    """SkyReels R2V does not eat a first frame. Reuse the locked sheet so keyframe mint does not delay anim."""
+    from anime_factory.design import _character_front_file, still_file_ok
+
+    cid = str(shot.get("character_id") or "").strip()
+    sid = str(shot.get("id") or "").strip()
+    if not cid or not sid:
+        return
+    src = _character_front_file(root, cid)
+    if src is None:
+        return
+    for name in ("f1.png", "f01.png"):
+        dest = root / "episodes" / EP / "keyframes" / sid / name
+        if still_file_ok(dest):
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+
+
+def _absolute_story_refs(root: Path, references: list[Any]) -> list[Any]:
+    """SkyReels opens --ref_imgs as files. Registry paths are story-relative."""
+    from anime_factory.contracts import ReferenceAsset
+
+    resolved: list[Any] = []
+    for item in references:
+        path = str(getattr(item, "path", "") or "")
+        role = str(getattr(item, "role", "") or "character")
+        qc_status = str(getattr(item, "qc_status", "") or "pass")
+        asset_id = str(getattr(item, "asset_id", "") or "")
+        file_path = Path(path)
+        if not file_path.is_file():
+            candidate = Path(root) / path
+            if candidate.is_file():
+                file_path = candidate.resolve()
+            else:
+                resolved.append(item)
+                continue
+        resolved.append(
+            ReferenceAsset(
+                path=str(file_path),
+                role=role,  # type: ignore[arg-type]
+                qc_status=qc_status,  # type: ignore[arg-type]
+                asset_id=asset_id,
+            )
+        )
+    return resolved
+
+
 def generate_missing_stills(
     story_id: str,
     root: Path,
@@ -1335,16 +1442,23 @@ def generate_missing_stills(
 
     _pull_studio_asset_index(story_id, root)
     lib = library_from_db(conn, story_id, client, root, skip_existing=True)
-    if lib.get("needs_human"):
-        failed_puts = _upload_story_media(story_id, root, progress)
-        upload_error = (
-            f"; r2_upload_failed:{','.join(failed_puts[:8])}"
-            if failed_puts
-            else ""
-        )
-        raise RuntimeError(
-            f"design visual QC needs_human: {lib['needs_human']}; refusing H3{upload_error}"
-        )
+    needs_human = [str(item) for item in (lib.get("needs_human") or []) if str(item).strip()]
+    if needs_human:
+        _promote_unattended_character_sheets(root)
+        blocking = _blocking_human_gate(root, needs_human)
+        if blocking:
+            failed_puts = _upload_story_media(story_id, root, progress)
+            upload_error = (
+                f"; r2_upload_failed:{','.join(failed_puts[:8])}"
+                if failed_puts
+                else ""
+            )
+            raise RuntimeError(
+                f"design visual QC needs_human: {blocking}; refusing H3{upload_error}"
+            )
+        lib["needs_human"] = []
+    else:
+        _promote_unattended_character_sheets(root)
     created.extend(lib.get("created") or [])
     assets_index = {"items": [{"id": k, **v} for k, v in (lib.get("specs") or {}).items()]}
     geo = export_geo(conn, story_id, invented=True, sources=[])
@@ -1402,9 +1516,16 @@ def generate_missing_stills(
             "UPDATE shots SET refs_json = ?, h3_mode = ? WHERE id = ?",
             (refs_json, mode, sid),
         )
+    video_backend = ""
+    try:
+        video_backend = select_video_backend(root=root)
+    except Exception:  # noqa: BLE001 — env lock is enough for the still-seed decision
+        video_backend = str(os.environ.get("VIDEO_BACKEND") or os.environ.get("AF_VIDEO_BACKEND") or "")
     for shot in shots:
         if not is_chain_head(shot):
             continue
+        if video_backend == "skyreels_v3_r2v":
+            _seed_skyreels_keyframes_from_sheets(root, shot)
         if needs_first_frame_still(shot):
             from anime_factory.keyframe import keyframe_file_ok
 
@@ -2892,6 +3013,7 @@ def _submit_skyreels(
         references, qc_status = _stable_skyreels_references(root)
     else:
         qc_status = "pass" if references else "fail"
+    references = _absolute_story_refs(root, list(references))
     pack = RefPackContract(
         shot_id=sid,
         references=list(references),

@@ -59,6 +59,41 @@ def test_lock_after_qc_requires_pass(tmp_path):
     assert has_locked_identity(root, "hero")
 
 
+def test_gpu_stills_lock_existing_front_instead_of_needs_human(tmp_path, monkeypatch):
+    """Unattended GPU sheets already on disk are the master. They must not wait on a person."""
+    monkeypatch.setattr("anime_factory.design.require_clip_for_client", lambda _client: False)
+    conn = open_db(tmp_path / "s.sqlite")
+    migrate(conn)
+    _front(tmp_path / "assets" / "characters" / "hero" / FRONT_ALIAS_FILENAME, "hero-front")
+    client = KolorsClient(["k"], opener=sized_placeholder_opener("fail"), live=False)
+    monkeypatch.setenv("ANIME_FACTORY_GPU_STILLS", "1")
+    chars, locs, props, interiors = harbor_mvp_cast()
+    out = generate_asset_library(
+        conn,
+        "story-x",
+        chars,
+        locs,
+        props,
+        client,
+        None,
+        "fiction",
+        tmp_path,
+        interiors=interiors,
+        skip_existing=False,
+        clip_scorer=dish_scorer(),
+    )
+    blocked = list(out.get("needs_human") or [])
+    assert "char_hero_sheet" not in blocked
+    assert "char_hero_side" not in blocked
+    assert "char_hero_back" not in blocked
+    assert "char_hero_turnaround" not in blocked
+    assert is_qc_locked(tmp_path, character_id="hero")
+    rec = load_assets_index(tmp_path)["characters"]["hero"]
+    assert rec.get("qc_verdict") == "pass"
+    assert "unattended_gpu_still" in (rec.get("qc_reasons") or [])
+    assert not (tmp_path / "assets" / "characters" / "hero" / "sheet_side.png").is_file()
+
+
 def test_three_deterministic_seeds_then_needs_human(tmp_path):
     conn = open_db(tmp_path / "s.sqlite")
     migrate(conn)

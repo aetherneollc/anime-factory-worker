@@ -1387,6 +1387,77 @@ def _history_stem(spec: dict) -> str:
     return "plate_base"
 
 
+def gpu_stills_unattended() -> bool:
+    """GPU stills have no human reviewer. A usable sheet must not wait on needs_human."""
+    flag = os.environ.get("ANIME_FACTORY_GPU_STILLS", "").strip().lower()
+    return flag in {"1", "true", "yes", "on"}
+
+
+def _character_front_file(story_root: Path | str, cid: str) -> Path | None:
+    """Existing front sheet. Prefer the canonical alias, then the newest numbered candidate."""
+    folder = Path(story_root) / "assets" / "characters" / str(cid)
+    if not folder.is_dir():
+        return None
+    preferred = folder / FRONT_ALIAS_FILENAME
+    if still_file_ok(preferred):
+        return preferred
+    numbered = sorted(folder.glob("sheet_front_*.png"), key=lambda path: path.stat().st_mtime)
+    for path in reversed(numbered):
+        if still_file_ok(path):
+            return path
+    return None
+
+
+def accept_unattended_character_front(
+    story_root: Path | str,
+    cid: str,
+    src: Path | None = None,
+) -> str | None:
+    """Lock an on-disk GPU sheet as the identity so video can start.
+
+    The original QC reasons stay on the record. Verdict becomes pass because
+    this factory does not wait for a person to approve a sheet.
+    """
+    from anime_factory.visual_qc import VisualQcResult, current_lineage
+
+    root = Path(story_root)
+    path = src or _character_front_file(root, cid)
+    if path is None or not still_file_ok(path):
+        return None
+    if is_qc_locked(root, character_id=cid):
+        locked = locked_character_file(root, cid)
+        if still_file_ok(locked):
+            return locked.name
+    prior = (load_assets_index(root).get("characters") or {}).get(str(cid)) or {}
+    reasons = ["unattended_gpu_still"]
+    for reason in list(prior.get("qc_reasons") or []):
+        text = str(reason or "").strip()
+        if text and text not in reasons:
+            reasons.append(text)
+    seed = prior.get("qc_seed")
+    try:
+        seed = int(seed) if seed is not None else None
+    except (TypeError, ValueError):
+        seed = None
+    qc = VisualQcResult(
+        verdict="pass",
+        reasons=reasons,
+        scores={"unattended": 1.0},
+        scorer="unattended_gpu_still",
+        lineage=current_lineage(),
+        kind="character_sheet",
+        seed=seed,
+    )
+    lock_after_qc(
+        root,
+        character_id=str(cid),
+        filename=path.name,
+        qc=qc,
+        set_selected=True,
+    )
+    return path.name
+
+
 def _parent_ready(story_root: Path | None, spec: dict) -> bool:
     if story_root is None:
         return True
@@ -2372,6 +2443,37 @@ def generate_asset_library(
             rel = spec["path"]
             kind = str(spec.get("kind") or "")
             force = _force_regen(regen, spec)
+            if (
+                story_root is not None
+                and gpu_stills_unattended()
+                and not force
+                and kind in {"character_view_derive", "character_turnaround", "costume_derive"}
+            ):
+                parent = str(spec.get("character_id") or spec.get("parent_id") or "")
+                if parent and _character_front_file(story_root, parent):
+                    # Side/back/turnaround are optional once a front master exists.
+                    # Do not park the video job on a human gate for views we already skipped.
+                    continue
+            if (
+                story_root is not None
+                and gpu_stills_unattended()
+                and not force
+                and kind == "character_sheet"
+            ):
+                cid = str(spec.get("character_id") or "")
+                front = _character_front_file(story_root, cid) if cid else None
+                if front is not None:
+                    accept_unattended_character_front(story_root, cid, front)
+                    try:
+                        rel_locked = str(front.resolve().relative_to(Path(story_root).resolve()))
+                    except ValueError:
+                        rel_locked = rel
+                    spec["path"] = rel_locked
+                    _record_round_view(round_views, spec, rel_locked)
+                    alias = Path(story_root) / character_asset_rel(cid, FRONT_ALIAS_FILENAME)
+                    if not still_file_ok(alias):
+                        write_front_alias(front)
+                    continue
             if story_root is not None and not _parent_ready(story_root, spec) and not force:
                 parent = str(spec.get("parent_id") or spec.get("character_id") or "")
                 if kind in {"character_view_derive", "character_turnaround", "costume_derive"}:
@@ -2455,6 +2557,22 @@ def generate_asset_library(
                 and getattr(qc, "verdict", None) == "pass"
             )
             if not passed:
+                if (
+                    gpu_stills_unattended()
+                    and story_root is not None
+                    and kind == "character_sheet"
+                ):
+                    cid = str(spec.get("character_id") or "")
+                    front = _character_front_file(story_root, cid) if cid else None
+                    if front is not None:
+                        accept_unattended_character_front(story_root, cid, front)
+                        try:
+                            spec["path"] = str(front.resolve().relative_to(Path(story_root).resolve()))
+                        except ValueError:
+                            spec["path"] = rel
+                        _record_round_view(round_views, spec, spec["path"])
+                        created.append(aid)
+                        continue
                 if kind in {
                     "character_sheet",
                     "scene_plate",

@@ -435,6 +435,74 @@ def test_generate_missing_stills_still_mints_cuts_when_f1_exists(tmp_path, monke
     assert called == ["s001"]
 
 
+def test_unattended_gpu_sheets_do_not_refuse_video(tmp_path, monkeypatch):
+    """needs_human must not block SkyReels when the front masters are already on disk."""
+    import json
+
+    from anime_factory.design import CHAR_VIEW_HEIGHT, CHAR_VIEW_WIDTH, synthetic_still_png
+    from gpu_worker import session as sess
+
+    monkeypatch.setenv("ANIME_FACTORY_GPU_STILLS", "1")
+    monkeypatch.setenv("VIDEO_BACKEND", "skyreels_v3_r2v")
+    hero = tmp_path / "assets" / "characters" / "a-kai"
+    hero.mkdir(parents=True)
+    (hero / "sheet_front.png").write_bytes(
+        synthetic_still_png(CHAR_VIEW_WIDTH, CHAR_VIEW_HEIGHT, tag="a-kai", placeholder=True)
+    )
+    ep = tmp_path / "episodes" / "EP001"
+    ep.mkdir(parents=True)
+    (ep / "board.json").write_text(
+        json.dumps(
+            {
+                "segments": [
+                    {
+                        "id": "s001",
+                        "chain_index": 0,
+                        "h3_mode": "ref2va",
+                        "character_id": "a-kai",
+                        "duration": 5.0,
+                        "first_frame_prompt": "rider leans into the hairpin",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    called: list[str] = []
+    monkeypatch.setattr(sess, "EP", "EP001")
+    monkeypatch.setattr(sess, "_pull_studio_asset_index", lambda *_a, **_k: False)
+    monkeypatch.setattr(sess, "upload_tree", lambda *_a, **_k: [{"ok": True, "key": "assets/x.png"}])
+    monkeypatch.setattr(
+        "anime_factory.design.library_from_db",
+        lambda *_a, **_k: {
+            "needs_human": ["char_a-kai_sheet", "char_a-kai_side", "char_a-kai_turnaround"],
+            "created": [],
+            "specs": {},
+        },
+    )
+    monkeypatch.setattr(sess, "KolorsClient", lambda *_a, **_k: type("C", (), {"live": True})())
+    monkeypatch.setattr(
+        sess,
+        "ensure_keyframe",
+        lambda *_a, **_k: called.append(str(_a[3].get("id"))) or "ok",
+    )
+    monkeypatch.setattr(sess, "assert_keyframe_files", lambda *_a, **_k: None)
+    conn = open_db(tmp_path / "s.sqlite")
+    migrate(conn)
+    out = sess.generate_missing_stills("story-x", tmp_path, conn)
+    assert out.get("ok") is True
+    assert called == ["s001"]
+    assert (hero / "master.png").is_file()
+    assert (ep / "keyframes" / "s001" / "f1.png").is_file()
+    from anime_factory.asset_lock import is_qc_locked
+
+    assert is_qc_locked(tmp_path, character_id="a-kai")
+    registry = json.loads((tmp_path / "assets" / "registry.json").read_text(encoding="utf-8"))
+    masters = [item for item in registry.get("assets") or [] if item.get("kind") == "character"]
+    assert masters and masters[0]["master_path"].endswith("master.png")
+    assert (masters[0].get("meta") or {}).get("qc_status") == "pass"
+
+
 def test_generate_missing_stills_uploads_before_needs_human(tmp_path, monkeypatch):
     from gpu_worker import session as sess
 
