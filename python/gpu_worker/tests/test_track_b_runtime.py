@@ -1240,6 +1240,7 @@ def test_weight_byte_probe_counts_incomplete_downloads(tmp_path):
 
 
 def test_run_anim_progress_requires_qc_and_successful_r2_upload(tmp_path, monkeypatch):
+    monkeypatch.setattr(session, "lock_video_backend", lambda **_k: "h3")
     monkeypatch.setattr(
         session,
         "_board_shots",

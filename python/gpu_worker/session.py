@@ -2853,6 +2853,179 @@ def _run_anim_h3(
     }
 
 
+def _skyreels_clip_seconds(shot: dict) -> float:
+    """SkyReels V3 R2V shot unit. A few seconds, never an H3 8s grid."""
+    try:
+        raw = float(shot.get("duration") or shot.get("duration_s") or 5)
+    except (TypeError, ValueError):
+        raw = 5.0
+    if raw != raw or raw <= 0:
+        raw = 5.0
+    cap = float(max_seconds_for_backend("skyreels_v3_r2v"))
+    return max(1.0, min(raw, cap))
+
+
+def _stable_skyreels_references(root: Path) -> tuple[list[Any], str]:
+    """One character-master pack for every shot. Last frames are not references."""
+    from anime_factory.stills_phase import build_reference_pack
+
+    base = build_reference_pack(
+        {"id": "pack", "shot_id": "pack"},
+        story_root=root,
+        status="qc_pass",
+    )
+    return list(base.references), str(base.qc_status or "fail")
+
+
+def _submit_skyreels(
+    shot: dict,
+    root: Path,
+    dest: Path,
+    references: list[Any] | None = None,
+) -> Path:
+    """Generate one SkyReels clip into dest. Tests patch this; it does not rent a GPU."""
+    from anime_factory.backends.video_ext import VideoGenerateRequest, gated_video_generate
+    from anime_factory.contracts import RefPackContract
+
+    sid = str(shot.get("id") or "shot")
+    if references is None:
+        references, qc_status = _stable_skyreels_references(root)
+    else:
+        qc_status = "pass" if references else "fail"
+    pack = RefPackContract(
+        shot_id=sid,
+        references=list(references),
+        qc_status=qc_status,  # type: ignore[arg-type]
+        preview_path="",
+        meta={"source": "asset_registry", "video_backend": "skyreels_v3_r2v"},
+    )
+    seed = shot.get("seed")
+    prompt = str(shot.get("prompt") or shot.get("h3_prompt") or shot.get("visual") or "").strip()
+    req = VideoGenerateRequest(
+        shot_id=sid,
+        prompt=prompt,
+        duration=_skyreels_clip_seconds(shot),
+        seed=None if seed is None else int(seed),
+        references=list(pack.references),
+        meta={"out_path": str(dest)},
+    )
+    result = gated_video_generate(pack, req)
+    produced = Path(str(result.path or ""))
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if produced.is_file() and produced.resolve() != dest.resolve():
+        shutil.copy2(produced, dest)
+    if not dest.is_file() or dest.stat().st_size < 32:
+        raise RuntimeError(f"skyreels produced no video: {sid}")
+    return dest
+
+
+def _upload_finished_shot(
+    story_id: str,
+    dest: Path,
+    rel: str,
+    sid: str,
+    progress: ProgressCallback | None = None,
+) -> str:
+    """Store a finished shot mp4 under the story. A missing last.png must not block this."""
+    key = join_story(story_id, rel)
+    upload = put_file(key, dest, "video/mp4")
+    if not _upload_ok(upload):
+        raise RuntimeError(f"shot R2 upload failed: {sid}")
+    if progress:
+        progress(f"shot_uploaded:{sid}")
+    return key
+
+
+def _run_anim_skyreels(
+    story_id: str,
+    root: Path,
+    conn,
+    progress: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    """5s SkyReels clips. Upload each finished mp4; do not wait for an H3 last-frame."""
+    shots = _board_shots(root)
+    done: list[str] = []
+    failed: list[Any] = []
+    skipped: list[str] = []
+    references, _qc = _stable_skyreels_references(root)
+    resolution = {
+        "width": VIDEO_WIDTH,
+        "height": VIDEO_HEIGHT,
+        "delivery_width": VIDEO_WIDTH,
+        "delivery_height": VIDEO_HEIGHT,
+        "video_backend": "skyreels_v3_r2v",
+        "shot_seconds": float(max_seconds_for_backend("skyreels_v3_r2v")),
+    }
+    for index, shot in enumerate(shots):
+        sid = str(shot.get("id") or f"s{index + 1:03d}")
+        shot = dict(shot)
+        shot["id"] = sid
+        shots[index] = shot
+        try:
+            if progress and index == 0:
+                progress(f"production_started:{sid}")
+            if progress:
+                progress(f"anim:{sid}")
+            selected = select_passing_generation(conn, root, sid)
+            if selected is not None:
+                existing, _version, _how = selected
+                skipped.append(sid)
+                rel = existing.relative_to(root).as_posix()
+                mark_completed_passing(conn, sid, join_story(story_id, rel))
+                try:
+                    _upload_finished_shot(story_id, existing, rel, sid, progress)
+                except Exception:
+                    try:
+                        _upload_ok(put_file(join_story(story_id, rel), existing, "video/mp4"))
+                    except Exception:
+                        pass
+                continue
+            version, rel = next_generation_path(root, sid)
+            dest = root / rel
+            _submit_skyreels(shot, root, dest, references)
+            _upload_finished_shot(story_id, dest, rel, sid, progress)
+            try:
+                record_generation_result(
+                    conn,
+                    sid,
+                    version,
+                    join_story(story_id, rel),
+                    shot.get("seed"),
+                    "skyreels_v3_r2v",
+                    "completed",
+                    "pass",
+                )
+            except Exception:
+                pass
+            mark_completed_passing(conn, sid, join_story(story_id, rel))
+            done.append(sid)
+        except (BudgetExceeded, ProgressStalled, StartupTimeout):
+            try:
+                flush_gpu_artifacts(story_id, root, conn, progress=progress)
+            except Exception:
+                pass
+            raise
+        except Exception as exc:  # noqa: BLE001 — one shot must not drop the episode
+            failed.append({"id": sid, "error": str(exc)[:800]})
+    try:
+        _checkpoint_story(conn, story_id, root, progress=progress, upload=True)
+    except Exception:
+        pass
+    return {
+        "shots_total": len(shots),
+        "shots_done": len(done) + len(skipped),
+        "generated": done,
+        "skipped_existing": skipped,
+        "repaired": [],
+        "failed": failed,
+        "resolution": resolution,
+        "model_load_count": 1 if done else 0,
+        "video_backend": "skyreels_v3_r2v",
+        "gpu_done": not failed and (len(done) + len(skipped)) > 0,
+        "reference_count": len(references),
+    }
+
+
 def run_anim(
     story_id: str,
     root: Path,
@@ -2860,13 +3033,14 @@ def run_anim(
     router: ComfyRouter | None,
     progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
-    shots = _board_shots(root)
     try:
         backend = lock_video_backend(root=root)
     except VideoBackendLockError as exc:
         raise RuntimeError(str(exc)) from exc
     if backend == "longlive":
         return _run_anim_longlive(story_id, root, conn, progress)
+    if backend == "skyreels_v3_r2v":
+        return _run_anim_skyreels(story_id, root, conn, progress)
     return _run_anim_h3(story_id, root, conn, router, progress=progress)
 
 
@@ -3601,6 +3775,10 @@ def run_gpu_episode(
             ensure_longlive(progress=progress)
         except Exception as exc:  # noqa: BLE001 — do not retry pip -e / SIGKILL
             raise RuntimeError(f"{FAIL_CLOSED}:{exc}") from exc
+    elif backend == "skyreels_v3_r2v":
+        unload_still_models(router)
+        if progress:
+            progress("weights:skyreels")
     else:
         if progress:
             progress("weights:h3_join")
