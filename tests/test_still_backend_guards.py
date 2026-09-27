@@ -362,3 +362,28 @@ def test_a_live_run_redraws_a_dry_run_placeholder(tmp_path):
     finally:
         reset_clip_scorer(token)
     assert dest.read_bytes() == art
+
+
+def test_generate_still_uses_klein_instead_of_kolors_workflow(monkeypatch):
+    monkeypatch.setenv("IMAGE_BACKEND", "flux2_klein4b")
+    calls: dict[str, object] = {}
+
+    def fake(prompt, width, height, **kwargs):
+        calls["prompt"] = prompt
+        calls["size"] = (width, height)
+        return synthetic_still_png(width, height)
+
+    monkeypatch.setattr("anime_factory.flux2_klein.generate_klein_t2i", fake)
+    blob = generate_still(
+        {
+            "prompt": "1boy, red shirt",
+            "image_size": "128x128",
+            "_kind": "character_sheet",
+            "_styled": True,
+            "_label": "c2",
+        },
+        router=None,
+    )
+    assert blob[:8] == b"\x89PNG\r\n\x1a\n"
+    assert calls["size"] == (128, 128)
+    assert "red shirt" in str(calls["prompt"])

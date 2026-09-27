@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 from typing import Any, Callable
 
@@ -335,6 +336,30 @@ def unload_still_models(router) -> dict:
         return {"ok": False, "error": str(exc)}
 
 
+def _klein_still(payload: dict) -> bytes:
+    """FLUX.2 Klein 4B. SkyReels boxes have no Comfy and no kolors_t2i workflow."""
+    from anime_factory.flux2_klein import edit_klein_refs, generate_klein_t2i
+
+    spec = still_payload_to_prompt(payload)
+    parent = payload.get("_parent_png")
+    if isinstance(parent, (bytes, bytearray)) and parent:
+        return edit_klein_refs(
+            spec["prompt"],
+            [bytes(parent)],
+            spec["width"],
+            spec["height"],
+            negative_prompt=str(spec["negative"] or ""),
+            seed=spec["seed"],
+        )
+    return generate_klein_t2i(
+        spec["prompt"],
+        spec["width"],
+        spec["height"],
+        negative_prompt=str(spec["negative"] or ""),
+        seed=spec["seed"],
+    )
+
+
 def generate_still(payload: dict, router=None) -> bytes:
     from anime_factory.design import assert_no_reference_images, assert_still_blob
 
@@ -342,10 +367,14 @@ def generate_still(payload: dict, router=None) -> bytes:
         assert_no_reference_images({k: v for k, v in payload.items() if not str(k).startswith("_")})
         if payload.get("_parent_png"):
             raise RuntimeError("scene plate must not bind a parent image (reference-image bleed)")
-    if router is None:
-        raise RuntimeError("GPU 生图 needs Comfy anime SDXL on this card (no SiliconFlow fallback on Vast)")
     width, height = parse_size(payload.get("image_size"))
-    blob = generate_via_comfy(payload, router=router)
+    image_backend = (os.environ.get("IMAGE_BACKEND") or "").strip().lower()
+    if image_backend == "flux2_klein4b":
+        blob = _klein_still(payload)
+    else:
+        if router is None:
+            raise RuntimeError("GPU 生图 needs Comfy anime SDXL on this card (no SiliconFlow fallback on Vast)")
+        blob = generate_via_comfy(payload, router=router)
     return assert_still_blob(
         blob,
         width=width,
