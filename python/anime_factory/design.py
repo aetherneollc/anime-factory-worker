@@ -2949,6 +2949,10 @@ def library_from_db(
     missing_cast = sorted(cid for cid in needed if cid not in have)
     if missing_cast:
         raise RuntimeError(f"design has no character rows for {missing_cast}; refusing empty library")
+    # Stale sqlite rows (an earlier draft's akai/xiaobei prose) are not on this board.
+    # Planning them re-enters the identity lock and blocks the riders who already locked.
+    if needed:
+        characters = [ch for ch in characters if str(ch.get("id") or "").strip() in needed]
     result = generate_asset_library(
         conn,
         story_id,

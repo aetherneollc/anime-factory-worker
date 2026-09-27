@@ -357,6 +357,60 @@ def test_seed_cast_unlocks_c2_when_wiki_is_chinese_and_script_has_blue_jacket(tm
     assert not any("\u4e00" <= ch <= "\u9fff" for ch in prompt)
 
 
+def test_library_from_db_skips_stale_cast_not_on_the_board(tmp_path, monkeypatch):
+    import json
+
+    from anime_factory.db import migrate, open_db
+    from anime_factory.design import library_from_db
+
+    ep = tmp_path / "episodes" / "EP001"
+    ep.mkdir(parents=True)
+    (ep / "board.json").write_text(
+        json.dumps({"shots": [{"id": "s002", "character_id": "c2"}]}),
+        encoding="utf-8",
+    )
+    (ep / "script.json").write_text(
+        json.dumps(
+            {
+                "cast": [
+                    {
+                        "id": "c2",
+                        "name": "小磊",
+                        "gender": "male",
+                        "identity_prompt": "1boy, young adult, bleached blond hair, dark eyes, blue jacket, slim build",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    conn = open_db(tmp_path / "story.sqlite")
+    migrate(conn)
+    conn.execute(
+        "INSERT INTO characters (id, name, identity_prompt, age, alive, seed) VALUES (?, ?, ?, ?, 1, ?)",
+        (
+            "akai",
+            "阿凯",
+            "24-year-old Chinese male, lean build, short spiky black hair, black leather jacket",
+            24,
+            1,
+        ),
+    )
+    conn.commit()
+    seen: dict[str, list[str]] = {}
+
+    def fake_generate(conn, story_id, characters, *args, **kwargs):
+        seen["ids"] = [str(c["id"]) for c in characters]
+        return {
+            "specs": {"char_c2_sheet": {"kind": "character_sheet", "character_id": "c2"}},
+            "created": [],
+        }
+
+    monkeypatch.setattr("anime_factory.design.generate_asset_library", fake_generate)
+    library_from_db(conn, "story-x", client=None, story_root=tmp_path)
+    assert seen["ids"] == ["c2"]
+
+
 def test_seed_cast_from_story_root_plain_english_wiki_fallback(tmp_path):
     from anime_factory.db import migrate, open_db
 
