@@ -481,17 +481,18 @@ def test_unattended_gpu_sheets_do_not_refuse_video(tmp_path, monkeypatch):
         },
     )
     monkeypatch.setattr(sess, "KolorsClient", lambda *_a, **_k: type("C", (), {"live": True})())
-    monkeypatch.setattr(
-        sess,
-        "ensure_keyframe",
-        lambda *_a, **_k: called.append(str(_a[3].get("id"))) or "ok",
-    )
+
+    def _refuse_keyframe(*_a, **_k):
+        called.append(str(_a[3].get("id")))
+        raise RuntimeError("scene sc01 has no interiors[] match")
+
+    monkeypatch.setattr(sess, "ensure_keyframe", _refuse_keyframe)
     monkeypatch.setattr(sess, "assert_keyframe_files", lambda *_a, **_k: None)
     conn = open_db(tmp_path / "s.sqlite")
     migrate(conn)
     out = sess.generate_missing_stills("story-x", tmp_path, conn)
     assert out.get("ok") is True
-    assert called == ["s001"]
+    assert called == []
     assert (hero / "master.png").is_file()
     assert (ep / "keyframes" / "s001" / "f1.png").is_file()
     from anime_factory.asset_lock import is_qc_locked

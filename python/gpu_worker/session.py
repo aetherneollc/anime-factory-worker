@@ -1524,8 +1524,16 @@ def generate_missing_stills(
     for shot in shots:
         if not is_chain_head(shot):
             continue
-        if video_backend == "skyreels_v3_r2v":
+        if video_backend == "skyreels_v3_r2v" and str(shot.get("character_id") or "").strip():
             _seed_skyreels_keyframes_from_sheets(root, shot)
+            from anime_factory.design import still_file_ok
+
+            seeded = root / "episodes" / EP / "keyframes" / str(shot.get("id") or "") / "f1.png"
+            # R2V does not use a first frame. Interior/H3 keyframe gates must not
+            # refuse video once the character master is on disk.
+            if still_file_ok(seeded):
+                created.append(str(shot.get("id") or ""))
+                continue
         if needs_first_frame_still(shot):
             from anime_factory.keyframe import keyframe_file_ok
 
