@@ -591,6 +591,16 @@ def main() -> int:
         runtime.complete_startup(bool(stack_info.get("router_ready")))
     elif production_without_comfy():
         from gpu_worker.stack import start_tunnel, verify_tunnel_connection
+        from gpu_worker.weights import VISUAL_QC_STILL_FILES, _materialize_items, visual_qc_clip_env
+
+        # Klein stills score with OpenCLIP. The Comfy boot used to pull these files;
+        # this image never starts Comfy, so fetch only the visual-QC pair.
+        runtime.record_startup_stage("visual_qc_clip")
+        try:
+            _materialize_items(VISUAL_QC_STILL_FILES, "/opt/ComfyUI")
+            os.environ.update(visual_qc_clip_env("/opt/ComfyUI"))
+        except Exception as exc:  # noqa: BLE001 — stills fail closed later if CLIP is absent
+            print(json.dumps({"visual_qc_clip": f"{type(exc).__name__}:{exc}"}, ensure_ascii=False), flush=True)
 
         # Do not mark_idle here. adopt_batch already marked the card busy, and an
         # immediate idle is what self-destroyed sr3 leases after ~15 minutes.

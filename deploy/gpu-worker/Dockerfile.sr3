@@ -106,6 +106,8 @@ RUN /opt/venv/bin/python -m pip install --no-cache-dir \
         "pyloudnorm" \
         "boto3==1.35.81" \
     && /opt/venv/bin/python -c "import torch; from diffusers import Flux2KleinPipeline; assert torch.__version__.startswith('2.10'), torch.__version__; print('flux2 klein pipeline', Flux2KleinPipeline.__name__)" \
+    && /opt/venv/bin/python -m pip install --no-cache-dir --no-deps "open_clip_torch==2.32.0" \
+    && /opt/venv/bin/python -c "import open_clip, torch; assert torch.__version__.startswith('2.10'), torch.__version__; print('open_clip', open_clip.__version__)" \
     && rm -rf /root/.cache/pip
 
 WORKDIR /opt/anime-factory-worker
