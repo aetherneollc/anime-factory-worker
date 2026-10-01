@@ -17,6 +17,7 @@ from anime_factory.models import (
     IMAGE_MODEL,
     KOLORS_MODEL,
     KOLORS_UNET_FILE,
+    QWEN_IMAGE_21_MODEL_ID,
     StillBackendError,
     still_backend,
     still_model_id,
@@ -31,14 +32,14 @@ from gpu_worker.weights import still_weight_files
 def test_default_backend_is_kolors(monkeypatch):
     monkeypatch.delenv("STILL_BACKEND", raising=False)
     assert still_backend() == "kolors"
-    assert still_model_id() == KOLORS_MODEL
+    assert still_model_id() == QWEN_IMAGE_21_MODEL_ID
     assert still_workflow_name() == "kolors_t2i"
     assert still_unet_file() == KOLORS_UNET_FILE
 
 
 def test_animagine_backend_keeps_sdxl_checkpoint(monkeypatch):
     monkeypatch.setenv("STILL_BACKEND", "animagine")
-    assert still_model_id() == IMAGE_MODEL
+    assert still_model_id() == QWEN_IMAGE_21_MODEL_ID
     assert still_workflow_name() == "anime_t2i"
     assert still_unet_file() == IMAGE_CKPT
     dests = {item["dest"] for item in still_weight_files()}
@@ -62,10 +63,10 @@ def test_kolors_prompt_skips_animagine_quality_tags(monkeypatch):
 
 
 def test_scene_plate_payload_has_no_reference_on_either_backend(monkeypatch):
-    for backend, model in (("kolors", KOLORS_MODEL), ("animagine", IMAGE_MODEL)):
+    for backend in ("kolors", "animagine"):
         monkeypatch.setenv("STILL_BACKEND", backend)
         payload = build_scene_plate_payload("cliffside mountain road, empty")
-        assert payload["model"] == model
+        assert payload["model"] == QWEN_IMAGE_21_MODEL_ID
         assert "reference_image" not in payload
         assert "image" not in payload
         assert "_parent_png" not in payload
@@ -160,7 +161,8 @@ def test_animagine_character_prompt_keeps_booru_sheet(monkeypatch):
         gender_tag="1boy",
     ).lower()
     assert "both feet fully visible" not in prompt
-    assert "original anime character design" in prompt
+    assert "shinkai-like animated film frame" in prompt
+    assert "even soft light" in prompt
     assert "masterpiece" in prompt
     negative = style_negative(
         extra=_kind_negative("character_sheet", "1boy, grey hoodie"),

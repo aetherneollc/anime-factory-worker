@@ -20,6 +20,7 @@ from anime_factory.design import (
 from anime_factory.models import (
     FIXED_NEGATIVE,
     LUMINOUS_CINEMATIC_ANIME_PRESET,
+    LUMINOUS_STYLE_PREFIX_CHARACTER,
     STYLE_PREFIX,
     STYLE_PREFIX_CHARACTER,
     STYLE_PREFIX_LOCATION,
@@ -44,14 +45,18 @@ BANNED = (
 )
 
 
-def test_style_prefix_is_original_production_art_not_shinkai_stills():
-    assert "original anime production still" in STYLE_PREFIX.lower()
+def test_style_prefix_is_shinkai_block_without_film_titles():
+    assert "shinkai-like animated film frame" in STYLE_PREFIX.lower()
+    assert "strong backlight" in STYLE_PREFIX_LOCATION.lower()
+    assert "even soft light" in STYLE_PREFIX_CHARACTER.lower()
     assert "makoto shinkai" not in STYLE_PREFIX.lower()
     assert "shinkai style" not in STYLE_PREFIX.lower()
+    for film in ("your name", "君の名は", "weathering with you", "suzume", "5 centimeters per second"):
+        assert film not in STYLE_PREFIX.lower()
+        assert film not in STYLE_PREFIX_CHARACTER.lower()
     for term in ("Makoto Shinkai", "君の名は", "天气之子", "秒速5厘米"):
         assert term in FIXED_NEGATIVE
     assert "generic endless sunset" not in FIXED_NEGATIVE
-    assert "clear luminous atmosphere" in STYLE_PREFIX_LOCATION
     assert "ghost film" in FIXED_NEGATIVE
     assert "corpse-pale skin" in FIXED_NEGATIVE
 
@@ -118,19 +123,23 @@ def test_character_sheets_are_model_sheets():
     assert "cinematic composition" not in sheets[0]["prompt"].lower()
 
 
-def test_style_prefixes_split_by_asset_kind():
+def test_style_prefixes_share_shinkai_block():
     assert style_prefix_for_kind("character_sheet") == STYLE_PREFIX_CHARACTER
     assert style_prefix_for_kind("character_view_derive") == STYLE_PREFIX_CHARACTER
     assert style_prefix_for_kind("scene_plate") == STYLE_PREFIX_LOCATION
-    assert "detailed background" in STYLE_PREFIX_LOCATION
-    assert "detailed background" not in STYLE_PREFIX_CHARACTER
+    assert "detailed painted backgrounds" in STYLE_PREFIX_LOCATION
+    assert "detailed painted backgrounds" in STYLE_PREFIX_CHARACTER
+    assert "strong backlight" in STYLE_PREFIX_LOCATION
+    assert "even soft light" in STYLE_PREFIX_CHARACTER
+    assert "ghibli" not in STYLE_PREFIX_LOCATION.lower()
+    assert "ghibli" not in STYLE_PREFIX_CHARACTER.lower()
 
 
 def test_luminous_preset_is_location_keyframe_only(monkeypatch):
     monkeypatch.setenv("STYLE_PRESET", LUMINOUS_CINEMATIC_ANIME_PRESET)
     assert style_prefix_for_kind("scene_plate") == STYLE_PREFIX_LOCATION_LUMINOUS
     assert style_prefix_for_kind("keyframe") == STYLE_PREFIX_LOCATION_LUMINOUS
-    assert style_prefix_for_kind("character_sheet") == STYLE_PREFIX_CHARACTER
+    assert style_prefix_for_kind("character_sheet") == LUMINOUS_STYLE_PREFIX_CHARACTER
 
     payload = build_scene_plate_payload(
         "rainy canal shopping street, old stone bridge, anime location background",

@@ -174,7 +174,8 @@ def test_scene_plate_never_binds_a_parent_image():
     assert "reference-image bleed" in str(exc.value)
 
 
-def test_generate_still_validates_the_returned_blob():
+def test_generate_still_validates_the_returned_blob(monkeypatch):
+    monkeypatch.setenv("IMAGE_BACKEND", "comfy")
     payload = {"prompt": "night street, anime location background", "image_size": "1344x768", "_styled": True}
     ok = generate_still(payload, router=FakeRouter())
     assert len(ok) >= MIN_STILL_BYTES
@@ -187,7 +188,7 @@ def test_generate_still_validates_the_returned_blob():
 
 def test_styled_marker_stops_double_prefixing():
     styled = still_payload_to_prompt({"prompt": f"{STYLE_PREFIX}, a night counter", "_styled": True})
-    assert styled["prompt"].count("original anime production still") == 1
+    assert styled["prompt"].count("Shinkai-like animated film frame") == 1
     # A story-specific bible prefix does not start with STYLE_PREFIX, and the old
     # `prompt.startswith(STYLE_PREFIX[:20])` guess double-prefixed exactly there.
     bible = still_payload_to_prompt({"prompt": "salt-bleached harbour palette, a night counter", "_styled": True})

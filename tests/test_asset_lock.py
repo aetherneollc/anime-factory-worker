@@ -22,6 +22,7 @@ from anime_factory.db import migrate, open_db
 from anime_factory.design import (
     CHAR_BACK_FILENAME,
     CHAR_IMAGE_SIZE,
+    SHEET_IMAGE_SIZE,
     CHAR_SIDE_FILENAME,
     CHAR_VIEW_HEIGHT,
     CHAR_VIEW_WIDTH,
@@ -137,7 +138,8 @@ def test_plan_library_generates_front_then_reference_views_and_composite():
     turnaround = specs["char_hero_turnaround"]
     assert front["path"] == character_asset_rel("hero", FRONT_ALIAS_FILENAME)
     assert front["view"] == "front"
-    assert front["image_size"] == CHAR_IMAGE_SIZE == "768x1344"
+    assert front["image_size"] == SHEET_IMAGE_SIZE == "1344x768"
+    assert side["image_size"] == CHAR_IMAGE_SIZE == "768x1344"
     assert side["path"] == character_asset_rel("hero", CHAR_SIDE_FILENAME)
     assert back["path"] == character_asset_rel("hero", CHAR_BACK_FILENAME)
     assert side["parent_id"] == back["parent_id"] == "hero"

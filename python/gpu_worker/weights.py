@@ -484,7 +484,7 @@ def runtime_weight_bytes(comfy_dir: Path | str | None = None) -> int:
 
         backend = locked_video_backend() or select_legacy_video_backend()
     except Exception:  # noqa: BLE001 — accounting must not crash boot
-        backend = (os.environ.get("AF_VIDEO_BACKEND") or "skyreels_v3_r2v").strip().lower()
+        backend = (os.environ.get("AF_VIDEO_BACKEND") or "h3").strip().lower()
     total = 0
     if backend != "longlive":
         root = Path(comfy_dir or os.environ.get("COMFYUI_DIR") or "/opt/ComfyUI") / "models"

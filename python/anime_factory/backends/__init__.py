@@ -1,12 +1,12 @@
 """Production image and video backends for the stills pipeline.
 
 Env:
-  IMAGE_BACKEND=flux2_klein4b
-  VIDEO_BACKEND=skyreels_v3_r2v
+  IMAGE_BACKEND=qwen_image_21
+  VIDEO_BACKEND=h3
 
 ``STILL_BACKEND=kolors`` does not override IMAGE_BACKEND.
 ``CONTROL_BACKEND`` is an asset-generation knob, not part of the video lease.
-H3 / LongLive / Kolors are not production selections.
+SkyReels, Klein, and LongLive are not production selections.
 """
 
 from __future__ import annotations

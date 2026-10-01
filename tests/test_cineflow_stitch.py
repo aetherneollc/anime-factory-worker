@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from anime_factory.board import expand_shots_to_segments
 from anime_factory.compose import chain_overlap_frames, drop_first_frames_cmd
 from anime_factory.design import synthetic_still_png
@@ -387,7 +389,9 @@ def test_longlive_board_packs_scene_into_few_long_takes():
     assert max(float(s["duration"]) for s in h3_spoken) <= H3_MAX_SECONDS + 1e-9
 
 
-def test_board_from_script_does_not_select_longlive():
+def test_board_from_script_selects_h3_and_rejects_longlive():
+    from anime_factory.video_backend import ProductionBackendError
+
     lines = [_line("ke", f"第{i}句今晚别赊账我再说一遍。") for i in range(1, 7)]
     h3 = board_from_script(
         _script(lines),
@@ -396,19 +400,19 @@ def test_board_from_script_does_not_select_longlive():
         kind="short",
         video_backend="h3",
     )
-    live = board_from_script(
-        _script(lines),
-        episode_code="EP001",
-        langs=("zh", "en", "ja"),
-        kind="short",
-        video_backend="longlive",
-        shot_seconds=LONGLIVE_MAX_SECONDS,
-    )
     h3_spoken = [s for s in h3 if s.get("line")]
-    live_spoken = [s for s in live if s.get("line")]
-    assert len(live_spoken) == len(h3_spoken)
+    assert h3_spoken
+    assert all(s.get("video_backend") == "h3" for s in h3)
     assert max(float(s["duration"]) for s in h3_spoken) <= H3_MAX_SECONDS + 1e-9
-    assert max(float(s["duration"]) for s in live_spoken) <= H3_MAX_SECONDS + 1e-9
+    with pytest.raises(ProductionBackendError):
+        board_from_script(
+            _script(lines),
+            episode_code="EP001",
+            langs=("zh", "en", "ja"),
+            kind="short",
+            video_backend="longlive",
+            shot_seconds=LONGLIVE_MAX_SECONDS,
+        )
 
 
 def test_pack_longlive_takes_keeps_one_scene_until_cap():

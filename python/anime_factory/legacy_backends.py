@@ -1,9 +1,9 @@
-"""Legacy Kolors / H3 / LongLive adapters.
+"""Frozen-image adapters.
 
-These classes stay so frozen worker images can still boot. Production
-selection (``IMAGE_BACKENDS``, ``VIDEO_BACKENDS``, ``normalize_video_backend``,
-``select_video_backend``, the shot planner, and the produce lease) does not
-return them.
+H3 is the production video line (registered in ``backends.video_ext``).
+LongLive and SkyReels stay here so a frozen worker image can still lock its
+own line. Production ``normalize_video_backend`` / ``select_video_backend``,
+the shot planner, and the produce lease do not select them.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from anime_factory.backends.video_ext import (
 )
 
 LEGACY_IMAGE_BACKENDS = ("kolors",)
-LEGACY_VIDEO_BACKENDS = ("h3", "longlive")
+LEGACY_VIDEO_BACKENDS = ("longlive", "skyreels_v3_r2v")
 LONGLIVE_ALIASES = frozenset(
     {
         "longlive",
@@ -45,7 +45,7 @@ class KolorsImageBackend(ImageBackend):
     def generate(self, request: ImageGenerateRequest) -> ImageGenerateResult:
         raise ImageBackendError(
             "KolorsImageBackend is legacy and is not a production IMAGE_BACKEND; "
-            "use IMAGE_BACKEND=flux2_klein4b"
+            "use IMAGE_BACKEND=qwen_image_21"
         )
 
 
@@ -76,10 +76,10 @@ class LongliveVideoGenerateBackend(VideoGenerateBackend):
 
 
 def normalize_legacy_video_backend(value: Any) -> str:
-    """Worker-only name fold. Production normalize refuses these names."""
+    """Worker-only name fold. Empty is production H3. Unknown names stay SkyReels."""
     raw = str(value or "").strip().lower().replace(" ", "")
     if not raw:
-        return "skyreels_v3_r2v"
+        return "h3"
     if raw.startswith("longlive") or raw in LONGLIVE_ALIASES:
         return "longlive"
     if raw in H3_ALIASES or raw == "h3":
@@ -137,4 +137,4 @@ def select_legacy_video_backend(
     image_cap = str(mapping.get("AF_IMAGE_CAPABILITY") or "").strip().lower()
     if image_cap in {"h3", "longlive", "skyreels_v3_r2v"}:
         return normalize_legacy_video_backend(image_cap)
-    return "skyreels_v3_r2v"
+    return "h3"

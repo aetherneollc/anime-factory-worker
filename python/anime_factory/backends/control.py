@@ -1,4 +1,4 @@
-"""Control backends: Klein multi-ref (default), composite, Kolors IP-Adapter rollback."""
+"""Control backends: Qwen-Image-2.1 reference edit (default), plus rollback stubs."""
 
 from __future__ import annotations
 
@@ -9,9 +9,9 @@ from typing import Any, Mapping, Sequence
 
 from anime_factory.contracts import CharacterRefError, assert_character_refs, is_master_ref
 
-CONTROL_BACKENDS = ("flux2_klein_ref", "composite", "kolors_ipadapter", "none")
-DEFAULT_CONTROL_BACKEND = "flux2_klein_ref"
-MAX_CONTROL_REFS = 4
+CONTROL_BACKENDS = ("qwen_image_21_ref", "flux2_klein_ref", "composite", "kolors_ipadapter", "none")
+DEFAULT_CONTROL_BACKEND = "qwen_image_21_ref"
+MAX_CONTROL_REFS = 10
 
 
 class ControlBackendError(ValueError):
@@ -67,6 +67,44 @@ def select_control_backend(env: Mapping[str, str] | None = None) -> str:
             f"CONTROL_BACKEND must be one of {CONTROL_BACKENDS}, got {raw!r}"
         )
     return raw
+
+
+class QwenImage21RefControlBackend(ControlBackend):
+    """Qwen-Image-2.1 reference edit. 1–10 master.png refs. Dry-run via QWEN_IMAGE_21_DRY_RUN."""
+
+    name = "qwen_image_21_ref"
+
+    def apply(self, request: ControlRequest) -> ControlResult:
+        refs = list(request.character_refs)
+        pngs = [p for p in request.reference_pngs if p]
+        if not refs and not pngs:
+            raise ControlBackendError("qwen_image_21_ref requires at least one master.png or PNG bytes")
+        if len(refs) > MAX_CONTROL_REFS or len(pngs) > MAX_CONTROL_REFS:
+            raise ControlBackendError(f"qwen_image_21_ref accepts at most {MAX_CONTROL_REFS} refs")
+        from anime_factory.qwen_image_21 import edit_qwen_image_21
+
+        payload: list[Any] = list(pngs) if pngs else list(refs)
+        dry = request.meta.get("dry_run")
+        view = str(request.meta.get("view") or "")
+        master_path = str(request.meta.get("master_path") or (refs[0] if refs else ""))
+        png = edit_qwen_image_21(
+            request.prompt,
+            payload,
+            request.width,
+            request.height,
+            negative_prompt=request.negative_prompt,
+            seed=request.seed,
+            dry_run=True if dry else None,
+            master_path=master_path,
+            view=view or None,
+        )
+        return ControlResult(
+            png=png,
+            backend=self.name,
+            control_mode=request.control_mode or "identity",
+            used_refs=refs,
+            meta={"model": "Qwen/Qwen-Image-2.1", **dict(request.meta)},
+        )
 
 
 class Flux2KleinRefControlBackend(ControlBackend):
@@ -173,6 +211,7 @@ def _stub_png(width: int, height: int, *, tag: bytes) -> bytes:
 
 
 _BACKENDS: dict[str, type[ControlBackend]] = {
+    "qwen_image_21_ref": QwenImage21RefControlBackend,
     "flux2_klein_ref": Flux2KleinRefControlBackend,
     "composite": CompositeControlBackend,
     "kolors_ipadapter": KolorsIpAdapterControlBackend,

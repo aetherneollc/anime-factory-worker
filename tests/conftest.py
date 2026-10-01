@@ -20,10 +20,9 @@ def _clear_video_backend_lock(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _unit_tests_use_kolors_characters(request, monkeypatch):
-    """Production default is CHARACTER_STILL_BACKEND=hunyuan; unit tests inject Kolors/GPU fakes.
+    """Production default is CHARACTER_STILL_BACKEND=qwen; unit tests inject Kolors/GPU fakes.
 
-    Mark a test with ``@pytest.mark.qwen_character_default`` to assert the real default
-    (or other hosted character backends).
+    Mark a test with ``@pytest.mark.qwen_character_default`` to assert the real default.
     """
     if request.node.get_closest_marker("qwen_character_default"):
         monkeypatch.delenv("CHARACTER_STILL_BACKEND", raising=False)
@@ -34,6 +33,6 @@ def _unit_tests_use_kolors_characters(request, monkeypatch):
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
-        "qwen_character_default: exercise production CHARACTER_STILL_BACKEND (hunyuan/qwen)",
+        "qwen_character_default: exercise production CHARACTER_STILL_BACKEND=qwen",
     )
 

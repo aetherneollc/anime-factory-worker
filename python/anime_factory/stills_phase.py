@@ -1,9 +1,9 @@
-"""Klein writes the asset registry. SkyReels consumes a stable character pack.
+"""Qwen-Image-2.1 writes the asset registry. MiniMax H3 consumes a stable character pack.
 
-Tier A/B/C Klein edits are asset generation (keyframes for review), not video
-continuity. ``build_reference_pack`` reloads the same character masters from
-the registry for every shot and never chains the previous shot's last frame.
-Shot unit is 5 seconds. Production video is SkyReels V3 R2V only.
+Tier A is one master T2I. Tier B/C edits use that master.png, not a new
+text-to-image. ``build_reference_pack`` reloads the same character masters
+for every shot and never chains the previous shot's last frame.
+Shot unit is H3's native cap (about 8 seconds). LongLive is not selected.
 """
 
 from __future__ import annotations
@@ -39,19 +39,21 @@ from anime_factory.contracts import (
     b_tier_control_payload,
     is_master_ref,
 )
-from anime_factory.flux2_klein import (
+from anime_factory.models import H3_MAX_SECONDS
+from anime_factory.qwen_image_21 import (
     DEFAULT_HEIGHT,
-    DEFAULT_MASTER_HEIGHT,
-    DEFAULT_MASTER_WIDTH,
+    DEFAULT_SHEET_HEIGHT,
+    DEFAULT_SHEET_WIDTH,
     DEFAULT_WIDTH,
-    Flux2KleinError,
-    edit_klein_refs,
-    generate_klein_t2i,
-    master_prompt,
+    QwenImage21Error,
+    edit_qwen_image_21,
+    generate_qwen_image_21,
 )
 
-# R2V recommended duration. Longer shots are split, not extended.
-SHOT_UNIT_SECONDS = 5.0
+# H3 native shot unit. Longer shots are split, not extended past this cap.
+SHOT_UNIT_SECONDS = H3_MAX_SECONDS
+DEFAULT_MASTER_WIDTH = DEFAULT_SHEET_WIDTH
+DEFAULT_MASTER_HEIGHT = DEFAULT_SHEET_HEIGHT
 REGISTRY_REL = Path("assets") / "registry.json"
 
 
@@ -200,6 +202,17 @@ def _dry_flag(env: Mapping[str, str] | None, name: str) -> bool:
     return str((env or os.environ).get(name) or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def master_prompt(identity: str) -> str:
+    """One 16:9 sheet. Side and back are edits of this master, not new T2I."""
+    from anime_factory.design import SHEET_LAYOUT, appearance_lock_clause
+    from anime_factory.models import STYLE_PREFIX_CHARACTER
+
+    ident = str(identity or "").strip()
+    lock = appearance_lock_clause(ident)
+    head = f"{STYLE_PREFIX_CHARACTER}, {SHEET_LAYOUT}, {lock}"
+    return f"{head}, {ident}" if ident else head
+
+
 def mint_master_png(
     *,
     identity: str,
@@ -208,8 +221,8 @@ def mint_master_png(
     width: int = DEFAULT_MASTER_WIDTH,
     height: int = DEFAULT_MASTER_HEIGHT,
 ) -> bytes:
-    """Character master via Klein 4B T2I."""
-    return generate_klein_t2i(
+    """One text-to-image master per character. Later views edit this file."""
+    return generate_qwen_image_21(
         master_prompt(identity),
         width,
         height,
@@ -224,14 +237,14 @@ def generate_tier_a_keyframe(
     env: Mapping[str, str] | None = None,
     dry_run: bool | None = None,
 ) -> tuple[bytes, str]:
-    """A-tier: Klein T2I. No character reference."""
+    """A-tier: Qwen-Image-2.1 T2I. No character reference."""
     s = shot if isinstance(shot, ShotContract) else ShotContract.from_dict(shot)
     if dry_run is None:
-        dry_run = _dry_flag(env, "FLUX2_KLEIN_DRY_RUN")
+        dry_run = _dry_flag(env, "QWEN_IMAGE_21_DRY_RUN")
     backend_name = select_image_backend(env=env)
-    if backend_name == "flux2_klein4b" and dry_run:
+    if backend_name == "qwen_image_21" and dry_run:
         return (
-            generate_klein_t2i(
+            generate_qwen_image_21(
                 s.prompt,
                 DEFAULT_WIDTH,
                 DEFAULT_HEIGHT,
@@ -239,7 +252,7 @@ def generate_tier_a_keyframe(
                 dry_run=True,
                 negative_prompt=s.negative_prompt,
             ),
-            "flux2_klein4b",
+            "qwen_image_21",
         )
     result = get_image_backend(backend_name, env=env).generate(
         ImageGenerateRequest(
@@ -277,7 +290,7 @@ def generate_tier_b_keyframe(
             width=DEFAULT_WIDTH,
             height=DEFAULT_HEIGHT,
             seed=s.seed,
-            meta={"tier": "B", "dry_run": _dry_flag(env, "FLUX2_KLEIN_DRY_RUN")},
+            meta={"tier": "B", "dry_run": _dry_flag(env, "QWEN_IMAGE_21_DRY_RUN")},
         )
     )
     return result.png, result.backend, {"control": payload, **result.meta}
@@ -298,7 +311,7 @@ def generate_tier_c_keyframe(
     reference_pngs: list[bytes] | None = None,
     env: Mapping[str, str] | None = None,
 ) -> tuple[bytes, str, dict[str, Any]]:
-    """C-tier: 2–4 refs through Klein. Composite paste, then Klein refine, on failure."""
+    """C-tier: refs through Qwen edit. Composite paste, then Qwen refine, on failure."""
     s = shot if isinstance(shot, ShotContract) else ShotContract.from_dict(shot)
     chars = list(s.character_refs)
     scenes = _scene_refs(s)
@@ -320,22 +333,22 @@ def generate_tier_c_keyframe(
         width=DEFAULT_WIDTH,
         height=DEFAULT_HEIGHT,
         seed=s.seed,
-        meta={"tier": "C", "scene_refs": scenes, "dry_run": _dry_flag(env, "FLUX2_KLEIN_DRY_RUN")},
+        meta={"tier": "C", "scene_refs": scenes, "dry_run": _dry_flag(env, "QWEN_IMAGE_21_DRY_RUN")},
     )
     try:
-        result = get_control_backend("flux2_klein_ref", env=env).apply(request)
+        result = get_control_backend("qwen_image_21_ref", env=env).apply(request)
         return result.png, result.backend, {"control": {"character_refs": chars, "scene_refs": scenes}, **result.meta}
-    except (Flux2KleinError, Exception) as exc:  # noqa: BLE001 — composite fallback is the C-tier contract
+    except (QwenImage21Error, Exception) as exc:  # noqa: BLE001 — composite fallback is the C-tier contract
         pasted = get_control_backend("composite", env=env).apply(request)
-        refined = edit_klein_refs(
+        refined = edit_qwen_image_21(
             s.prompt,
             [pasted.png, *pngs[:3]],
             DEFAULT_WIDTH,
             DEFAULT_HEIGHT,
             seed=s.seed,
-            dry_run=True if _dry_flag(env, "FLUX2_KLEIN_DRY_RUN") else None,
+            dry_run=True if _dry_flag(env, "QWEN_IMAGE_21_DRY_RUN") else None,
         )
-        return refined, "flux2_klein_ref", {
+        return refined, "qwen_image_21_ref", {
             "fallback": "composite",
             "error": str(exc),
             "control": {"character_refs": chars, "scene_refs": scenes},
@@ -489,7 +502,7 @@ def run_video_phase(
     rife: bool = False,
     env: Mapping[str, str] | None = None,
 ) -> VideoContract:
-    """QC-passed stable reference pack, then SkyReels. No preview-frame substitute."""
+    """QC-passed stable reference pack, then H3. No preview-frame substitute."""
     pack = ref_pack
     if pack is None and isinstance(keyframe, RefPackContract):
         pack = keyframe
@@ -528,7 +541,7 @@ def run_video_phase(
         references=list(request_doc.references),
         aspect=aspect,
         rife=rife,
-        meta={"dry_run": _dry_flag(env, "SKYREELS_DRY_RUN")},
+        meta={"dry_run": _dry_flag(env, "QWEN_IMAGE_21_DRY_RUN")},
     )
     result = gated_video_generate(pack, req, backend=backend, env=env)
     return video_contract_from_result(pack.shot_id, "", result, request=req)
@@ -542,7 +555,7 @@ def ensure_master_on_disk(
     seed: int | None = None,
     dry_run: bool | None = None,
 ) -> Path:
-    """Write characters/<id>/master.png via Klein 4B T2I."""
+    """Write characters/<id>/master.png via one Qwen-Image-2.1 T2I."""
     if not character_id.strip():
         raise CharacterRefError("character_id required")
     dest = Path(story_root) / "assets" / "characters" / character_id / MASTER_FILENAME
@@ -564,13 +577,12 @@ def phase_a_loop(
     dry_run: bool = True,
     run_video: bool = True,
 ) -> dict[str, Any]:
-    """Closed loop: Klein asset → registry pack → SkyReels. Legacy video backends are not selected."""
+    """Closed loop: Qwen asset → registry pack → H3. LongLive is not selected."""
     mapping = dict(env or os.environ)
     if dry_run:
-        mapping.setdefault("FLUX2_KLEIN_DRY_RUN", "1")
-        mapping.setdefault("SKYREELS_DRY_RUN", "1")
-    mapping.setdefault("IMAGE_BACKEND", "flux2_klein4b")
-    mapping.setdefault("VIDEO_BACKEND", "skyreels_v3_r2v")
+        mapping.setdefault("QWEN_IMAGE_21_DRY_RUN", "1")
+    mapping.setdefault("IMAGE_BACKEND", "qwen_image_21")
+    mapping.setdefault("VIDEO_BACKEND", "h3")
     kf = run_keyframe_phase(
         shot,
         story_root=story_root,

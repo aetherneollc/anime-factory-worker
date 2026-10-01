@@ -125,14 +125,18 @@ def test_character_master_relpath():
 def test_image_backend_env_and_still_adapter(monkeypatch):
     monkeypatch.delenv("IMAGE_BACKEND", raising=False)
     monkeypatch.delenv("STILL_BACKEND", raising=False)
-    assert IMAGE_BACKENDS == ("flux2_klein4b",)
-    assert select_image_backend() == "flux2_klein4b"
+    assert IMAGE_BACKENDS == ("qwen_image_21",)
+    assert select_image_backend() == "qwen_image_21"
 
     monkeypatch.setenv("STILL_BACKEND", "kolors")
-    assert select_image_backend() == "flux2_klein4b"
+    assert select_image_backend() == "qwen_image_21"
+
+    monkeypatch.setenv("IMAGE_BACKEND", "qwen_image_21")
+    assert select_image_backend() == "qwen_image_21"
 
     monkeypatch.setenv("IMAGE_BACKEND", "flux2_klein4b")
-    assert select_image_backend() == "flux2_klein4b"
+    with pytest.raises(ImageBackendError):
+        select_image_backend()
 
     monkeypatch.setenv("IMAGE_BACKEND", "kolors")
     with pytest.raises(ImageBackendError):
@@ -145,7 +149,7 @@ def test_image_backend_env_and_still_adapter(monkeypatch):
 
 def test_control_backend_default_and_selection(monkeypatch):
     monkeypatch.delenv("CONTROL_BACKEND", raising=False)
-    assert select_control_backend() == "flux2_klein_ref"
+    assert select_control_backend() == "qwen_image_21_ref"
     monkeypatch.setenv("CONTROL_BACKEND", "composite")
     assert select_control_backend() == "composite"
     monkeypatch.setenv("CONTROL_BACKEND", "bad")
@@ -158,17 +162,17 @@ def test_production_enums_reject_legacy_backends(monkeypatch):
     monkeypatch.delenv("AF_VIDEO_BACKEND", raising=False)
     monkeypatch.delenv("AF_VIDEO_BACKEND_LOCKED", raising=False)
     monkeypatch.delenv("AF_IMAGE_CAPABILITY", raising=False)
-    assert VIDEO_BACKENDS == ("skyreels_v3_r2v",)
-    assert normalize_video_backend(None) == "skyreels_v3_r2v"
-    assert normalize_pluggable_video_backend("r2v") == "skyreels_v3_r2v"
-    assert select_video_backend() == "skyreels_v3_r2v"
-    for legacy in ("h3", "wan", "longlive", "kolors"):
+    assert VIDEO_BACKENDS == ("h3",)
+    assert normalize_video_backend(None) == "h3"
+    assert normalize_pluggable_video_backend("wan") == "h3"
+    assert select_video_backend() == "h3"
+    for legacy in ("skyreels", "skyreels_v3_r2v", "longlive", "flux2_klein4b"):
         with pytest.raises(ProductionBackendError):
             normalize_video_backend(legacy)
     monkeypatch.setenv("AF_VIDEO_BACKEND", "longlive")
     with pytest.raises(ProductionBackendError):
         select_pluggable_video_backend()
-    monkeypatch.setenv("VIDEO_BACKEND", "h3")
+    monkeypatch.setenv("VIDEO_BACKEND", "skyreels_v3_r2v")
     with pytest.raises(ProductionBackendError):
         select_video_backend()
     with pytest.raises(ProductionBackendError):
@@ -176,13 +180,13 @@ def test_production_enums_reject_legacy_backends(monkeypatch):
 
 
 def test_resolve_backend_env_snapshot(monkeypatch):
-    monkeypatch.setenv("IMAGE_BACKEND", "flux2_klein4b")
-    monkeypatch.setenv("CONTROL_BACKEND", "flux2_klein_ref")
-    monkeypatch.setenv("VIDEO_BACKEND", "skyreels_v3_r2v")
+    monkeypatch.setenv("IMAGE_BACKEND", "qwen_image_21")
+    monkeypatch.setenv("CONTROL_BACKEND", "qwen_image_21_ref")
+    monkeypatch.setenv("VIDEO_BACKEND", "h3")
     snap = resolve_backend_env()
     assert snap == {
-        "IMAGE_BACKEND": "flux2_klein4b",
-        "VIDEO_BACKEND": "skyreels_v3_r2v",
+        "IMAGE_BACKEND": "qwen_image_21",
+        "VIDEO_BACKEND": "h3",
     }
     assert "CONTROL_BACKEND" not in snap
 
@@ -280,9 +284,8 @@ def test_h3_rollback_still_generates():
 # --- Phase A loop ---------------------------------------------------------------
 
 
-def test_phase_a_loop_qc_pass_then_skyreels(tmp_path: Path, monkeypatch):
-    monkeypatch.setenv("FLUX2_KLEIN_DRY_RUN", "1")
-    monkeypatch.setenv("SKYREELS_DRY_RUN", "1")
+def test_phase_a_loop_qc_pass_then_h3(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("QWEN_IMAGE_21_DRY_RUN", "1")
     monkeypatch.delenv("IMAGE_BACKEND", raising=False)
     monkeypatch.delenv("VIDEO_BACKEND", raising=False)
     register_character_master(tmp_path, "alice", "assets/characters/alice/master.png")
@@ -294,19 +297,19 @@ def test_phase_a_loop_qc_pass_then_skyreels(tmp_path: Path, monkeypatch):
     )
     out = phase_a_loop(shot, story_root=tmp_path, episode_code="EP001", dry_run=True)
     assert out["blocked"] is False
-    assert out["image_backend"] == "flux2_klein4b"
-    assert out["video_backend"] == "skyreels_v3_r2v"
+    assert out["image_backend"] == "qwen_image_21"
+    assert out["video_backend"] == "h3"
     final = Path(out["keyframe"]["final_path"])
     assert final.name == "keyframe_final.png"
     assert final.is_file()
     assert out["keyframe"]["qc"]["verdict"] == "pass"
-    assert out["video"]["backend"] == "skyreels_v3_r2v"
+    assert out["video"]["backend"] == "h3"
     assert "keyframe_final" not in json.dumps(out["video"].get("references"))
 
 
 def test_phase_a_blocks_video_on_qc_fail(tmp_path: Path, monkeypatch):
-    monkeypatch.setenv("FLUX2_KLEIN_DRY_RUN", "1")
-    monkeypatch.setenv("IMAGE_BACKEND", "flux2_klein4b")
+    monkeypatch.setenv("QWEN_IMAGE_21_DRY_RUN", "1")
+    monkeypatch.delenv("IMAGE_BACKEND", raising=False)
     monkeypatch.delenv("VIDEO_BACKEND", raising=False)
 
     def _fail_qc(*_a, **_k):
@@ -324,8 +327,8 @@ def test_phase_a_blocks_video_on_qc_fail(tmp_path: Path, monkeypatch):
 
 
 def test_tier_b_uses_control_not_directory_scan(tmp_path: Path, monkeypatch):
-    monkeypatch.setenv("FLUX2_KLEIN_DRY_RUN", "1")
-    monkeypatch.setenv("IMAGE_BACKEND", "flux2_klein4b")
+    monkeypatch.setenv("QWEN_IMAGE_21_DRY_RUN", "1")
+    monkeypatch.delenv("IMAGE_BACKEND", raising=False)
     monkeypatch.setenv("CONTROL_BACKEND", "kolors_ipadapter")
     shot = ShotContract(
         shot_id="s010",
@@ -350,8 +353,8 @@ def test_tier_b_uses_control_not_directory_scan(tmp_path: Path, monkeypatch):
     assert "sheet_front.png" not in json.dumps(kf.meta)
 
 
-def test_tier_c_klein_refs_and_composite_refine(tmp_path: Path, monkeypatch):
-    monkeypatch.setenv("FLUX2_KLEIN_DRY_RUN", "1")
+def test_tier_c_qwen_refs_and_composite_refine(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("QWEN_IMAGE_21_DRY_RUN", "1")
     shot = ShotContract(
         shot_id="s030",
         tier="C",
@@ -364,7 +367,7 @@ def test_tier_c_klein_refs_and_composite_refine(tmp_path: Path, monkeypatch):
     )
     pngs = [b"\x89PNG\r\n\x1a\n" + f"ref{i}".encode() for i in range(3)]
     png, backend, meta = generate_tier_c_keyframe(shot, reference_pngs=pngs)
-    assert backend == "flux2_klein_ref"
+    assert backend == "qwen_image_21_ref"
     assert png.startswith(b"\x89PNG")
     assert "fallback" not in meta
 
@@ -373,13 +376,13 @@ def test_tier_c_klein_refs_and_composite_refine(tmp_path: Path, monkeypatch):
     def _boom(_self, _request):
         raise RuntimeError("klein unavailable")
 
-    monkeypatch.setattr(control.Flux2KleinRefControlBackend, "apply", _boom)
+    monkeypatch.setattr(control.QwenImage21RefControlBackend, "apply", _boom)
     png2, backend2, meta2 = generate_tier_c_keyframe(
         shot,
         reference_pngs=pngs,
         env={"FLUX2_KLEIN_DRY_RUN": "1"},
     )
-    assert backend2 == "flux2_klein_ref"
+    assert backend2 == "qwen_image_21_ref"
     assert meta2["fallback"] == "composite"
     assert meta2["refine"] is True
     assert png2.startswith(b"\x89PNG")
@@ -388,7 +391,7 @@ def test_tier_c_klein_refs_and_composite_refine(tmp_path: Path, monkeypatch):
         story_root=tmp_path,
         episode_code="EP001",
         reference_pngs=pngs,
-        env={"FLUX2_KLEIN_DRY_RUN": "1", "IMAGE_BACKEND": "flux2_klein4b"},
+        env={"QWEN_IMAGE_21_DRY_RUN": "1", "IMAGE_BACKEND": "qwen_image_21"},
     )
     pack = json.loads((Path(kf.final_path).parent / "ref_pack.json").read_text(encoding="utf-8"))
     packed = pack.get("references") or pack.get("images") or []
@@ -468,8 +471,7 @@ def test_ref_pack_gate_and_master_png():
 
 
 def test_consecutive_shots_share_stable_reference_pack(tmp_path: Path, monkeypatch):
-    monkeypatch.setenv("FLUX2_KLEIN_DRY_RUN", "1")
-    monkeypatch.setenv("SKYREELS_DRY_RUN", "1")
+    monkeypatch.setenv("QWEN_IMAGE_21_DRY_RUN", "1")
     monkeypatch.delenv("IMAGE_BACKEND", raising=False)
     monkeypatch.delenv("VIDEO_BACKEND", raising=False)
     monkeypatch.delenv("AF_VIDEO_BACKEND", raising=False)
@@ -505,11 +507,11 @@ def test_consecutive_shots_share_stable_reference_pack(tmp_path: Path, monkeypat
     assert "last-frame" not in blob
     kf = run_keyframe_phase(shot_a, story_root=tmp_path, episode_code="EP001", dry_run=True)
     video = run_video_phase(kf, prompt="dock night", camera="wide", motion="push in", duration=5, seed=7)
-    assert video.backend == "skyreels_v3_r2v"
+    assert video.backend == "h3"
     assert video.camera == "wide"
     assert video.motion == "push in"
     assert video.references == paths_a
-    assert "--task_type" in video.meta.get("argv", [])
+    assert video.meta.get("delegated") == "gpu_worker.h3"
 
 
 def test_skyreels_truncates_characters_first_and_refuses_empty():
@@ -561,8 +563,9 @@ def test_dockerfile_sr3_skeleton_parses():
     sr3 = next(t for t in targets["targets"] if t["id"] == "sr3")
     assert sr3["enabled"] is True
     assert "python/" in sr3["watch_paths"]
-    for frozen in ("h3", "longlive"):
-        row = next(t for t in targets["targets"] if t["id"] == frozen)
-        assert "python/" not in row["watch_paths"]
-        assert not any(str(p).startswith("python") for p in row["watch_paths"])
+    h3 = next(t for t in targets["targets"] if t["id"] == "h3")
+    assert "python/" in h3["watch_paths"]
+    longlive = next(t for t in targets["targets"] if t["id"] == "longlive")
+    assert longlive["enabled"] is False
+    assert "python/" not in longlive["watch_paths"]
 

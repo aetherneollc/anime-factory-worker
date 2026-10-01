@@ -336,6 +336,51 @@ def unload_still_models(router) -> dict:
         return {"ok": False, "error": str(exc)}
 
 
+def _qwen_still(payload: dict) -> bytes:
+    """Qwen-Image-2.1. One T2I master; side/back/costume edit from master.png."""
+    from anime_factory.qwen_image_21 import (
+        MasterReferenceError,
+        edit_qwen_image_21,
+        generate_qwen_image_21,
+    )
+
+    spec = still_payload_to_prompt(payload)
+    kind = str(spec.get("kind") or "")
+    view = str(payload.get("_view") or payload.get("view") or "").strip().lower()
+    master_path = str(payload.get("_master_path") or "")
+    parent = payload.get("_parent_png")
+    if kind in REFERENCE_REQUIRED_KINDS:
+        if view == "side":
+            from anime_factory.qwen_image_21 import assert_side_master_reference
+
+            assert_side_master_reference(master_path)
+        elif not str(master_path).replace("\\", "/").endswith("master.png"):
+            raise MasterReferenceError(
+                f"{kind} requires master.png reference, got {master_path!r}"
+            )
+        if not isinstance(parent, (bytes, bytearray)) or not parent:
+            raise MasterReferenceError(
+                f"{kind} requires master.png reference bytes"
+            )
+        return edit_qwen_image_21(
+            spec["prompt"],
+            [bytes(parent)],
+            spec["width"],
+            spec["height"],
+            negative_prompt=str(spec["negative"] or ""),
+            seed=spec["seed"],
+            master_path=master_path,
+            view=view or None,
+        )
+    return generate_qwen_image_21(
+        spec["prompt"],
+        spec["width"],
+        spec["height"],
+        negative_prompt=str(spec["negative"] or ""),
+        seed=spec["seed"],
+    )
+
+
 def _klein_still(payload: dict) -> bytes:
     """FLUX.2 Klein 4B. SkyReels boxes have no Comfy and no kolors_t2i workflow."""
     from anime_factory.flux2_klein import edit_klein_refs, generate_klein_t2i
@@ -369,7 +414,10 @@ def generate_still(payload: dict, router=None) -> bytes:
             raise RuntimeError("scene plate must not bind a parent image (reference-image bleed)")
     width, height = parse_size(payload.get("image_size"))
     image_backend = (os.environ.get("IMAGE_BACKEND") or "").strip().lower()
-    if image_backend == "flux2_klein4b":
+    # Unset IMAGE_BACKEND is the production Qwen-Image-2.1 path.
+    if image_backend in {"", "qwen_image_21"}:
+        blob = _qwen_still(payload)
+    elif image_backend == "flux2_klein4b":
         blob = _klein_still(payload)
     else:
         if router is None:

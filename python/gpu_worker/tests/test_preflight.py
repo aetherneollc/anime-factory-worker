@@ -134,7 +134,7 @@ def test_select_profile_id_respects_video_backend(monkeypatch):
     monkeypatch.delenv("AF_VIDEO_BACKEND", raising=False)
     monkeypatch.delenv("VIDEO_BACKEND", raising=False)
     monkeypatch.delenv("AF_IMAGE_CAPABILITY", raising=False)
-    assert select_profile_id() == "sr3-cu128-sm120"
+    assert select_profile_id() == "h3-comfy-cu130-sm120"
     monkeypatch.setenv("AF_VIDEO_BACKEND", "longlive")
     assert select_profile_id() == "longlive-nvfp4-sm120"
     monkeypatch.setenv("AF_VIDEO_BACKEND", "h3")

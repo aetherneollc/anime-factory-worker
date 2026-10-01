@@ -3912,6 +3912,9 @@ def run_gpu_episode(
     else:
         if progress:
             progress("weights:h3_join")
+        from anime_factory.qwen_image_21 import release_qwen_image_21_vram
+
+        release_qwen_image_21_vram()
         join_h3_weights()
         ensure_h3_dits_for_shots(_board_shots(root))
         unload_still_models(router)

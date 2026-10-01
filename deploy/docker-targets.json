@@ -13,6 +13,7 @@
         "deploy/gpu-worker/Dockerfile",
         "deploy/gpu-worker/start.sh",
         "deploy/gpu-worker/moss_sfx_runner.py",
+        "python/",
         "workflows",
         "schema",
         "config"

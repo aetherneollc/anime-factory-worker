@@ -1,8 +1,8 @@
-"""Production video generate backend: SkyReels V3 R2V only.
+"""Production video generate backend: MiniMax H3.
 
-H3 and LongLive live in ``anime_factory.legacy_backends`` and are not registered
-here. A missing reference pack is a refusal; ``keyframe_final`` is never used
-as a substitute image.
+SkyReels stays importable for the frozen sr3 image. It is not a production
+enum. LongLive is not registered. A missing reference pack is a refusal;
+``keyframe_final`` is never used as a substitute image.
 """
 
 from __future__ import annotations
@@ -20,8 +20,9 @@ from anime_factory.contracts import (
     ref_pack_from_keyframe,
 )
 
-PLUGGABLE_VIDEO_BACKENDS = ("skyreels_v3_r2v",)
-DEFAULT_PLUGGABLE_VIDEO_BACKEND = "skyreels_v3_r2v"
+PLUGGABLE_VIDEO_BACKENDS = ("h3",)
+DEFAULT_PLUGGABLE_VIDEO_BACKEND = "h3"
+H3_ALIASES = frozenset({"h3", "wan", "minimax", "minimax-h3", "minimaxh3"})
 SKYREELS_ALIASES = frozenset(
     {
         "skyreels_v3_r2v",
@@ -87,7 +88,7 @@ class VideoGenerateBackend(ABC):
 
 
 def select_pluggable_video_backend(env: Mapping[str, str] | None = None) -> str:
-    """VIDEO_BACKEND → AF_VIDEO_BACKEND → skyreels_v3_r2v."""
+    """VIDEO_BACKEND → production select (H3)."""
     mapping = env if env is not None else os.environ
     raw = str(mapping.get("VIDEO_BACKEND") or "").strip().lower().replace(" ", "")
     if raw:
@@ -100,8 +101,8 @@ def select_pluggable_video_backend(env: Mapping[str, str] | None = None) -> str:
 def normalize_pluggable_video_backend(value: Any) -> str:
     raw = str(value or "").strip().lower().replace(" ", "")
     folded = raw.replace("-", "_")
-    if folded in SKYREELS_ALIASES or folded.startswith("skyreels") or folded == "r2v":
-        return "skyreels_v3_r2v"
+    if not raw or raw in H3_ALIASES or folded in H3_ALIASES:
+        return "h3"
     from anime_factory.video_backend import normalize_video_backend
 
     return normalize_video_backend(raw)
@@ -190,8 +191,32 @@ def gated_video_generate(
     return impl.generate(request)
 
 
+class H3VideoGenerateBackend(VideoGenerateBackend):
+    """Production H3 wrapper. Real sampling stays in gpu_worker.h3."""
+
+    name = "h3"
+
+    def generate(self, request: VideoGenerateRequest) -> VideoGenerateResult:
+        from anime_factory.qwen_image_21 import release_qwen_image_21_vram
+
+        release_qwen_image_21_vram()
+        refs = [str(item) for item in (request.ref_images or request.references or [])]
+        return VideoGenerateResult(
+            path=str(request.meta.get("out_path") or f"video/{request.shot_id}.mp4"),
+            backend=self.name,
+            status="pending",
+            meta={
+                "delegated": "gpu_worker.h3",
+                **dict(request.meta),
+                "references": refs,
+                "ref_images": refs,
+                "duration": float(request.duration or request.duration_s or 8),
+            },
+        )
+
+
 _BACKENDS: dict[str, type[VideoGenerateBackend]] = {
-    "skyreels_v3_r2v": SkyReelsV3R2VBackend,
+    "h3": H3VideoGenerateBackend,
 }
 
 

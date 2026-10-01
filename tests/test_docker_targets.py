@@ -41,16 +41,17 @@ def test_docker_yml_is_valid_and_wires_force_all():
         assert doc["jobs"]["matrix"]["outputs"]["targets"]
 
 
-def test_h3_and_longlive_do_not_watch_python():
+def test_h3_watches_python_longlive_stays_disabled():
     by_id = {t["id"]: t for t in _targets()}
     assert "hy" not in by_id
     assert by_id["sr3"]["enabled"] is True
     assert "python/" in by_id["sr3"]["watch_paths"]
     assert by_id["longlive"]["enabled"] is False
     assert by_id["h3"]["enabled"] is True
-    for frozen in ("h3", "longlive"):
-        paths = by_id[frozen]["watch_paths"]
-        assert not any(str(p).startswith("python") for p in paths)
+    assert "python/" in by_id["h3"]["watch_paths"]
+    assert "deploy/gpu-worker/Dockerfile" in by_id["h3"]["watch_paths"]
+    longlive_paths = by_id["longlive"]["watch_paths"]
+    assert not any(str(p).startswith("python") for p in longlive_paths)
 
 
 def test_force_all_and_zero_before_select_every_enabled_target():

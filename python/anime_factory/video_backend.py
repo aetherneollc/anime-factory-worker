@@ -1,6 +1,7 @@
-"""Production video line: SkyReels V3 R2V only.
+"""Production video line: MiniMax H3.
 
-``normalize_video_backend`` and ``select_video_backend`` reject H3 and LongLive.
+``normalize_video_backend`` and ``select_video_backend`` select H3 (native
+duration up to about 8 seconds). SkyReels and LongLive are refused.
 Frozen worker images still lock their own line through
 ``normalize_legacy_video_backend`` inside ``lock_video_backend``.
 """
@@ -19,8 +20,8 @@ from anime_factory.models import (
     SKYREELS_MAX_SECONDS,
 )
 
-VIDEO_BACKENDS = ("skyreels_v3_r2v",)
-DEFAULT_VIDEO_BACKEND = "skyreels_v3_r2v"
+VIDEO_BACKENDS = ("h3",)
+DEFAULT_VIDEO_BACKEND = "h3"
 # Image-capability labels the worker lock still understands. Not production enums.
 _WORKER_IMAGE_LINES = frozenset({"h3", "longlive", "skyreels_v3_r2v"})
 FACTORY_JSON_NAME = "factory.json"
@@ -65,9 +66,9 @@ def _is_skyreels(raw: str) -> bool:
 
 
 def normalize_video_backend(value: Any) -> str:
-    """Production normalize. Empty selects SkyReels. H3 and LongLive are refused."""
+    """Production normalize. Empty selects H3. SkyReels and LongLive are refused."""
     raw = str(value or "").strip().lower().replace(" ", "")
-    if not raw or _is_skyreels(raw):
+    if not raw or raw in H3_ALIASES:
         return DEFAULT_VIDEO_BACKEND
     raise ProductionBackendError(
         f"production VIDEO_BACKEND rejects {raw!r}; allowed {VIDEO_BACKENDS}"
@@ -189,7 +190,7 @@ def select_video_backend(
     root: Path | None = None,
     env: Mapping[str, str] | None = None,
 ) -> str:
-    """Production selection. Unset env is SkyReels. H3 and LongLive raise."""
+    """Production selection. Unset env is H3. SkyReels and LongLive raise."""
     mapping = env if env is not None else os.environ
     explicit = _first_explicit_backend(segment, root, mapping)
     if explicit:
@@ -227,8 +228,8 @@ def lock_video_backend(
         if requested is not None and str(requested).strip()
         else select_legacy_video_backend(root=root, env=mapping)
     )
-    # No explicit request: a frozen H3/LongLive image keeps its line.
-    # Otherwise the default is SkyReels V3 R2V.
+    # No explicit request: a frozen image keeps its own line.
+    # Otherwise the production default is MiniMax H3.
     env_set = str(mapping.get("AF_VIDEO_BACKEND") or "").strip()
     factory = read_factory_backend(root)
     image_cap = image_video_capability(mapping)

@@ -732,6 +732,15 @@ def identity_attribute_probes(identity: str, *, view: str = "front") -> list[dic
             pos = f"{pants_color} pants"
             neg = "black pants, white pants"
         probes.append({"id": "pants", "pos": pos, "neg": neg})
+    shoes_color = garments.get("shoes") or garments.get("boots") or garments.get("sneakers")
+    if shoes_color:
+        probes.append(
+            {
+                "id": "shoes",
+                "pos": f"{shoes_color} shoes",
+                "neg": "bare feet, mismatched footwear",
+            }
+        )
     if view != "back" and "short" in low and "hair" in low:
         hair_pos = "short black hair, bangs" if "black hair" in low else "short hair, bangs"
         probes.append({"id": "hair", "pos": hair_pos, "neg": "long hair, blonde hair"})

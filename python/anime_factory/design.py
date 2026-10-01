@@ -1,11 +1,12 @@
 """Stills assets. Scene plates MUST NOT send image / reference_images.
 
-Identity is ONE four-view turnaround (`sheet_turnaround.png`), not three
-independent rolls. `sheet_front.png` is a copy alias for old lookups.
+Identity is one 16:9 sheet (`master.png`): left bust as the face anchor,
+front/side/back on the right, detail strip below. Side, back, and costume
+views are reference edits of that master, not a second text-to-image.
 Locked seed + assets/index.json selected pointer. Character sheets default to
-HunyuanImage (CHARACTER_STILL_BACKEND=hunyuan; TokenHub interim, GPU self-host
-target). Scene plates / keyframes stay on GPU Kolors. Kolors remains character
-rollback. TTS never uses Vast.
+local Qwen-Image-2.1 (CHARACTER_STILL_BACKEND=qwen). Unset does not fall
+through to Hunyuan. DashScope qwen-image-2.0-pro is not the production path.
+Scene plates stay empty of people. Kolors remains a character rollback.
 
 Every blob that reaches disk goes through `assert_still_blob`: PNG magic, the
 requested pixel size, and `MIN_STILL_BYTES`. The 3-byte `f1.png` files on disk
@@ -179,21 +180,30 @@ HUNYUAN_CHARACTER_FRAMING = QWEN_CHARACTER_FRAMING
 HUNYUAN_CHARACTER_CROP_LOCK = QWEN_CHARACTER_CROP_LOCK
 HUNYUAN_CHARACTER_NEGATIVE = QWEN_CHARACTER_NEGATIVE + ", nude, bare legs, missing pants"
 ESTABLISHING_PLATE_LOOK = (
-    "anime location background, wide establishing shot, no characters, "
+    "anime location background, wide establishing shot, empty of people, no characters, "
     "foreground, midground, background, architectural perspective, "
     "clear luminous atmosphere, layered clouds, volumetric light, "
     "atmospheric perspective, saturated blue and gold light"
 )
 DETAIL_PLATE_LOOK = (
-    "anime location background, empty location shot, no characters, "
+    "anime location background, empty location shot, empty of people, no characters, "
     "hand-painted background, volumetric light, atmospheric perspective, "
     "saturated blue and gold light"
 )
 # Default for callers that still reference PLATE_LOOK; prefer plate_look_for().
 PLATE_LOOK = ESTABLISHING_PLATE_LOOK
 PLATE_NEGATIVE = "famous movie still, people, crowd, text, ceramic plate, dish, dinnerware, bowl"
-PROP_LOOK = "prop design sheet, product turnaround, plain studio background"
-PROP_NEGATIVE = "cinematic still, scenery background, people, text"
+PROP_LOOK = (
+    "prop design sheet, product turnaround, plain white background, no hands, "
+    "include a scale reference"
+)
+PROP_NEGATIVE = "cinematic still, scenery background, people, hands, text"
+SHEET_IMAGE_SIZE = "1344x768"
+SHEET_LAYOUT = (
+    "16:9 character design sheet, left about 34 percent is a bust portrait used as the face anchor, "
+    "right side shows front view, side view, and back view of the same character, "
+    "detail strip along the bottom, one consistent outfit"
+)
 IDENTITY_PROMPT_MAX_CHARS = 1000
 DERIVE_FACE_LOCK = "keep the same face body and hairline as the parent sheet, do not redesign identity"
 _STANDALONE_PLATE_RE = re.compile(r"(?<![\w-])\bplate\b(?![\w-])", re.I)
@@ -511,6 +521,60 @@ def validate_character_identity(
     return raw[:IDENTITY_PROMPT_MAX_CHARS]
 
 
+APPEARANCE_LOCK_SLOTS = ("hair", "top", "pants", "shoes")
+_TOP_GARMENTS = frozenset(
+    {"jacket", "coat", "hoodie", "shirt", "blouse", "sweater", "raincoat", "vest", "dress", "uniform", "robe"}
+)
+_PANTS_GARMENTS = frozenset({"pants", "trousers"})
+_SHOE_GARMENTS = frozenset({"shoes", "boots", "sneakers"})
+_HAIR_PHRASE_RE = re.compile(
+    r"\b((?:short|long|messy|wavy|straight|black|brown|blonde|blond|silver|red|dark|white)\s+){1,3}hair\b",
+    re.I,
+)
+
+
+def appearance_lock_tokens(identity: str | None) -> dict[str, str]:
+    """Hair, top, pants, and shoes phrases. Missing slots stay empty strings."""
+    text = str(identity or "")
+    hair_hit = _HAIR_PHRASE_RE.search(text)
+    tokens = {"hair": hair_hit.group(0).strip() if hair_hit else "", "top": "", "pants": "", "shoes": ""}
+    for match in _CLOTHING_COLOR_RE.finditer(text):
+        phrase = f"{match.group(1)} {match.group(2)}".strip()
+        garment = match.group(2).lower()
+        if garment in _SHOE_GARMENTS and not tokens["shoes"]:
+            tokens["shoes"] = phrase
+        elif garment in _PANTS_GARMENTS and not tokens["pants"]:
+            tokens["pants"] = phrase
+        elif garment in _TOP_GARMENTS and not tokens["top"]:
+            tokens["top"] = phrase
+    return tokens
+
+
+def appearance_lock_clause(identity: str | None) -> str:
+    tokens = appearance_lock_tokens(identity)
+    parts = [f"{slot}: {tokens[slot]}" for slot in APPEARANCE_LOCK_SLOTS if tokens.get(slot)]
+    body = ", ".join(parts)
+    tail = "keep the same pants, keep the same shoes"
+    return f"appearance lock, {body}, {tail}" if body else f"appearance lock, {tail}"
+
+
+def apply_appearance_lock(prompt: str, lock: dict[str, str] | None) -> str:
+    """Put pants and shoes back if a QC retry dropped them. The lock itself does not change."""
+    text = str(prompt or "").strip().strip(",")
+    tokens = lock or {}
+    extra: list[str] = []
+    for slot in APPEARANCE_LOCK_SLOTS:
+        phrase = str(tokens.get(slot) or "").strip()
+        if phrase and phrase.lower() not in text.lower():
+            extra.append(phrase)
+    tail = "keep the same pants, keep the same shoes"
+    if tail not in text.lower():
+        extra.append(tail)
+    if not extra:
+        return text
+    return f"{text}, {', '.join(extra)}" if text else ", ".join(extra)
+
+
 def identity_conditioned_negative(identity: str | None) -> str:
     """CFG negatives that depend on the locked identity. Hoodie identities must not ban hoodie."""
     text = str(identity or "").lower()
@@ -623,10 +687,15 @@ def style_prompt(
     head = scrub_copycat(prefix if prefix is not None else style_prefix_for_kind(kind))
     char_backend = _character_backend_for_kind(kind)
     kolors_character = char_backend == "kolors"
-    open_character = char_backend in {"qwen", "hunyuan"}
-    if open_character:
-        framing = HUNYUAN_CHARACTER_FRAMING if char_backend == "hunyuan" else QWEN_CHARACTER_FRAMING
-        crop_lock = HUNYUAN_CHARACTER_CROP_LOCK if char_backend == "hunyuan" else QWEN_CHARACTER_CROP_LOCK
+    if char_backend == "qwen":
+        from anime_factory.models import SHINKAI_RENDER
+
+        if SHINKAI_RENDER.lower() not in (head or "").lower():
+            head = f"{STYLE_PREFIX_CHARACTER}, {head}" if head else STYLE_PREFIX_CHARACTER
+        if str(kind or "") == "character_sheet" and "16:9 character design sheet" not in (head or "").lower():
+            head = f"{head}, {SHEET_LAYOUT}"
+    elif char_backend == "hunyuan":
+        framing = HUNYUAN_CHARACTER_FRAMING
         if not head or head == STYLE_PREFIX_CHARACTER or head.startswith("original anime character design"):
             head = framing
         elif "full body shot" not in head.lower():
@@ -644,9 +713,9 @@ def style_prompt(
         composed = f"{body}{extra}"
     else:
         composed = f"{head}, {body}{extra}"
-    if open_character:
-        if crop_lock not in composed:
-            composed = f"{composed}, {crop_lock}"
+    if char_backend == "hunyuan":
+        if HUNYUAN_CHARACTER_CROP_LOCK not in composed:
+            composed = f"{composed}, {HUNYUAN_CHARACTER_CROP_LOCK}"
     elif char_backend == "animagine" or (char_backend is None and still_backend() == "animagine"):
         tail = animagine_quality_suffix(kind, gender_tag=gender_tag)
         if tail.lower() not in composed.lower():
@@ -674,7 +743,10 @@ def style_negative(
         terms = [HUNYUAN_CHARACTER_NEGATIVE, extra_text, base_text, *period]
         return ", ".join(term for term in terms if term)
     if char_backend == "qwen":
-        terms = [QWEN_CHARACTER_NEGATIVE, extra_text, base_text, *period]
+        from anime_factory.models import SHINKAI_NEGATIVE
+
+        sunset = "sunset color cast" if str(kind or "") in _CHARACTER_STILL_KINDS else ""
+        terms = [SHINKAI_NEGATIVE, sunset, QWEN_CHARACTER_NEGATIVE, extra_text, base_text, *period]
         return ", ".join(term for term in terms if term)
     if char_backend == "kolors":
         terms = [KOLORS_CHARACTER_NEGATIVE_LEAD, extra_text, base_text, *period]
@@ -932,13 +1004,20 @@ class KolorsClient:
             width, height = parse_image_size(payload.get("image_size"), default=(CHAR_VIEW_WIDTH, CHAR_VIEW_HEIGHT))
             label = str(payload.get("_label") or kind or "still")
             return self._generate_hunyuan_character(clean, width, height, label)
-        # Qwen character path is T2I (no IP-Adapter). Drop parent refs before routing.
+        # Local Qwen-Image-2.1. The master is one T2I. Derives edit master.png.
         if char_backend == "qwen":
-            clean = {k: v for k, v in payload.items() if k not in {"image", "reference_images", "_parent_png"}}
-            clean["model"] = qwen_image_model()
-            self.last_payloads.append(clean)
+            from anime_factory.models import QWEN_IMAGE_21_MODEL_ID
+
+            clean = {k: v for k, v in payload.items() if k not in {"image", "reference_images"}}
+            clean["model"] = QWEN_IMAGE_21_MODEL_ID
+            if kind == "character_sheet":
+                clean.pop("_parent_png", None)
+            self.last_payloads.append({k: v for k, v in clean.items() if k != "_parent_png"})
             Counters.kolors_requests += 1
-            width, height = parse_image_size(payload.get("image_size"), default=(CHAR_VIEW_WIDTH, CHAR_VIEW_HEIGHT))
+            width, height = parse_image_size(
+                payload.get("image_size"),
+                default=(1344, 768) if kind == "character_sheet" else (CHAR_VIEW_WIDTH, CHAR_VIEW_HEIGHT),
+            )
             label = str(payload.get("_label") or kind or "still")
             return self._generate_qwen_character(clean, width, height, label)
         if parent_png and kind not in {"scene_plate", "scene_derive"}:
@@ -1034,37 +1113,53 @@ class KolorsClient:
         return self._checked(blob, width, height, label)
 
     def _generate_qwen_character(self, payload: dict, width: int, height: int, label: str) -> bytes:
-        from anime_factory.qwen_image import generate_qwen_image
+        from anime_factory.models import QWEN_IMAGE_21_MODEL_ID
+        from anime_factory.qwen_image_21 import (
+            QwenImage21Error,
+            edit_qwen_image_21,
+            generate_qwen_image_21,
+        )
 
         attempt = dict(payload)
-        attempt["model"] = qwen_image_model()
+        attempt["model"] = QWEN_IMAGE_21_MODEL_ID
         attempt["image_size"] = f"{width}x{height}"
-        if self.opener:
-            try:
-                blob = generate_qwen_image(
-                    prompt=str(payload.get("prompt") or ""),
-                    negative_prompt=str(payload.get("negative_prompt") or ""),
-                    image_size=attempt["image_size"],
-                    seed=payload.get("seed"),
-                    opener=self.opener,
-                )
-            except QwenImageError:
-                blob = self._offline_still(attempt, width, height)
-            return self._checked(blob, width, height, label)
-        if not self.live:
-            return self._checked(self._offline_still(attempt, width, height), width, height, label)
-        self._throttle()
+        kind = str(payload.get("_kind") or "")
+        view = str(payload.get("_view") or payload.get("view") or "")
+        master_path = str(payload.get("_master_path") or "")
+        parent = payload.get("_parent_png")
+        derive = kind in {"character_view_derive", "costume_derive"} and isinstance(parent, (bytes, bytearray)) and parent
+        dry = True if not self.live else None
         try:
-            blob = generate_qwen_image(
-                prompt=str(payload.get("prompt") or ""),
-                negative_prompt=str(payload.get("negative_prompt") or ""),
-                image_size=attempt["image_size"],
-                seed=payload.get("seed"),
-            )
-        except QwenImageError as exc:
-            self._last_call = time.time()
-            raise KolorsPayloadError(str(exc)) from exc
-        self._last_call = time.time()
+            if derive:
+                blob = edit_qwen_image_21(
+                    str(payload.get("prompt") or ""),
+                    [bytes(parent)],
+                    width,
+                    height,
+                    negative_prompt=str(payload.get("negative_prompt") or ""),
+                    seed=payload.get("seed"),
+                    dry_run=dry,
+                    master_path=master_path,
+                    view=view or None,
+                )
+            else:
+                blob = generate_qwen_image_21(
+                    str(payload.get("prompt") or ""),
+                    width,
+                    height,
+                    negative_prompt=str(payload.get("negative_prompt") or ""),
+                    seed=payload.get("seed"),
+                    dry_run=dry,
+                )
+        except QwenImage21Error as exc:
+            if not self.live:
+                blob = self._offline_still(attempt, width, height)
+            else:
+                self._last_call = time.time()
+                raise KolorsPayloadError(str(exc)) from exc
+        else:
+            if self.live:
+                self._last_call = time.time()
         return self._checked(blob, width, height, label)
 
     def _offline_still(self, payload: dict, width: int, height: int) -> bytes:
@@ -1624,6 +1719,9 @@ def plan_library_specs(
         )
         gender_tag = _gender_tag_from_fields(identity, char.get("gender"))
         seed = char.get("seed") if char.get("seed") is not None else locked_seed(cid)
+        lock_tokens = appearance_lock_tokens(identity)
+        lock_clause = appearance_lock_clause(identity)
+        master_rel = f"assets/characters/{cid}/master.png"
         aid = locked_character_relpath(cid)
         specs[aid] = {
             "id": aid,
@@ -1631,10 +1729,12 @@ def plan_library_specs(
             "view": "front",
             "character_id": cid,
             "path": character_asset_rel(cid, FRONT_ALIAS_FILENAME),
-            "prompt": f"{identity}, {FRONT_LOOK}{extra}",
+            "master_path": master_rel,
+            "prompt": f"{identity}, {SHEET_LAYOUT}, {lock_clause}{extra}",
+            "appearance_lock": lock_tokens,
             "gender_tag": gender_tag,
             "seed": int(seed),
-            "image_size": CHAR_IMAGE_SIZE,
+            "image_size": SHEET_IMAGE_SIZE,
             "parent_id": char.get("parent_id"),
         }
         for view, filename, look, seed_offset in (
@@ -1649,7 +1749,9 @@ def plan_library_specs(
                 "view": view,
                 "character_id": cid,
                 "path": character_asset_rel(cid, filename),
-                "prompt": f"{identity}, {look}{lock}{extra}",
+                "master_path": master_rel,
+                "prompt": f"{identity}, {look}{lock}, {lock_clause}, derive from master.png{extra}",
+                "appearance_lock": dict(lock_tokens),
                 "gender_tag": gender_tag,
                 "seed": int(seed) + seed_offset,
                 "image_size": CHAR_IMAGE_SIZE,
@@ -2121,7 +2223,15 @@ def _render_until_qc(
         seed = attempt_seed(spec, salt)
         work["seed"] = seed
         if char_master:
-            # Escalating tall canvases; fit back to CHAR_* delivery before QC/lock.
+            # QC retries keep the same pants and shoes. They do not roll a new wardrobe.
+            lock = work.get("appearance_lock")
+            if not isinstance(lock, dict):
+                lock = appearance_lock_tokens(str(work.get("prompt") or ""))
+            work["appearance_lock"] = lock
+            work["prompt"] = apply_appearance_lock(str(work.get("prompt") or ""), lock)
+        if char_master and character_still_backend() != "qwen":
+            # Kolors/Hunyuan: escalating tall canvases, then fit back to CHAR_*.
+            # Qwen keeps the spec size (16:9 master sheet, portrait derives).
             work["image_size"] = character_canvas_for_attempt(attempt_index)
         rel = str(work.get("path") or "")
         if story_root is not None:
@@ -2211,7 +2321,7 @@ def _render_until_qc(
         if qc.passed:
             spec["path"] = rel
             spec["seed"] = seed
-            if char_master:
+            if char_master and character_still_backend() != "qwen":
                 spec["image_size"] = CHAR_IMAGE_SIZE
             return png, qc, rel
         if kind == "character_turnaround":
@@ -2269,6 +2379,13 @@ def _render_spec(
     }
     if seed is not None:
         payload["seed"] = seed
+    payload["_view"] = str(spec.get("view") or "")
+    payload["_master_path"] = str(spec.get("master_path") or "")
+    if kind == "character_view_derive" and str(spec.get("view") or "").strip().lower() == "side":
+        from anime_factory.qwen_image_21 import assert_side_master_reference
+
+        if character_still_backend() == "qwen":
+            assert_side_master_reference(payload["_master_path"])
     if parent_png:
         payload["_parent_png"] = parent_png
         payload["_parent_id"] = str(spec.get("parent_id") or "")

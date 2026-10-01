@@ -12,15 +12,17 @@ QC_MODEL = "Qwen/Qwen3.5-4B"
 IMAGE_MODEL = "cagliostrolab/animagine-xl-4.0"
 IMAGE_CKPT = "animagine-xl-4.0.safetensors"
 # GPU stills: scene plates / keyframes stay on Kwai Kolors (backup for characters too).
-# Character sheets default to HunyuanImage (commercial open-weight family; TokenHub interim,
-# self-host on leased GPU is the target). Qwen open-weight 2.1 is research-licensed — not default.
+# Character sheets default to local Qwen-Image-2.1 (see qwen_image_21.py).
+# DashScope qwen-image-2.0-pro is not the production path.
 # Kolors is not an SDXL checkpoint: ChatGLM3 encodes text, so it cannot reuse anime_t2i.
 STILL_BACKENDS = ("kolors", "animagine")
 DEFAULT_STILL_BACKEND = "kolors"
 CHARACTER_STILL_BACKENDS = ("hunyuan", "qwen", "kolors", "animagine")
-DEFAULT_CHARACTER_STILL_BACKEND = "hunyuan"
+DEFAULT_CHARACTER_STILL_BACKEND = "qwen"
 HUNYUAN_IMAGE_MODEL = "hy-image-v3"
+# Hosted DashScope id. Production stills do not call this model.
 QWEN_IMAGE_MODEL = "qwen-image-2.0-pro"
+QWEN_IMAGE_21_MODEL_ID = "Qwen/Qwen-Image-2.1"
 DASHSCOPE_MULTIMODAL_URL = (
     "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
 )
@@ -65,11 +67,13 @@ ROLE_MODELS = {
     ROLE_QC: QC_MODEL,
 }
 
-DEFAULT_STYLE_PRESET = "cinematic"
+SHINKAI_PRESET = "shinkai"
+DEFAULT_STYLE_PRESET = SHINKAI_PRESET
 LUMINOUS_CINEMATIC_ANIME_PRESET = "luminous-cinematic-anime"
 STYLE_PRESET_ALIASES = {
-    DEFAULT_STYLE_PRESET: DEFAULT_STYLE_PRESET,
-    "default": DEFAULT_STYLE_PRESET,
+    SHINKAI_PRESET: SHINKAI_PRESET,
+    "default": SHINKAI_PRESET,
+    "cinematic": SHINKAI_PRESET,
     LUMINOUS_CINEMATIC_ANIME_PRESET: LUMINOUS_CINEMATIC_ANIME_PRESET,
     "luminous": LUMINOUS_CINEMATIC_ANIME_PRESET,
 }
@@ -79,12 +83,29 @@ SCHEMA_VERSION = "v1"
 CHUNKING_VERSION = "v3"
 VECTOR_SCHEMA_VERSION = "v1"
 
-# Spec 1.2 — per-asset-kind affirmative prefixes. Diffusion cannot process negation;
-# everything we do not want lives in FIXED_NEGATIVE, which SDXL CFG applies.
-# Character sheets must not inherit cinematic / detailed-background wording.
-# Default location/keyframe look is luminous cinematic anime (Shinkai-like light and sky)
-# described in paint terms. Director names and film titles stay out of the positive
-# prompt; Animagine copies those famous stills instead of this story's places.
+# Production style is one shinkai block (render / surface / lighting / negative / tags).
+# Characters, scenes, and shot prompts share render, surface, and tags.
+# Character sheets use even soft light. Scenes and shots may use strong backlight.
+# Do not name a film or ask to copy a still. Do not mix a ghibli or realistic block in.
+SHINKAI_RENDER = (
+    "Shinkai-like animated film frame, detailed painted backgrounds, "
+    "cel-shaded characters, painterly background"
+)
+SHINKAI_SURFACE = (
+    "clean skin, clear pupil highlights, hair with volume, "
+    "clothing with a soft sheen, illustrated fabric"
+)
+SHINKAI_LIGHTING_SCENE = (
+    "volumetric light, lens flare, clear sky after dusk or rain, "
+    "distant atmospheric perspective, strong backlight"
+)
+SHINKAI_LIGHTING_CHARACTER = "even soft light, neutral color temperature"
+SHINKAI_TAGS = "original story-specific animated film frame"
+SHINKAI_NEGATIVE = (
+    "photorealistic, 3d render, plastic skin, photographic fabric, flat ghibli, "
+    "western cartoon, watermark, text, famous movie still, copy a still"
+)
+# Kept for an explicit non-production luminous preset. Not the shinkai block.
 STYLE_PREFIX_LOCATION_LUMINOUS = (
     "original anime production still for this story, anime production still, cel shaded, "
     "clean lineart, flat shading, 2d anime illustration, clear luminous atmosphere, "
@@ -95,13 +116,21 @@ STYLE_PREFIX_LOCATION_LUMINOUS = (
     "detailed everyday urban and natural backgrounds, atmospheric perspective, cinematic depth, "
     "cinematic composition, story-specific props and locations from the bible, natural living skin tone"
 )
-STYLE_PREFIX_LOCATION = STYLE_PREFIX_LOCATION_LUMINOUS
-STYLE_PREFIX_CHARACTER = (
+def shinkai_positive(*, lighting: str) -> str:
+    """One shinkai block. Lighting is the only clause that changes by asset kind."""
+    light = SHINKAI_LIGHTING_CHARACTER if lighting == "character" else SHINKAI_LIGHTING_SCENE
+    return ", ".join((SHINKAI_RENDER, SHINKAI_SURFACE, light, SHINKAI_TAGS))
+
+
+STYLE_PREFIX_LOCATION = shinkai_positive(lighting="scene")
+STYLE_PREFIX_CHARACTER = shinkai_positive(lighting="character")
+# Shot prompts use the same scene block as plates.
+STYLE_PREFIX = STYLE_PREFIX_LOCATION
+# Explicit luminous preset still uses the older character sheet wording.
+LUMINOUS_STYLE_PREFIX_CHARACTER = (
     "original anime character design, solo, cel shaded, clean lineart, "
     "warm ivory studio background"
 )
-# Backward-compatible default for location/keyframe paths.
-STYLE_PREFIX = STYLE_PREFIX_LOCATION
 
 ANIMAGINE_QUALITY_TAGS = ("masterpiece", "high score", "great score", "absurdres", "safe")
 
@@ -114,6 +143,7 @@ FIXED_NEGATIVE = (
     "movie screenshot, famous movie still, screenshot, famous still composition, "
     "copycat composition, exaggerated moe eyes, "
     "ceramic plate, dish, dinnerware, bowl, "
+    "plastic skin, photographic fabric, flat ghibli, "
     "nude, nsfw, "
     "ghost film, horror lighting, corpse-pale skin, wet gloomy face, empty horror corridor, "
     "undead eyes, found footage, dead white skin, haunted hallway"
@@ -143,10 +173,13 @@ def still_backend() -> str:
 
 
 def character_still_backend() -> str:
-    """Backend for character_sheet / view_derive / costume_derive. Default: hunyuan."""
-    raw = (
-        os.environ.get("CHARACTER_STILL_BACKEND") or DEFAULT_CHARACTER_STILL_BACKEND
-    ).strip().lower()
+    """Backend for character_sheet / view_derive / costume_derive. Default: qwen.
+
+    Unset or blank never falls through to hunyuan.
+    """
+    raw = (os.environ.get("CHARACTER_STILL_BACKEND") or "").strip().lower()
+    if not raw:
+        raw = DEFAULT_CHARACTER_STILL_BACKEND
     if raw not in CHARACTER_STILL_BACKENDS:
         raise CharacterStillBackendError(
             f"CHARACTER_STILL_BACKEND must be one of {CHARACTER_STILL_BACKENDS}, got {raw!r}"
@@ -165,7 +198,8 @@ def hunyuan_image_model() -> str:
 
 
 def still_model_id() -> str:
-    return KOLORS_MODEL if still_backend() == "kolors" else IMAGE_MODEL
+    """Asset-index stamp. Production stills are Qwen-Image-2.1, not Kolors."""
+    return QWEN_IMAGE_21_MODEL_ID
 
 
 def still_workflow_name() -> str:
@@ -182,12 +216,15 @@ def normalize_style_preset(preset: str | None = None) -> str:
 
 
 def style_prefix_for_kind(kind: str | None, preset: str | None = None) -> str:
-    """Return the style prefix appropriate for a still asset kind."""
+    """Shinkai block for characters, scenes, and shots. Lighting follows the kind."""
     k = str(kind or "").strip().lower()
-    if k in {"character_sheet", "character_view_derive", "costume_derive"}:
-        return STYLE_PREFIX_CHARACTER
-    if k in {"scene_plate", "scene_derive", "keyframe"} and normalize_style_preset(preset) == LUMINOUS_CINEMATIC_ANIME_PRESET:
+    characterish = k in {"character_sheet", "character_view_derive", "costume_derive"}
+    if normalize_style_preset(preset) == LUMINOUS_CINEMATIC_ANIME_PRESET:
+        if characterish:
+            return LUMINOUS_STYLE_PREFIX_CHARACTER
         return STYLE_PREFIX_LOCATION_LUMINOUS
+    if characterish:
+        return STYLE_PREFIX_CHARACTER
     return STYLE_PREFIX_LOCATION
 
 
@@ -245,13 +282,13 @@ LONGLIVE_SHORT_MAX_SECONDS = 60.0
 LONGLIVE_SHORT_TARGET_SECONDS = 120.0
 LONGLIVE_SHORT_MIN_TAKES = 2
 LONGLIVE_SHORT_MAX_TAKES = 3
-VIDEO_BACKENDS = ("skyreels_v3_r2v",)
-DEFAULT_VIDEO_BACKEND = "skyreels_v3_r2v"
-# Production stills backend. Kolors is not selectable here.
-IMAGE_BACKENDS = ("flux2_klein4b",)
-DEFAULT_IMAGE_BACKEND = "flux2_klein4b"
-CONTROL_BACKENDS = ("flux2_klein_ref", "composite", "kolors_ipadapter", "none")
-DEFAULT_CONTROL_BACKEND = "flux2_klein_ref"
+VIDEO_BACKENDS = ("h3",)
+DEFAULT_VIDEO_BACKEND = "h3"
+# Production stills. Klein is not selectable here.
+IMAGE_BACKENDS = ("qwen_image_21",)
+DEFAULT_IMAGE_BACKEND = "qwen_image_21"
+CONTROL_BACKENDS = ("qwen_image_21_ref", "flux2_klein_ref", "composite", "kolors_ipadapter", "none")
+DEFAULT_CONTROL_BACKEND = "qwen_image_21_ref"
 H3_MAX_REFS = 9
 H3_MAX_RETRIES = 2
 STORY_KINDS = ("film", "series", "short")

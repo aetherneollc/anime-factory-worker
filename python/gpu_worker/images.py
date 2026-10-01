@@ -402,7 +402,7 @@ def default_profile_id() -> str:
     cap = (os.environ.get(IMAGE_CAPABILITY_ENV) or "").strip().lower()
     if cap in {"h3", "longlive", "skyreels_v3_r2v"}:
         return profile_for_video_backend(cap)
-    return "sr3-cu128-sm120"
+    return "h3-comfy-cu130-sm120"
 
 
 def resolve_capability_profile(profile_id: str | None = None) -> CapabilityProfile:

@@ -1355,7 +1355,7 @@ def _try_one_lease(stage_flags: dict[str, str]) -> dict[str, Any]:
 
     key = os.environ.get("VAST_API_KEY") or ""
     client = VastClient(api_key=key, dry_run=False)
-    lease_image = lease_image_for_backend("skyreels_v3_r2v")
+    lease_image = lease_image_for_backend("h3")
     caps = image_capabilities(lease_image)
     try:
         assert_lease_capabilities(caps)
@@ -1385,13 +1385,15 @@ def _try_one_lease(stage_flags: dict[str, str]) -> dict[str, Any]:
     env = {
         "CONTROL_PLANE_URL": os.environ.get("CONTROL_PLANE_URL") or "",
         "AF_STORY_ID": os.environ.get("AF_STORY_ID") or "",
-        "AF_START_COMFY": "0",
+        "AF_START_COMFY": "1",
         "ANIME_FACTORY_GPU_STILLS": "1",
-        "IMAGE_BACKEND": "flux2_klein4b",
-        "VIDEO_BACKEND": "skyreels_v3_r2v",
-        "AF_VIDEO_BACKEND": "skyreels_v3_r2v",
-        "AF_IMAGE_CAPABILITY": "skyreels_v3_r2v",
-        "AF_GPU_PROFILE": "sr3-cu128-sm120",
+        "IMAGE_BACKEND": "qwen_image_21",
+        "VIDEO_BACKEND": "h3",
+        "AF_VIDEO_BACKEND": "h3",
+        "AF_IMAGE_CAPABILITY": "h3",
+        "AF_GPU_PROFILE": "h3-comfy-cu130-sm120",
+        "CHARACTER_STILL_BACKEND": "qwen",
+        "STYLE_PRESET": "shinkai",
         "VAST_DRY_RUN": "0",
         "ANIME_FACTORY_LIVE_VAST": "1",
         "VAST_ALLOW_REPLACE": "0",

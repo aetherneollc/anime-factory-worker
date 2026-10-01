@@ -504,6 +504,9 @@ def prompt_pair(
     doing what, where, in what light, at what framing. `h3_prompt` keeps the
     Chinese/`@tag`/camera/H3_TAIL video script. They are no longer the same string.
     """
+    from anime_factory.models import style_prefix_for_kind
+
+    shot_style = style_prefix_for_kind("keyframe")
     scene_tag = _scene_tag(setting, plate_id)
     framing = SIZE_FRAMING.get(size, "medium shot")
     motion = _motion_text(camera)
@@ -515,9 +518,8 @@ def prompt_pair(
         )
     else:
         h3_body = (
-            f"{scene_tag} anime location background, wide establishing shot, "
-            f"clear luminous atmosphere, layered clouds, volumetric light, "
-            f"{framing}, {staging}, no extra people"
+            f"{shot_style}, {scene_tag} anime location background, wide establishing shot, "
+            f"empty of people, {framing}, {staging}"
         )
     zh_motion = str(motion_zh or "").strip()
     if zh_motion:
@@ -533,11 +535,14 @@ def prompt_pair(
         still_parts.append(setting)
         if not character_id:
             still_parts.append(
-                "anime location background, wide establishing shot, clear luminous atmosphere, "
-                "layered clouds, volumetric light, no people"
+                "anime location background, wide establishing shot, empty location, no people"
             )
     first = still_prompt_text(", ".join(part for part in still_parts if str(part).strip()))
+    if shot_style and shot_style not in first:
+        first = still_prompt_text(f"{shot_style}, {first}")
     h3 = scrub_copycat(f"{h3_body}, camera {camera}, {motion}, {H3_TAIL}")
+    if shot_style and shot_style not in h3:
+        h3 = scrub_copycat(f"{shot_style}, {h3}")
     return first, h3
 
 
