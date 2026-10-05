@@ -495,7 +495,7 @@ def compile_segment_v2(segment: dict[str, Any]) -> dict[str, Any]:
     out["h3_prompt"] = compile_picture_prompt(out)
     # Keep still prompt English-only from the first cut framing.
     head = cuts[0] if cuts else {}
-    still = _text(head.get("frame_prompt") or out.get("first_frame_prompt"))
+    still = _text(head.get("first_frame_prompt") or out.get("first_frame_prompt") or head.get("frame_prompt"))
     if still:
         out["first_frame_prompt"] = still
     out["text_policy"] = str(out.get("text_policy") or DEFAULT_TEXT_POLICY)

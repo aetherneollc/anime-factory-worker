@@ -191,7 +191,11 @@ def compose_cut_still_prompt(segment: dict, cut: dict, *, story_root: Path | Non
     props = [str(p).strip() for p in (cut.get("props") or segment.get("props") or []) if str(p).strip()]
     if props:
         parts.append("props: " + ", ".join(props))
-    pose = str(cut.get("frame_prompt") or cut.get("staging") or cut.get("pose") or "").strip()
+    # A cut's video framing may carry camera motion. Its still uses the
+    # explicit static description; only the head cut may inherit the segment's.
+    head_still = segment.get("first_frame_prompt") if int(cut.get("seq") or 1) == 1 else ""
+    pose = str(cut.get("first_frame_prompt") or head_still or cut.get("frame_prompt")
+               or cut.get("staging") or cut.get("pose") or "").strip()
     if pose:
         parts.append(pose)
     size = str(cut.get("size") or "MS").strip()

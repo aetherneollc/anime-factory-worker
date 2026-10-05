@@ -175,3 +175,22 @@ def test_board_refuses_shots_whose_still_prompt_is_the_video_script(monkeypatch)
     monkeypatch.setattr(board_mod, "director_board", leaky)
     with pytest.raises(StillPromptError):
         board_mod.board_from_script(draft, episode_code="E01", langs=["zh"])
+
+
+def test_cut_keyframes_preserve_static_descriptions_and_video_motion():
+    from anime_factory.h3_storyboard import compile_segment_v2
+    from anime_factory.keyframe import compose_cut_still_prompt
+    segment = dict(id="s003", duration=8, first_frame_prompt="young man holding a gift on a campus road",
+        cuts=[dict(seq=1, seconds=4, frame_prompt="Tracking Shot, young man walks on a campus road"),
+              dict(seq=2, seconds=4, frame_prompt="Dolly In, he opens the box",
+                   first_frame_prompt="close-up of a young man holding an open gift box")])
+    compiled = compile_segment_v2(segment)
+    assert compiled["first_frame_prompt"] == segment["first_frame_prompt"]
+    assert "Tracking Shot" in compiled["h3_prompt"]
+    assert "Dolly In" in compiled["h3_prompt"]
+    first, second = [compose_cut_still_prompt(compiled, c) for c in compiled["cuts"]]
+    assert_still_prompt_clean(first)
+    assert_still_prompt_clean(second)
+    assert "campus road" in first
+    assert "open gift box" in second
+    assert first != second
