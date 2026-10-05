@@ -171,3 +171,48 @@ def test_golden_fixture_parity_if_present():
     assert board["validation"]["ok"] is True
     prompt = compile_picture_prompt(board["segments"][0])
     assert data["expected_prompt_substr"] in prompt
+
+
+def test_resume_rejects_cross_shot_pass_and_unverified_completion(tmp_path):
+    import sqlite3
+    from anime_factory.db import migrate
+    from anime_factory.qc import mark_completed_passing
+    conn = sqlite3.connect(tmp_path / 'story.sqlite')
+    conn.row_factory = sqlite3.Row
+    migrate(conn)
+    for sid in ('s1', 's2'):
+        folder = tmp_path / 'shots' / sid
+        folder.mkdir(parents=True)
+        (folder / 'generation-001.mp4').write_bytes(b'x' * 5000)
+        (folder / 'generation-004.mp4').write_bytes(b'y' * 5000)
+        conn.execute("INSERT INTO segments (id,episode_code,scene_id,seq,status,video_path) VALUES (?,?,?,?,'completed',?)",
+                     (sid, 'EP001', 'scene', 1, 'shots/s2/generation-004.mp4'))
+    for gid, sid, version, path, verdict in (
+        ('s1-g1', 's1', 1, 'shots/s1/generation-001.mp4', 'pass'),
+        ('s1-g4', 's1', 4, 'shots/s2/generation-004.mp4', 'pass'),
+        ('s2-g1', 's2', 1, 'shots/s2/generation-001.mp4', 'retry'),
+    ):
+        conn.execute("INSERT INTO generation_results (id,segment_id,version,path,status,qc_verdict,created_at) VALUES (?,?,?,?,'completed',?,'t')",
+                     (gid, sid, version, path, verdict))
+    conn.commit()
+    assert select_passing_generation(conn, tmp_path, 's1')[0].name == 'generation-001.mp4'
+    assert select_passing_generation(conn, tmp_path, 's2') is None
+    with pytest.raises(ValueError, match='no QC-passing'):
+        mark_completed_passing(conn, 's2', 'shots/s2/generation-004.mp4')
+    with pytest.raises(ValueError, match='another segment'):
+        mark_completed_passing(conn, 's1', 'shots/s2/generation-004.mp4')
+    conn.close()
+
+
+def test_chain_qc_uses_original_frame_after_unique_comfy_staging(tmp_path):
+    from anime_factory.qc import chain_qc
+    previous = tmp_path / 'prev-last.png'
+    copied = tmp_path / 'chain-first.png'
+    previous.write_bytes(b'same-frame')
+    copied.write_bytes(previous.read_bytes())
+    prev = {'chain_id': 'c1', 'last_frame_path': str(previous)}
+    shot = {'chain_id': 'c1', 'chain_index': 1,
+            'first_frame_path': 's2_first_abcd.png', 'first_frame_source_path': str(copied)}
+    assert chain_qc(prev, shot)[0] == 'pass'
+    copied.write_bytes(b'wrong-frame')
+    assert chain_qc(prev, shot)[0] == 'retry'

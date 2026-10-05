@@ -8,6 +8,7 @@ One card. Do not silent-truncate 600s. Partial shots stay on R2 if the lease TTL
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
 import subprocess
@@ -1782,7 +1783,9 @@ def _stage_first_frame(shot: dict, root: Path) -> dict:
     if not first.is_file() and not chain_tail:
         first = root / "episodes" / EP / "keyframes" / shot["id"] / "f1.png"
     if first.is_file() and first.stat().st_size >= 1:
-        name = first.name if first.name.endswith(".png") else f"{shot['id']}_f1.png"
+        shot["first_frame_source_path"] = str(first.resolve())
+        digest = hashlib.sha256(first.read_bytes()).hexdigest()[:12]
+        name = f"{shot['id']}_first_{digest}.png"
         staged = _stage_named_image(first, name)
         if staged:
             shot["first_frame_path"] = staged
@@ -1791,7 +1794,8 @@ def _stage_first_frame(shot: dict, root: Path) -> dict:
         shot["first_frame_path"] = None
     last = Path(str(shot.get("last_frame_path") or ""))
     if last.is_file() and last.stat().st_size >= 1:
-        staged_last = _stage_named_image(last, last.name)
+        digest = hashlib.sha256(last.read_bytes()).hexdigest()[:12]
+        staged_last = _stage_named_image(last, f"{shot['id']}_last_{digest}.png")
         if staged_last:
             shot["last_frame_path"] = staged_last
     staged_refs: list[str] = []
@@ -2403,9 +2407,6 @@ def _link_longlive_continuation(shots: list[dict], index: int, last_path: Path) 
 def _ensure_last_frame(root: Path, shot: dict, video: Path) -> Path | None:
     sid = str(shot.get("id") or shot.get("take_id") or "")
     last_path = root / "episodes" / EP / "keyframes" / sid / "last.png"
-    if last_path.is_file() and last_path.stat().st_size > 32:
-        shot["last_frame_path"] = str(last_path)
-        return last_path
     if not video.is_file():
         return None
     try:
@@ -2778,6 +2779,8 @@ def _run_anim_h3(
                     failed.append({"id": sid, "error": "no_comfy_router"})
                     continue
                 shot = prep_pool.prime(shot)
+                if str(shot.get("id") or "") != sid:
+                    raise RuntimeError(f"h3 staging identity mismatch: expected {sid}, got {shot.get('id')}")
                 shots[index] = shot
                 next_shot = shots[index + 1] if index + 1 < len(shots) else None
                 if next_shot is not None and can_prefetch_staging(next_shot):

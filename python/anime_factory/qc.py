@@ -189,7 +189,8 @@ def chain_qc(prev: dict | None, segment: dict) -> tuple[str, dict]:
     if int(segment.get("chain_index") or 0) > 0:
         if not prev or prev.get("chain_id") != segment.get("chain_id"):
             issues.append("chain_break")
-        elif not _same_frame(prev.get("last_frame_path"), segment.get("first_frame_path")):
+        elif not _same_frame(prev.get("last_frame_path"),
+                             segment.get("first_frame_source_path") or segment.get("first_frame_path")):
             issues.append("chain_break")
     verdict = "retry" if issues else "pass"
     return verdict, {"issues": issues, "check": "chain"}
@@ -342,6 +343,8 @@ def select_passing_generation(
             # path may be stories/<id>/shots/... or shots/...
             name = Path(rel).name
             parent = Path(rel).parent.name
+            if parent != segment_id or row["status"] != "completed":
+                continue
             local_candidates = [
                 root / "shots" / segment_id / name,
                 root / rel,
@@ -362,7 +365,7 @@ def select_passing_generation(
                 qc_rows = conn.execute(
                     """
                     SELECT details_json FROM qc_reports
-                    WHERE segment_id = ? AND check_name = 'visual'
+                    WHERE segment_id = ? AND gate = 'visual'
                     ORDER BY created_at DESC LIMIT 4
                     """,
                     (segment_id,),
@@ -391,26 +394,14 @@ def select_passing_generation(
             if "shots" in parts:
                 idx = parts.index("shots")
                 cand = root.joinpath(*parts[idx:])
-                if cand.is_file() and cand.stat().st_size > 4096:
+                if cand.parent.name == segment_id and cand.is_file() and cand.stat().st_size > 4096:
                     path = cand
             if path is not None:
-                # Ensure it is among passing candidates or promote if DB says completed+approved.
-                if not any(c[2] == path for c in candidates):
-                    # Only trust approved when generation_results also says pass when available.
-                    gid = str(approved["approved_generation_id"] or "")
-                    ok = True
-                    if gid:
-                        try:
-                            g_row = conn.execute(
-                                "SELECT qc_verdict FROM generation_results WHERE id = ?",
-                                (gid,),
-                            ).fetchone()
-                            if g_row is not None and str(g_row["qc_verdict"] or "") != "pass":
-                                ok = False
-                        except Exception:  # noqa: BLE001
-                            pass
-                    if ok:
-                        candidates.append((1e9, 999, path, "approved"))
+                # Completion is not evidence of QC. Prefer an approval only
+                # when this exact shot/path already has a passing result.
+                passing = next((c for c in candidates if c[2] == path), None)
+                if passing is not None:
+                    candidates.append((1e9, passing[1], path, "approved"))
     if not candidates:
         return None
     candidates.sort(key=lambda row: (row[0], row[1]), reverse=True)
@@ -562,20 +553,27 @@ def passing_index(conn: sqlite3.Connection, episode_code: str) -> dict[str, str]
 
 
 def mark_completed_passing(conn: sqlite3.Connection, segment_id: str, video_path: str) -> None:
+    if Path(video_path).parent.name != segment_id:
+        raise ValueError(f"generation path belongs to another segment: {segment_id}")
     gid = None
     try:
-        row = conn.execute(
+        rows = conn.execute(
             """
-            SELECT id FROM generation_results
-            WHERE segment_id = ? AND qc_verdict = 'pass'
-            ORDER BY version DESC LIMIT 1
+            SELECT id, path FROM generation_results
+            WHERE segment_id = ? AND qc_verdict = 'pass' AND status = 'completed'
+            ORDER BY version DESC
             """,
             (segment_id,),
-        ).fetchone()
-        if row:
-            gid = row["id"]
+        ).fetchall()
+        for row in rows:
+            candidate = Path(str(row["path"] or ""))
+            if candidate.parent.name == segment_id and candidate.name == Path(video_path).name:
+                gid = row["id"]
+                break
     except Exception:  # noqa: BLE001
         gid = None
+    if not gid:
+        raise ValueError(f"no QC-passing generation for {segment_id}: {Path(video_path).name}")
     if gid:
         try:
             conn.execute(

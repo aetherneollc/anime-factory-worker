@@ -69,10 +69,28 @@ def test_prep_pool_overlaps_staging(tmp_path):
     first = pool.prime({"id": "s1"})
     assert first["staged"] is True
     pool.schedule({"id": "s2"})
-    second = pool.prime({"id": "placeholder"})
+    second = pool.prime({"id": "s2"})
     assert second["id"] == "s2"
     assert seen == ["s1", "s2"]
     pool.close()
+
+
+def test_prep_pool_does_not_apply_skipped_shot_cache_to_next_shot():
+    seen = []
+    def stage(shot):
+        seen.append(shot["id"])
+        return dict(shot, staged=True)
+    pool = H3PrepPool(stage)
+    try:
+        pool.schedule({"id": "s003", "seed": 11})
+        actual = pool.prime({"id": "s004", "seed": 28})
+        assert actual["id"] == "s004" and actual["seed"] == 28
+        pool.schedule({"id": "s004", "seed": 28})
+        changed = pool.prime({"id": "s004", "seed": 62})
+        assert changed["seed"] == 62
+        assert seen == ["s003", "s004", "s004", "s004"]
+    finally:
+        pool.close()
 
 
 def test_run_anim_h3_queues_upload_after_gpu(tmp_path, monkeypatch):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
+from copy import deepcopy
 from typing import Any, Callable
 
 from gpu_worker.h3 import FL2VA_UNET, REF2VA_UNET, select_mode
@@ -96,21 +97,27 @@ class H3PrepPool:
         self._stage_fn = stage_fn
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="h3-prep")
         self._future: Future[dict] | None = None
+        self._scheduled_shot: dict | None = None
 
     def prime(self, shot: dict) -> dict:
         if self._future is not None:
             staged = self._future.result()
             self._future = None
-            return staged
+            scheduled = self._scheduled_shot
+            self._scheduled_shot = None
+            if scheduled == shot and staged.get("id") == shot.get("id"):
+                return staged
         return self._stage_fn(shot)
 
     def schedule(self, shot: dict | None) -> None:
         if self._future is not None:
             self._future.result()
             self._future = None
+        self._scheduled_shot = None
         if shot is None:
             return
-        self._future = self._executor.submit(self._stage_fn, dict(shot))
+        self._scheduled_shot = deepcopy(shot)
+        self._future = self._executor.submit(self._stage_fn, deepcopy(shot))
 
     def close(self) -> None:
         if self._future is not None:
