@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from anime_factory.board import expand_shots_to_segments, persist_board, split_duration
 from anime_factory.db import migrate, open_db
 from anime_factory.design import synthetic_still_png
@@ -435,8 +437,8 @@ def test_generate_missing_stills_still_mints_cuts_when_f1_exists(tmp_path, monke
     assert called == ["s001"]
 
 
-def test_unattended_gpu_sheets_do_not_refuse_video(tmp_path, monkeypatch):
-    """needs_human must not block SkyReels when the front masters are already on disk."""
+def test_unattended_failed_gpu_sheets_refuse_video(tmp_path, monkeypatch):
+    """A candidate file cannot override a failed identity gate."""
     import json
 
     from anime_factory.design import CHAR_VIEW_HEIGHT, CHAR_VIEW_WIDTH, synthetic_still_png
@@ -490,18 +492,13 @@ def test_unattended_gpu_sheets_do_not_refuse_video(tmp_path, monkeypatch):
     monkeypatch.setattr(sess, "assert_keyframe_files", lambda *_a, **_k: None)
     conn = open_db(tmp_path / "s.sqlite")
     migrate(conn)
-    out = sess.generate_missing_stills("story-x", tmp_path, conn)
-    assert out.get("ok") is True
+    with pytest.raises(RuntimeError, match="design visual QC needs_human"):
+        sess.generate_missing_stills("story-x", tmp_path, conn)
     assert called == []
-    assert (hero / "master.png").is_file()
-    assert (ep / "keyframes" / "s001" / "f1.png").is_file()
+    assert not (hero / "master.png").exists()
+    assert not (ep / "keyframes" / "s001" / "f1.png").exists()
     from anime_factory.asset_lock import is_qc_locked
-
-    assert is_qc_locked(tmp_path, character_id="a-kai")
-    registry = json.loads((tmp_path / "assets" / "registry.json").read_text(encoding="utf-8"))
-    masters = [item for item in registry.get("assets") or [] if item.get("kind") == "character"]
-    assert masters and masters[0]["master_path"].endswith("master.png")
-    assert (masters[0].get("meta") or {}).get("qc_status") == "pass"
+    assert not is_qc_locked(tmp_path, character_id="a-kai")
 
 
 def test_generate_missing_stills_uploads_before_needs_human(tmp_path, monkeypatch):
@@ -637,3 +634,30 @@ def test_hosted_s001_hydrates_hero_sheet_not_empty_plate():
     assert shot["h3_mode"] == "ref2va"
     assert "char_hero_sheet" in shot["refs"]
     assert choose_h3_mode({"id": "wide", "purpose": "establish", "plate_id": "plate_office"}) == "fl2va_first"
+
+
+def test_each_candidate_uploads_image_metadata_and_index_before_gate(tmp_path, monkeypatch):
+    from gpu_worker import session as sess
+    import json
+
+    uploads = []
+    events = []
+    def fake_library(*args, on_candidate=None, **kwargs):
+        path = tmp_path / "assets" / "characters" / "hero" / "sheet_front.png"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"candidate")
+        path.with_suffix(".json").write_text(json.dumps({"qc_verdict": "fail"}))
+        (tmp_path / "assets" / "index.json").write_text("{}")
+        on_candidate(path, {"asset_id": "char_hero_sheet", "qc_verdict": "fail"})
+        return {"needs_human": ["char_hero_sheet"], "created": [], "specs": {}}
+
+    monkeypatch.setattr("anime_factory.design.library_from_db", fake_library)
+    monkeypatch.setattr(sess, "_pull_studio_asset_index", lambda *args: False)
+    monkeypatch.setattr(sess, "_upload_story_media", lambda *args: [])
+    monkeypatch.setattr(sess, "put_file", lambda key, path, content_type: uploads.append(key) or {"ok": True})
+    with pytest.raises(RuntimeError, match="needs_human"):
+        sess.generate_missing_stills("story-x", tmp_path, None, progress=events.append)
+    assert [key.split("stories/story-x/")[1] for key in uploads] == [
+        "assets/characters/hero/sheet_front.png", "assets/characters/hero/sheet_front.json", "assets/index.json",
+    ]
+    assert events == ["design_candidate_saved"]

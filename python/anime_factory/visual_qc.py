@@ -168,6 +168,7 @@ def is_current_pass(rec: dict[str, Any] | None) -> bool:
         return False
     return (
         rec.get("qc_verdict") == "pass"
+        and rec.get("qc_scorer") != "unattended_gpu_still"
         and rec.get("qc_version") == QC_VERSION
         and bool(str(rec.get("selected") or "").strip())
     )

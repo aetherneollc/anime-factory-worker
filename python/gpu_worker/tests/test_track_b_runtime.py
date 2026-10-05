@@ -2592,3 +2592,14 @@ def test_stack_boot_surfaces_comfy_exit_before_router_wait(monkeypatch):
     result = stack.boot_gpu_stack(progress=events.append)
     assert result["router_ready"] is False
     assert "comfy_startup_failed" in str(result.get("comfy_error"))
+
+
+def test_hosted_short_keeps_its_duration_and_kind_in_sqlite(tmp_path, monkeypatch):
+    monkeypatch.setattr(session, "EP", "EP001")
+    path = tmp_path / "episodes" / "EP001" / "board.json"
+    path.parent.mkdir(parents=True)
+    path.write_text('{"kind":"short","target_s":120,"shots":[]}')
+    conn = session.ensure_story_db("story-short", tmp_path)
+    row = conn.execute("SELECT kind, duration_target_s FROM episodes WHERE episode_code='EP001'").fetchone()
+    assert row["kind"] == "short"
+    assert row["duration_target_s"] == 120

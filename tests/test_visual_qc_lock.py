@@ -59,8 +59,8 @@ def test_lock_after_qc_requires_pass(tmp_path):
     assert has_locked_identity(root, "hero")
 
 
-def test_gpu_stills_lock_existing_front_instead_of_needs_human(tmp_path, monkeypatch):
-    """Unattended GPU sheets already on disk are the master. They must not wait on a person."""
+def test_gpu_stills_do_not_approve_existing_failed_front(tmp_path, monkeypatch):
+    """Existing candidates must pass QC before becoming identity masters."""
     monkeypatch.setattr("anime_factory.design.require_clip_for_client", lambda _client: False)
     conn = open_db(tmp_path / "s.sqlite")
     migrate(conn)
@@ -83,14 +83,11 @@ def test_gpu_stills_lock_existing_front_instead_of_needs_human(tmp_path, monkeyp
         clip_scorer=dish_scorer(),
     )
     blocked = list(out.get("needs_human") or [])
-    assert "char_hero_sheet" not in blocked
-    assert "char_hero_side" not in blocked
-    assert "char_hero_back" not in blocked
-    assert "char_hero_turnaround" not in blocked
-    assert is_qc_locked(tmp_path, character_id="hero")
+    assert "char_hero_sheet" in blocked
+    assert not is_qc_locked(tmp_path, character_id="hero")
     rec = load_assets_index(tmp_path)["characters"]["hero"]
-    assert rec.get("qc_verdict") == "pass"
-    assert "unattended_gpu_still" in (rec.get("qc_reasons") or [])
+    assert rec.get("qc_verdict") == "needs_human"
+    assert "unattended_gpu_still" not in (rec.get("qc_reasons") or [])
     assert not (tmp_path / "assets" / "characters" / "hero" / "sheet_side.png").is_file()
 
 
@@ -704,3 +701,34 @@ def test_passed_turnaround_reuses_exact_evidenced_path(tmp_path):
     )
     assert (hero / "sheet_turnaround_4.png").read_bytes() == files["sheet_turnaround_4.png"]
     assert not (hero / TURNAROUND_FILENAME).exists()
+
+
+def test_legacy_unattended_pass_is_not_a_valid_identity(tmp_path, monkeypatch):
+    from anime_factory.design import accept_unattended_character_front
+    from anime_factory.visual_qc import is_current_pass
+    from gpu_worker.session import _blocking_human_gate, _promote_unattended_character_sheets
+
+    monkeypatch.setenv("ANIME_FACTORY_GPU_STILLS", "1")
+    _front(tmp_path / "assets" / "characters" / "hero" / FRONT_ALIAS_FILENAME)
+    qc = pass_qc()
+    qc.scorer = "unattended_gpu_still"
+    lock_after_qc(tmp_path, character_id="hero", filename=FRONT_ALIAS_FILENAME, qc=qc)
+    rec = load_assets_index(tmp_path)["characters"]["hero"]
+    assert not is_current_pass(rec)
+    assert not is_qc_locked(tmp_path, character_id="hero")
+    assert accept_unattended_character_front(tmp_path, "hero") is None
+    assert _promote_unattended_character_sheets(tmp_path) == []
+    assert _blocking_human_gate(tmp_path, ["char_hero_sheet"]) == ["char_hero_sheet"]
+    assert not (tmp_path / "assets" / "characters" / "hero" / "master.png").exists()
+
+
+def test_approved_master_replaces_stale_master_alias(tmp_path, monkeypatch):
+    from gpu_worker.session import _promote_unattended_character_sheets
+
+    monkeypatch.setenv("ANIME_FACTORY_GPU_STILLS", "1")
+    folder = tmp_path / "assets" / "characters" / "hero"
+    _front(folder / FRONT_ALIAS_FILENAME, "approved-front")
+    _front(folder / "master.png", "old-master")
+    lock_after_qc(tmp_path, character_id="hero", filename=FRONT_ALIAS_FILENAME, qc=pass_qc())
+    assert _promote_unattended_character_sheets(tmp_path) == ["assets/characters/hero/master.png"]
+    assert (folder / "master.png").read_bytes() == (folder / FRONT_ALIAS_FILENAME).read_bytes()

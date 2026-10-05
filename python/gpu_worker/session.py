@@ -1330,7 +1330,7 @@ def _character_id_from_gate(asset_id: str) -> str | None:
 
 
 def _promote_unattended_character_sheets(root: Path) -> list[str]:
-    """Lock every on-disk front sheet and register master.png for SkyReels."""
+    """Publish only QC-approved selected sheets as character masters."""
     from anime_factory.contracts import MASTER_FILENAME
     from anime_factory.design import accept_unattended_character_front, gpu_stills_unattended
     from anime_factory.design import _character_front_file
@@ -1349,10 +1349,12 @@ def _promote_unattended_character_sheets(root: Path) -> list[str]:
         src = _character_front_file(root, cid)
         if src is None:
             continue
-        accept_unattended_character_front(root, cid, src)
+        approved = accept_unattended_character_front(root, cid, src)
+        if approved is None:
+            continue
+        src = child / approved
         dest = child / MASTER_FILENAME
-        if not dest.is_file() or dest.stat().st_size < 4096:
-            shutil.copy2(src, dest)
+        shutil.copy2(src, dest)
         rel = f"assets/characters/{cid}/{MASTER_FILENAME}"
         register_character_master(root, cid, rel, qc_status="pass")
         published.append(rel)
@@ -1360,18 +1362,8 @@ def _promote_unattended_character_sheets(root: Path) -> list[str]:
 
 
 def _blocking_human_gate(root: Path, needs_human: list[str]) -> list[str]:
-    """Drop character-sheet gates when an unattended GPU front master already exists."""
-    from anime_factory.design import _character_front_file, gpu_stills_unattended
-
-    if not gpu_stills_unattended():
-        return list(needs_human)
-    blocking: list[str] = []
-    for asset_id in needs_human:
-        cid = _character_id_from_gate(asset_id)
-        if cid and _character_front_file(root, cid):
-            continue
-        blocking.append(asset_id)
-    return blocking
+    """Preserve failed asset gates, including unattended generation failures."""
+    return list(needs_human)
 
 
 def _seed_skyreels_keyframes_from_sheets(root: Path, shot: dict) -> None:
@@ -1441,7 +1433,22 @@ def generate_missing_stills(
     from anime_factory.design import library_from_db
 
     _pull_studio_asset_index(story_id, root)
-    lib = library_from_db(conn, story_id, client, root, skip_existing=True)
+    def publish_candidate(path: Path, metadata: dict) -> None:
+        # Publish the image first, then metadata/index. A terminated GPU must not
+        # leave Studio with an untraceable image or an index pointing at absent bytes.
+        for file in (path, path.with_suffix(".json"), root / "assets" / "index.json"):
+            if not file.is_file():
+                continue
+            rel = file.relative_to(root).as_posix()
+            content_type = "image/png" if file.suffix == ".png" else "application/json"
+            result = put_file(join_story(story_id, rel), file, content_type)
+            if not _upload_ok(result):
+                raise RuntimeError(f"candidate R2 upload failed: {rel}")
+        if progress:
+            progress("design_candidate_saved")
+
+    lib = library_from_db(conn, story_id, client, root, skip_existing=True,
+                          on_candidate=publish_candidate)
     needs_human = [str(item) for item in (lib.get("needs_human") or []) if str(item).strip()]
     if needs_human:
         _promote_unattended_character_sheets(root)
@@ -3578,6 +3585,18 @@ def ensure_episode_rows(story_id: str, root: Path, conn) -> None:
         """,
         (EP, EP, now, now),
     )
+    board_path = root / "episodes" / EP / "board.json"
+    if board_path.is_file():
+        try:
+            board = json.loads(board_path.read_text(encoding="utf-8"))
+            target = float(board.get("target_s") or board.get("total_s") or 0)
+            if target > 0:
+                conn.execute("UPDATE episodes SET duration_target_s = ? WHERE episode_code = ?", (target, EP))
+            kind = str(board.get("kind") or "")
+            if kind in {"short", "series", "film"}:
+                conn.execute("UPDATE episodes SET kind = ? WHERE episode_code = ?", (kind, EP))
+        except (ValueError, TypeError, AttributeError):
+            pass
     scene_id = f"{EP}-sc01"
     conn.execute(
         "INSERT OR IGNORE INTO scenes (id, episode_code, seq) VALUES (?, ?, 1)",
@@ -3865,6 +3884,8 @@ def run_gpu_episode(
             "produced no character" in err
             or "no character rows" in err
             or "empty library" in err
+            or "design visual QC" in err
+            or "candidate R2 upload failed" in err
         )
         if control:
             if design_fail:

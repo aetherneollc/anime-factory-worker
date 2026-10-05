@@ -28,7 +28,7 @@ MODEL_ID = QWEN_IMAGE_21_MODEL_ID
 MAX_REFS = 10
 NUM_INFERENCE_STEPS = 40
 TRUE_CFG_SCALE = 4.0
-# 16:9 sheet. Left bust is the face anchor; the pipe is not a portrait full-body.
+# Generic still defaults are landscape; character masters pass portrait sizes explicitly.
 DEFAULT_SHEET_WIDTH = 1344
 DEFAULT_SHEET_HEIGHT = 768
 DEFAULT_WIDTH = DEFAULT_SHEET_WIDTH

@@ -100,12 +100,13 @@ def test_fit_character_canvas_bottom_aligns_small_full_body_figure():
 def test_render_until_qc_escalates_character_canvas(tmp_path):
     """Each QC salt must request the next taller ladder size, then lock at delivery size."""
     seen_sizes: list[str] = []
+    published: list[tuple] = []
 
     def fake_generate(payload: dict) -> bytes:
         size = str(payload.get("image_size") or "")
         seen_sizes.append(size)
         w, h = parse_image_size(size)
-        # Always return a bust-like figure so QC fails and we walk the ladder.
+        # Return a flat low-detail figure so QC fails and we walk the ladder.
         img = Image.new("RGB", (w, h), (245, 245, 245))
         for y in range(int(h * 0.05), int(h * 0.45)):
             for x in range(w // 3, 2 * w // 3):
@@ -137,13 +138,42 @@ def test_render_until_qc_escalates_character_canvas(tmp_path):
         None,
         root,
         require_clip=False,
+        on_candidate=lambda path, metadata: published.append((path, metadata)),
     )
     assert seen_sizes == list(CHAR_CANVAS_LADDER)
     assert png is not None
     assert png_dimensions(png) == CHARACTER_SIZE
     assert qc is not None
     assert not qc.passed
-    assert "not_full_body" in (qc.reasons or [])
+    assert "low_entropy" in (qc.reasons or [])
+    assert len(published) == len(QC_SEED_SALTS)
+    for path, metadata in published:
+        import json
+        assert path.is_file()
+        assert path.with_suffix(".json").is_file()
+        assert (root / "assets" / "index.json").is_file()
+        assert json.loads(path.with_suffix(".json").read_text()) == metadata
+        assert metadata["qc_verdict"] == "fail"
+        assert metadata["seed"] is not None
+        assert metadata["prompt"]
+        assert metadata["sha256"]
     assert rel
     # Spec restores delivery size for the locked path contract.
     assert spec["image_size"] == CHAR_IMAGE_SIZE or seen_sizes[-1] == CHAR_CANVAS_LADDER[-1]
+
+
+def test_fit_canvas_keeps_quantized_content_inside_qc_bounds():
+    """A flat silhouette reproduces the rounding failure seen in stored assets."""
+    from PIL import ImageDraw
+    from anime_factory.visual_qc import figure_is_full_body
+
+    image = Image.new("RGB", CHARACTER_SIZE, (248, 244, 232))
+    ImageDraw.Draw(image).rectangle((260, 250, 510, 1100), fill=(30, 40, 90))
+    buf = BytesIO()
+    image.save(buf, format="PNG")
+    fitted = fit_character_canvas(_pad_png(buf.getvalue()))
+    passed, metrics = figure_is_full_body(Image.open(BytesIO(fitted)).convert("RGB"))
+    assert passed, metrics
+    assert metrics["top"] < 0.20
+    assert metrics["bottom"] > 0.85
+    assert metrics["span"] > 0.65

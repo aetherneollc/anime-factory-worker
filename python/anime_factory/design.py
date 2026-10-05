@@ -1,7 +1,7 @@
 """Stills assets. Scene plates MUST NOT send image / reference_images.
 
-Identity is one 16:9 sheet (`master.png`): left bust as the face anchor,
-front/side/back on the right, detail strip below. Side, back, and costume
+Identity is one approved portrait master (`master.png`). The reference board
+is composed from independently approved front/side/back renders. Side, back, and costume
 views are reference edits of that master, not a second text-to-image.
 Locked seed + assets/index.json selected pointer. Character sheets default to
 local Qwen-Image-2.1 (CHARACTER_STILL_BACKEND=qwen). Unset does not fall
@@ -198,11 +198,11 @@ PROP_LOOK = (
     "include a scale reference"
 )
 PROP_NEGATIVE = "cinematic still, scenery background, people, hands, text"
-SHEET_IMAGE_SIZE = "1344x768"
+# Compose the reference board from an approved master and derived views.
+SHEET_IMAGE_SIZE = CHAR_IMAGE_SIZE
 SHEET_LAYOUT = (
-    "16:9 character design sheet, left about 34 percent is a bust portrait used as the face anchor, "
-    "right side shows front view, side view, and back view of the same character, "
-    "detail strip along the bottom, one consistent outfit"
+    "single character, front view, neutral standing pose, full body from head to both shoes, "
+    "both feet visible, arms relaxed, plain studio background, one consistent outfit"
 )
 IDENTITY_PROMPT_MAX_CHARS = 1000
 DERIVE_FACE_LOCK = "keep the same face body and hairline as the parent sheet, do not redesign identity"
@@ -692,7 +692,7 @@ def style_prompt(
 
         if SHINKAI_RENDER.lower() not in (head or "").lower():
             head = f"{STYLE_PREFIX_CHARACTER}, {head}" if head else STYLE_PREFIX_CHARACTER
-        if str(kind or "") == "character_sheet" and "16:9 character design sheet" not in (head or "").lower():
+        if str(kind or "") == "character_sheet" and SHEET_LAYOUT.lower() not in (head or "").lower():
             head = f"{head}, {SHEET_LAYOUT}"
     elif char_backend == "hunyuan":
         framing = HUNYUAN_CHARACTER_FRAMING
@@ -1483,7 +1483,7 @@ def _history_stem(spec: dict) -> str:
 
 
 def gpu_stills_unattended() -> bool:
-    """GPU stills have no human reviewer. A usable sheet must not wait on needs_human."""
+    """Whether this process is generating stills unattended on the GPU."""
     flag = os.environ.get("ANIME_FACTORY_GPU_STILLS", "").strip().lower()
     return flag in {"1", "true", "yes", "on"}
 
@@ -1508,49 +1508,17 @@ def accept_unattended_character_front(
     cid: str,
     src: Path | None = None,
 ) -> str | None:
-    """Lock an on-disk GPU sheet as the identity so video can start.
-
-    The original QC reasons stay on the record. Verdict becomes pass because
-    this factory does not wait for a person to approve a sheet.
-    """
-    from anime_factory.visual_qc import VisualQcResult, current_lineage
-
+    """Reuse an approved identity only; file existence never grants QC approval."""
     root = Path(story_root)
-    path = src or _character_front_file(root, cid)
-    if path is None or not still_file_ok(path):
+    if not is_qc_locked(root, character_id=cid):
         return None
-    if is_qc_locked(root, character_id=cid):
-        locked = locked_character_file(root, cid)
-        if still_file_ok(locked):
-            return locked.name
     prior = (load_assets_index(root).get("characters") or {}).get(str(cid)) or {}
-    reasons = ["unattended_gpu_still"]
-    for reason in list(prior.get("qc_reasons") or []):
-        text = str(reason or "").strip()
-        if text and text not in reasons:
-            reasons.append(text)
-    seed = prior.get("qc_seed")
-    try:
-        seed = int(seed) if seed is not None else None
-    except (TypeError, ValueError):
-        seed = None
-    qc = VisualQcResult(
-        verdict="pass",
-        reasons=reasons,
-        scores={"unattended": 1.0},
-        scorer="unattended_gpu_still",
-        lineage=current_lineage(),
-        kind="character_sheet",
-        seed=seed,
-    )
-    lock_after_qc(
-        root,
-        character_id=str(cid),
-        filename=path.name,
-        qc=qc,
-        set_selected=True,
-    )
-    return path.name
+    if prior.get("qc_scorer") == "unattended_gpu_still":
+        return None
+    locked = locked_character_file(root, cid)
+    if not still_file_ok(locked):
+        return None
+    return locked.name
 
 
 def _parent_ready(story_root: Path | None, spec: dict) -> bool:
@@ -2141,8 +2109,10 @@ def fit_character_canvas(
                 min(image.height, bottom + pad_y),
             )
             figure = image.crop(crop_box)
-            # Target: head near FIGURE_TOP_MAX, feet near FIGURE_BOTTOM_MIN.
-            usable_h = max(1, int(target_h * (FIGURE_BOTTOM_MIN - FIGURE_TOP_MAX)))
+            # Leave headroom inside QC bounds for rounding and resampling.
+            content_top = max(0.0, FIGURE_TOP_MAX - 0.02)
+            content_bottom = min(1.0, FIGURE_BOTTOM_MIN + 0.02)
+            usable_h = max(1, int(target_h * (content_bottom - content_top)))
             scale = min(target_w / float(fig_w), usable_h / float(fig_h))
             new_w = max(1, int(round(figure.width * scale)))
             new_h = max(1, int(round(figure.height * scale)))
@@ -2157,7 +2127,7 @@ def fit_character_canvas(
             paste_x = (target_w - fitted.width) // 2
             # Pin the unpadded feet to the geometric full-body floor.
             content_bottom_in_fitted = int(round((bottom - crop_box[1]) * scale))
-            paste_y = int(target_h * FIGURE_BOTTOM_MIN) - content_bottom_in_fitted
+            paste_y = int(round(target_h * content_bottom)) - content_bottom_in_fitted
             paste_y = max(0, min(paste_y, target_h - fitted.height))
             canvas.paste(fitted, (paste_x, paste_y))
         else:
@@ -2203,6 +2173,7 @@ def _render_until_qc(
     negative_base: str | None = None,
     clip_scorer: ClipScorer | None = None,
     require_clip: bool = False,
+    on_candidate: Callable[[Path, dict], None] | None = None,
 ) -> tuple[bytes | None, Any, str | None]:
     """Up to 3 deterministic seeds. History always records; selected only on QC pass."""
     kind = str(spec.get("kind") or "")
@@ -2314,6 +2285,20 @@ def _render_until_qc(
                 )
             else:
                 _store_qc_outcome(story_root, work, Path(rel).name, qc, lock=qc.passed)
+            metadata = {
+                "asset_id": work.get("id"), "kind": kind, "view": work.get("view"),
+                "character_id": work.get("character_id"), "scene_id": work.get("scene_id"),
+                "filename": dest.name, "seed": seed, "prompt": work.get("prompt"),
+                "image_size": work.get("image_size"), "parent_id": work.get("parent_id"),
+                "master_path": work.get("master_path"), "sha256": hashlib.sha256(png).hexdigest(),
+                "qc_verdict": qc.verdict, "qc_reasons": qc.reasons,
+                "qc_scores": qc.scores, "qc_scorer": qc.scorer, **qc.lineage,
+            }
+            dest.with_suffix(".json").write_text(
+                json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8",
+            )
+            if on_candidate is not None:
+                on_candidate(dest, metadata)
             if qc.passed and kind == "costume_derive" and not preserve_selected:
                 alias = dest.parent / FRONT_ALIAS_FILENAME
                 if not still_file_ok(alias):
@@ -2531,6 +2516,7 @@ def generate_asset_library(
     interiors: list[dict] | None = None,
     skip_existing: bool = True,
     clip_scorer: ClipScorer | None = None,
+    on_candidate: Callable[[Path, dict], None] | None = None,
 ) -> dict[str, Any]:
     """Fill stories/<id>/assets/. Bind a QC-passed identity; never re-roll it unless studio queued regen."""
     prefix, bible_negative = style_md_prefix(story_root)
@@ -2560,37 +2546,6 @@ def generate_asset_library(
             rel = spec["path"]
             kind = str(spec.get("kind") or "")
             force = _force_regen(regen, spec)
-            if (
-                story_root is not None
-                and gpu_stills_unattended()
-                and not force
-                and kind in {"character_view_derive", "character_turnaround", "costume_derive"}
-            ):
-                parent = str(spec.get("character_id") or spec.get("parent_id") or "")
-                if parent and _character_front_file(story_root, parent):
-                    # Side/back/turnaround are optional once a front master exists.
-                    # Do not park the video job on a human gate for views we already skipped.
-                    continue
-            if (
-                story_root is not None
-                and gpu_stills_unattended()
-                and not force
-                and kind == "character_sheet"
-            ):
-                cid = str(spec.get("character_id") or "")
-                front = _character_front_file(story_root, cid) if cid else None
-                if front is not None:
-                    accept_unattended_character_front(story_root, cid, front)
-                    try:
-                        rel_locked = str(front.resolve().relative_to(Path(story_root).resolve()))
-                    except ValueError:
-                        rel_locked = rel
-                    spec["path"] = rel_locked
-                    _record_round_view(round_views, spec, rel_locked)
-                    alias = Path(story_root) / character_asset_rel(cid, FRONT_ALIAS_FILENAME)
-                    if not still_file_ok(alias):
-                        write_front_alias(front)
-                    continue
             if story_root is not None and not _parent_ready(story_root, spec) and not force:
                 parent = str(spec.get("parent_id") or spec.get("character_id") or "")
                 if kind in {"character_view_derive", "character_turnaround", "costume_derive"}:
@@ -2666,6 +2621,7 @@ def generate_asset_library(
                 negative_base=bible_negative,
                 clip_scorer=clip_scorer,
                 require_clip=require_clip,
+                on_candidate=on_candidate,
             )
             passed = (
                 png is not None
@@ -2674,22 +2630,6 @@ def generate_asset_library(
                 and getattr(qc, "verdict", None) == "pass"
             )
             if not passed:
-                if (
-                    gpu_stills_unattended()
-                    and story_root is not None
-                    and kind == "character_sheet"
-                ):
-                    cid = str(spec.get("character_id") or "")
-                    front = _character_front_file(story_root, cid) if cid else None
-                    if front is not None:
-                        accept_unattended_character_front(story_root, cid, front)
-                        try:
-                            spec["path"] = str(front.resolve().relative_to(Path(story_root).resolve()))
-                        except ValueError:
-                            spec["path"] = rel
-                        _record_round_view(round_views, spec, spec["path"])
-                        created.append(aid)
-                        continue
                 if kind in {
                     "character_sheet",
                     "scene_plate",
@@ -3002,7 +2942,8 @@ def seed_cast_from_story_root(conn: sqlite3.Connection, story_root: Path | None)
                 loc_plates[lid] = plate
         blob = " ".join(str(row.get(k) or "") for k in ("h3_prompt", "first_frame_prompt", "prompt"))
         for hit in _AT_LOC_RE.findall(blob):
-            loc_names.setdefault(hit, hit)
+            if hit not in names:  # Character @mentions are not locations.
+                loc_names.setdefault(hit, hit)
     for lid, row in _story_location_rows(root).items():
         display = str(row.get("display_name") or "").strip()
         english = str(row.get("name") or "").strip()
@@ -3150,6 +3091,7 @@ def library_from_db(
     world_mode: str = "fiction",
     skip_existing: bool = True,
     clip_scorer: ClipScorer | None = None,
+    on_candidate: Callable[[Path, dict], None] | None = None,
 ) -> dict[str, Any]:
     seed_cast_from_story_root(conn, story_root)
     characters = [
@@ -3201,6 +3143,7 @@ def library_from_db(
         interiors=interiors,
         skip_existing=skip_existing,
         clip_scorer=clip_scorer,
+        on_candidate=on_candidate,
     )
     sheet_chars = {
         str(spec.get("character_id") or "")

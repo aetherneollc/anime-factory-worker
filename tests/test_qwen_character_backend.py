@@ -91,7 +91,9 @@ def test_qwen_character_prompt_uses_shinkai_sheet(monkeypatch):
     lowered = text.lower()
     assert "shinkai-like animated film frame" in lowered
     assert "even soft light" in lowered
-    assert "16:9 character design sheet" in lowered
+    assert "full body from head to both shoes" in lowered
+    assert "bust portrait" not in lowered
+    assert "16:9 character design sheet" not in lowered
     assert "your name" not in lowered
     assert "weathering with you" not in lowered
 
