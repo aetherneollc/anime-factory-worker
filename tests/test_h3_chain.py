@@ -661,3 +661,13 @@ def test_each_candidate_uploads_image_metadata_and_index_before_gate(tmp_path, m
         "assets/characters/hero/sheet_front.png", "assets/characters/hero/sheet_front.json", "assets/index.json",
     ]
     assert events == ["design_candidate_saved"]
+
+
+def test_generation_versions_stay_monotonic_with_sparse_checkpoint(tmp_path):
+    from anime_factory.qc import next_generation_path
+    directory = tmp_path / "shots/s001"
+    directory.mkdir(parents=True)
+    (directory / "generation-004.mp4").write_bytes(b"old candidate")
+    version, rel = next_generation_path(tmp_path, "s001")
+    assert version == 5
+    assert rel.endswith("generation-005.mp4")

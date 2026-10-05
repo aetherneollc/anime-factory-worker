@@ -412,14 +412,14 @@ def select_passing_generation(
 def next_generation_path(root: Path | None, segment_id: str) -> tuple[int, str]:
     version = 1
     if root is not None:
-        while True:
-            rel = shot_version_path(segment_id, version)
-            legacy = root / legacy_shot_version_path(segment_id, version)
-            current = root / rel
-            if current.is_file() or legacy.is_file():
-                version += 1
-                continue
-            return version, rel
+        import re
+        current_dir = (root / shot_version_path(segment_id, 1)).parent
+        legacy_dir = (root / legacy_shot_version_path(segment_id, 1)).parent
+        for directory in {current_dir, legacy_dir}:
+            for file in directory.glob("*.mp4"):
+                match = re.fullmatch(r"(?:generation-|v)(\d+)\.mp4", file.name)
+                if match:
+                    version = max(version, int(match[1]) + 1)
     return version, shot_version_path(segment_id, version)
 
 

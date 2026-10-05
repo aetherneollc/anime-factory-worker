@@ -2770,3 +2770,18 @@ def test_hosted_short_keeps_its_duration_and_kind_in_sqlite(tmp_path, monkeypatc
     row = conn.execute("SELECT kind, duration_target_s FROM episodes WHERE episode_code='EP001'").fetchone()
     assert row["kind"] == "short"
     assert row["duration_target_s"] == 120
+
+
+def test_video_index_only_publishes_selected_passing_clips(tmp_path, monkeypatch):
+    import hashlib
+    monkeypatch.setattr(session, "EP", "EP001")
+    monkeypatch.setattr(session, "_board_shots", lambda _r: [{"id": "s001"}, {"id": "s002"}])
+    dest = tmp_path / "shots/s001/generation-001.mp4"
+    dest.parent.mkdir(parents=True)
+    dest.write_bytes(b"approved clip bytes")
+    monkeypatch.setattr(session, "select_passing_generation", lambda _c, _r, sid: (dest, 1, "approved") if sid == "s001" else None)
+    index = session.publish_approved_video_index("story-x", tmp_path, None, upload=False)
+    assert set(index["shots"]) == {"s001"}
+    assert index["shots"]["s001"]["path"] == "stories/story-x/shots/s001/generation-001.mp4"
+    assert index["shots"]["s001"]["sha256"] == hashlib.sha256(dest.read_bytes()).hexdigest()
+    assert (tmp_path / "episodes/EP001/approved_videos.json").is_file()

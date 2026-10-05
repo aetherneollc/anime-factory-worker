@@ -2181,6 +2181,32 @@ def _h3_upload_passing(
     return _h3_commit_passing(conn, story_id, root, uploaded, progress=progress)
 
 
+def publish_approved_video_index(story_id: str, root: Path, conn, *, upload: bool = True) -> dict:
+    """Studio and compose must select the same QC-approved clips, regardless of filename rank."""
+    shots = _board_shots(root)
+    if not shots:
+        return {"ok": True, "skipped": True}
+    selected = {}
+    for shot in shots:
+        sid = str(shot.get("id") or "")
+        result = select_passing_generation(conn, root, sid)
+        if result is None:
+            continue
+        path, version, _source = result
+        selected[sid] = {
+            "path": join_story(story_id, path.relative_to(root).as_posix()),
+            "version": version, "status": "completed", "qc_verdict": "pass",
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+    index = {"schema_version": 1, "story_id": story_id, "episode_code": EP, "shots": selected}
+    path = root / "episodes" / EP / "approved_videos.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
+    if upload and not _upload_ok(put_file(join_story(story_id, path.relative_to(root).as_posix()), path, "application/json")):
+        raise RuntimeError("approved video index upload failed")
+    return index
+
+
 def flush_gpu_artifacts(
     story_id: str,
     root: Path,
@@ -2189,6 +2215,7 @@ def flush_gpu_artifacts(
 ) -> dict[str, Any]:
     """Push the latest sqlite + per-shot uploads before compose/idle teardown."""
     result = _checkpoint_story(conn, story_id, root, progress=progress, upload=True)
+    publish_approved_video_index(story_id, root, conn)
     if progress:
         progress("gpu_flushed")
     return result if isinstance(result, dict) else {"ok": True}
