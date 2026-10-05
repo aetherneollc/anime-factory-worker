@@ -100,6 +100,16 @@ CHARACTER_POSITIVE = (
     "clothed full-body anime character standing",
     "single anime character design",
 )
+CHARACTER_VIEW_POSITIVE = {
+    "side": (
+        "clothed full-body anime character standing in side profile",
+        "single anime character side-view design",
+    ),
+    "back": (
+        "clothed full-body anime character standing seen from behind",
+        "single anime character rear-view design",
+    ),
+}
 CHARACTER_NEGATIVE = (
     "collage of floating heads",
     "nude person",
@@ -934,13 +944,15 @@ def score_still(
     resolved = _refuse_fake_scorer(resolved)
     image = _load_rgb(blob if not isinstance(blob, (Path, str)) else Path(blob))
     semantic = _semantic_kind(kind)
+    char_view = resolve_character_view(kind=kind, prompt=str(prompt or ""), view=view)
     texts: list[str] = []
     pos_prompts: tuple[str, ...] = ()
     neg_prompts: tuple[str, ...] = ()
     if semantic == "scene":
         pos_prompts, neg_prompts = SCENE_POSITIVE, SCENE_NEGATIVE
     elif semantic == "character":
-        pos_prompts, neg_prompts = CHARACTER_POSITIVE, CHARACTER_NEGATIVE
+        pos_prompts = CHARACTER_POSITIVE + CHARACTER_VIEW_POSITIVE.get(char_view, ())
+        neg_prompts = CHARACTER_NEGATIVE
     texts.extend(pos_prompts)
     texts.extend(neg_prompts)
     prompt_text = str(prompt or "").strip()

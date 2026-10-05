@@ -384,3 +384,23 @@ def test_side_vision_accepts_profile_without_eye_contact():
     fields["strict_profile"] = False
     assert "not_strict_profile" in evaluate_master_vision_fields("side", fields).reasons
     assert not evaluate_master_vision_fields("front", dict(fields, looking_at_viewer=False)).passed
+
+
+@pytest.mark.parametrize("view", ["side", "back"])
+def test_view_aware_classification_keeps_bad_character_gate(view):
+    from anime_factory.visual_qc import CHARACTER_POSITIVE, CHARACTER_NEGATIVE, CHARACTER_VIEW_POSITIVE
+    def embedding(text):
+        if text in CHARACTER_VIEW_POSITIVE[view]: return list(POS)
+        if text in CHARACTER_POSITIVE: return [0.2, 0.98]
+        if text in CHARACTER_NEGATIVE: return [0.19, 0.98]
+        return list(POS)
+    valid = ScriptedClipScorer(image_embed=POS, text_embed=embedding, model_id="test-clip")
+    result = score_still(_char_png(view), kind="character_view_derive", view=view,
+                         prompt="clothed full-body anime character standing", scorer=valid,
+                         allow_placeholder=True)
+    assert result.verdict == "pass"
+    bad = ScriptedClipScorer(image_embed=ORTH, text_embed=embedding, model_id="test-clip")
+    rejected = score_still(_char_png(view), kind="character_view_derive", view=view,
+                           prompt="clothed full-body anime character standing", scorer=bad,
+                           allow_placeholder=True)
+    assert "character_classified_as_bad" in rejected.reasons
