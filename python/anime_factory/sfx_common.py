@@ -313,7 +313,7 @@ def normalize_generated_sfx(wav_bytes: bytes, *, bus: str = "sfx") -> bytes:
     rate, samples = decode_pcm16_mono(wav_bytes)
     rms = _wav_rms(samples)
     peak = max((abs(s) for s in samples), default=0)
-    if rms < 8.0 or peak < 120 or rms >= 1000.0:
+    if rms < 8.0 or peak < 40 or rms >= 1000.0:
         return wav_bytes
     gain = min(8.0, 1000.0 / rms, 28000.0 / peak)
     if gain <= 1.0:

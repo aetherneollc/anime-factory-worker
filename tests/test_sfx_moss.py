@@ -31,6 +31,11 @@ def test_quiet_impulse_is_normalized_but_mute_and_clipping_still_fail():
     quiet = encode_pcm16_mono(samples, 44100)
     assert "silence" in run_audio_qc(quiet).issues
     assert run_audio_qc(normalize_generated_sfx(quiet)).passed
+    # A production MOSS whoosh had RMS 38.4 and peak 82: quiet, not mute.
+    low_peak = encode_pcm16_mono([round(54 * math.sin(2 * math.pi * 440 * i / 44100))
+                                 for i in range(44100)], 44100)
+    assert "silence" in run_audio_qc(low_peak).issues
+    assert run_audio_qc(normalize_generated_sfx(low_peak)).passed
     mute = encode_pcm16_mono([0] * 44100, 44100)
     assert "silence" in run_audio_qc(normalize_generated_sfx(mute)).issues
     clipped = encode_pcm16_mono([32767] * 44100, 44100)
