@@ -300,7 +300,10 @@ def test_stage_first_frame_copies_locked_sheet_not_every_png(tmp_path, monkeypat
     assert "plate_store.png" in names
     assert not any("sheet_side" in n for n in names)
     assert not any("turnaround" in n for n in names)
-    assert staged.get("first_frame_path") in {"last.png", str(last)}
+    name = staged["first_frame_path"]
+    assert name.startswith("s002_first_")
+    assert staged["first_frame_source_path"] == str(last.resolve())
+    assert (comfy_in / name).read_bytes() == last.read_bytes()
     copied = {p.name for p in comfy_in.iterdir()} if comfy_in.is_dir() else set()
     assert "char_ke_sheet.png" in copied
     assert "plate_store.png" in copied
