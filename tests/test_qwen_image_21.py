@@ -92,20 +92,43 @@ def test_dry_run_does_not_download_weights(monkeypatch):
     assert b"qwen21-dry" in png
 
 
-@pytest.mark.parametrize("vram_gb, expected", [(32, "offload"), (80, "cuda")])
-def test_pipeline_load_keeps_sampling_headroom_on_32gb(monkeypatch, vram_gb, expected):
+@pytest.mark.parametrize("unquantized", [None, "transformer", "text_encoder"])
+def test_pipeline_quantizes_both_large_components_on_cuda(monkeypatch, unquantized):
     import sys
     from types import SimpleNamespace
     import anime_factory.qwen_image_21 as qwen
 
-    moves = []
-    pipe = SimpleNamespace(enable_model_cpu_offload=lambda: moves.append("offload"),
-                           to=lambda device: moves.append(device))
-    torch = SimpleNamespace(bfloat16="bf16", cuda=SimpleNamespace(is_available=lambda: True,
-        current_device=lambda: 0, get_device_properties=lambda _id: SimpleNamespace(total_memory=vram_gb * 1024**3)))
+    loaded = {}
+    pipe = SimpleNamespace(**{
+        name: SimpleNamespace(is_loaded_in_4bit=name != unquantized)
+        for name in ("transformer", "text_encoder")
+    })
+    def load(model, **kwargs):
+        loaded.update(kwargs)
+        assert model == qwen.MODEL_ID
+        return pipe
+
+    torch = SimpleNamespace(bfloat16="bf16", cuda=SimpleNamespace(is_available=lambda: True))
     monkeypatch.setitem(sys.modules, "torch", torch)
-    monkeypatch.setitem(sys.modules, "diffusers", SimpleNamespace(QwenImage21Pipeline=SimpleNamespace(
-        from_pretrained=lambda *_a, **_k: pipe)))
+    monkeypatch.setitem(sys.modules, "diffusers", SimpleNamespace(
+        BitsAndBytesConfig=lambda **kwargs: ("image", kwargs),
+        QwenImage21Pipeline=SimpleNamespace(from_pretrained=load)))
+    monkeypatch.setitem(sys.modules, "diffusers.quantizers", SimpleNamespace(
+        PipelineQuantizationConfig=lambda **kwargs: kwargs))
+    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(
+        BitsAndBytesConfig=lambda **kwargs: ("text", kwargs)))
     monkeypatch.setattr(qwen, "_PIPE", None)
-    assert qwen._load_pipe() is pipe
-    assert moves == [expected]
+    if unquantized:
+        with pytest.raises(qwen.QwenImage21Error, match=f"{unquantized} did not load in 4-bit"):
+            qwen._load_pipe()
+        assert qwen._PIPE is None
+    else:
+        assert qwen._load_pipe() is pipe
+        assert qwen._load_pipe() is pipe
+    assert loaded["device_map"] == "cuda"
+    mapping = loaded["quantization_config"]["quant_mapping"]
+    assert set(mapping) == {"transformer", "text_encoder"}
+    for component, origin in (("transformer", "image"), ("text_encoder", "text")):
+        assert mapping[component] == (origin, dict(load_in_4bit=True,
+            bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype="bf16",
+            bnb_4bit_use_double_quant=True))

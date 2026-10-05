@@ -217,10 +217,13 @@ PY
 # QwenImage21Pipeline landed in diffusers after the PyPI 0.40.0 wheel
 # (huggingface/diffusers#14804, 6256aa7). Pure Python. --no-deps so this
 # does not reinstall or re-pin the image torch (2.13.0+cu130).
+ARG BITSANDBYTES_VERSION=0.50.2
+RUN pip install --no-cache-dir --no-deps --only-binary=:all: "bitsandbytes==${BITSANDBYTES_VERSION}"
+
 ARG DIFFUSERS_QWEN21_REF=6256aa7666cedd47443adc8f82da9a10e110b09c
 RUN PIP_ONLY_BINARY= pip install --no-cache-dir --no-deps \
       "diffusers @ git+https://github.com/huggingface/diffusers.git@${DIFFUSERS_QWEN21_REF}" \
-    && python -c "import torch; from diffusers import QwenImage21Pipeline; assert torch.__version__.startswith('2.13'), torch.__version__; print('qwen image 2.1', QwenImage21Pipeline.__name__)"
+    && python -c "import torch; import bitsandbytes; from diffusers import QwenImage21Pipeline, BitsAndBytesConfig; from diffusers.quantizers import PipelineQuantizationConfig; from transformers import BitsAndBytesConfig as TextBitsAndBytesConfig; PipelineQuantizationConfig(quant_mapping={'transformer': BitsAndBytesConfig(load_in_4bit=True), 'text_encoder': TextBitsAndBytesConfig(load_in_4bit=True)}); assert torch.__version__.startswith('2.13'), torch.__version__; print('qwen image 2.1', QwenImage21Pipeline.__name__)"
 
 # Prove the isolated MOSS stack did not replace H3's torch, and that the final
 # image contains neither nvcc nor a compiler.
