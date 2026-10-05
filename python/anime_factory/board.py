@@ -30,6 +30,7 @@ from anime_factory.directors.common import (
     STORE_COPY_MARKERS,
     choose_h3_mode,
     expand_shots_to_segments,
+    normalize_chain_boundaries,
     hydrate_shot_identity,
     line_beat_id,
     line_blob,
@@ -349,7 +350,7 @@ def persist_board(
     over_max = any(float(row.get("duration") or 0) > limit for row in items)
     if looks_split and not over_max:
         shots = _shots_from_items(items)
-        segments = items
+        segments = normalize_chain_boundaries(items)
     else:
         shots = items
         segments = expand_shots_to_segments(items, max_s=limit)

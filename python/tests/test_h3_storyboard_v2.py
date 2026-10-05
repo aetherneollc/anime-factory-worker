@@ -216,3 +216,18 @@ def test_chain_qc_uses_original_frame_after_unique_comfy_staging(tmp_path):
     assert chain_qc(prev, shot)[0] == 'pass'
     copied.write_bytes(b'wrong-frame')
     assert chain_qc(prev, shot)[0] == 'retry'
+
+
+def test_chain_boundaries_hard_cut_location_and_character_changes():
+    from anime_factory.directors.common import normalize_chain_boundaries
+    shots = [
+        {'id': 's1', 'chain_id': 'scene', 'chain_index': 0, 'character_id': 'boy', 'location_id': 'dorm'},
+        {'id': 's2', 'chain_id': 'scene', 'chain_index': 1, 'character_id': 'boy', 'location_id': 'dorm'},
+        {'id': 's3', 'chain_id': 'scene', 'chain_index': 2, 'character_id': 'boy', 'location_id': 'canteen'},
+        {'id': 's4', 'chain_id': 'scene', 'chain_index': 3, 'character_id': 'girl', 'location_id': 'canteen'},
+    ]
+    normalized = normalize_chain_boundaries(shots)
+    assert [s['chain_index'] for s in normalized] == [0, 1, 0, 0]
+    assert normalized[2]['chain_id'] != normalized[1]['chain_id']
+    assert normalized[3]['chain_id'] != normalized[2]['chain_id']
+    assert normalize_chain_boundaries(normalized) == normalized

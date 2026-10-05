@@ -588,6 +588,36 @@ def needs_first_frame_still(segment: dict) -> bool:
     return bool(str(segment.get("character_id") or "").strip()) and segment.get("on_camera") is not False
 
 
+def normalize_chain_boundaries(shots: list[dict]) -> list[dict]:
+    """A scene label alone cannot chain a new location or another person's shot."""
+    out = []
+    previous = None
+    for original in shots:
+        row = dict(original)
+        base = str(row.get("chain_id") or row.get("scene_id") or f"{row.get('id')}-chain")
+        previous_base = str(previous.get("chain_id") or previous.get("scene_id") or "") if previous else ""
+        changed = False
+        if previous:
+            for key in ("location_id", "plate_id", "character_id"):
+                a, b = str(previous.get(key) or ""), str(row.get(key) or "")
+                changed = changed or bool(a and b and a != b)
+        continuation = bool(previous and base == previous_base and not changed and int(row.get("chain_index") or 0) > 0)
+        if continuation:
+            row["chain_id"] = out[-1]["chain_id"]
+            row["chain_index"] = out[-1]["chain_index"] + 1
+        else:
+            row["chain_id"] = f"{base}-{row.get('id')}-cut" if previous and base == previous_base else base
+            row["chain_index"] = 0
+            if int(original.get("chain_index") or 0) > 0:
+                row["first_frame_path"] = None
+                for key in ("chain_source_last_frame", "first_frame_source_path", "last_frame_path"):
+                    row.pop(key, None)
+                row["status"] = "prepared"
+        out.append(row)
+        previous = original
+    return out
+
+
 def expand_shots_to_segments(shots: list[dict], max_s: float | None = None) -> list[dict[str, Any]]:
     """Shot → one or more video segments. Same chain_id shares increasing chain_index."""
     limit = float(max_s) if max_s and max_s > 0 else H3_MAX_SECONDS
@@ -656,7 +686,7 @@ def expand_shots_to_segments(shots: list[dict], max_s: float | None = None) -> l
                 seg["cuts"] = [head]
             segments.append(seg)
         chain_cursor[chain_id] = start_index + n
-    return segments
+    return normalize_chain_boundaries(segments)
 
 
 def scale_shot_durations(shots: list[dict], target_seconds: float) -> None:

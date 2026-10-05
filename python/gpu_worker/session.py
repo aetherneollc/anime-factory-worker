@@ -40,7 +40,7 @@ from anime_factory.compose import (
 from anime_factory.sfx_orchestrate import prepare_episode_sfx
 from anime_factory.db import checkpoint_and_upload, migrate, open_db, utcnow
 from anime_factory.design import KolorsClient
-from anime_factory.directors.common import hydrate_shot_identity, is_chain_head, needs_first_frame_still
+from anime_factory.directors.common import hydrate_shot_identity, is_chain_head, needs_first_frame_still, normalize_chain_boundaries
 from anime_factory.keyframe import assert_keyframe_files, ensure_keyframe
 from anime_factory.models import H3_MAX_RETRIES, VIDEO_FPS, VIDEO_HEIGHT, VIDEO_WIDTH, is_short_kind
 from anime_factory.produce import DEFAULT_EPISODE, ControlPlane, produce_episode
@@ -1219,7 +1219,7 @@ def _cast_map_from_shots(shots: list[dict]) -> dict[str, dict]:
 
 def _hydrate_board_shots(shots: list[dict]) -> list[dict]:
     cast = _cast_map_from_shots(shots)
-    return [hydrate_shot_identity(shot, cast=cast) for shot in shots]
+    return normalize_chain_boundaries([hydrate_shot_identity(shot, cast=cast) for shot in shots])
 
 
 def _board_shots(root: Path) -> list[dict]:
