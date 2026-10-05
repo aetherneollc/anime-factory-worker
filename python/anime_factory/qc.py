@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import filecmp
 import json
+import os
 import sqlite3
 from pathlib import Path
 
@@ -231,6 +232,7 @@ def incremental_qc_segment(
         if c_verdict != "pass" and v_verdict == "pass":
             v_verdict = c_verdict
     if video_path and v_verdict == "pass":
+        visual_required = os.environ.get("ANIME_FACTORY_GPU_STILLS") == "1"
         try:
             from anime_factory.video_visual_qc import score_video_visual, write_visual_qc_report
 
@@ -262,7 +264,7 @@ def incremental_qc_segment(
                 scene_lock_path=scene_lock,
                 identity_prompt=identity,
                 work_dir=Path(video_path).parent / "_visual_qc",
-                require_clip=False,
+                require_clip=visual_required,
             )
             merged["video_visual"] = {
                 "verdict": result.verdict,
@@ -275,6 +277,8 @@ def incremental_qc_segment(
                 v_verdict = result.verdict
         except Exception as exc:  # noqa: BLE001 — visual QC is additive; never wipe deterministic pass silently
             merged["video_visual_error"] = str(exc)[:400]
+            if visual_required:
+                v_verdict = "retry"
     record_qc(conn, episode_code, segment_id, "visual", v_verdict, merged)
     if d_verdict == "fail":
         return "fail"

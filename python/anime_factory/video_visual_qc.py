@@ -142,6 +142,9 @@ def _frame_entropy(path: Path) -> float:
 
 
 def _encode_paths(paths: Sequence[Path], scorer: Any) -> list[list[float]]:
+    embed = getattr(scorer, "embed_images", None)
+    if callable(embed):
+        return [[float(x) for x in vec] for vec in embed([_load_rgb(p) for p in paths])]
     encode = getattr(scorer, "encode_images", None) or getattr(scorer, "encode_image", None)
     if encode is None:
         return []
@@ -156,7 +159,7 @@ def _encode_paths(paths: Sequence[Path], scorer: Any) -> list[list[float]]:
 
 
 def _encode_texts(texts: Sequence[str], scorer: Any) -> list[list[float]]:
-    encode = getattr(scorer, "encode_texts", None) or getattr(scorer, "encode_text", None)
+    encode = getattr(scorer, "embed_texts", None) or getattr(scorer, "encode_texts", None) or getattr(scorer, "encode_text", None)
     if encode is None:
         return []
     try:
@@ -250,9 +253,9 @@ def score_video_visual(
     clip = scorer
     if clip is None and require_clip:
         try:
-            from anime_factory.visual_qc import get_clip_scorer
+            from anime_factory.visual_qc import load_clip_scorer
 
-            clip = get_clip_scorer()
+            clip = load_clip_scorer(require=True)
         except Exception:  # noqa: BLE001
             clip = None
             reasons.append("clip_unavailable")

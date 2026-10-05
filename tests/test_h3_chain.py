@@ -671,3 +671,39 @@ def test_generation_versions_stay_monotonic_with_sparse_checkpoint(tmp_path):
     version, rel = next_generation_path(tmp_path, "s001")
     assert version == 5
     assert rel.endswith("generation-005.mp4")
+
+
+def test_production_video_qc_cannot_pass_when_visual_scorer_fails(tmp_path, monkeypatch):
+    from anime_factory.qc import incremental_qc_segment
+    from anime_factory import video_visual_qc
+    conn = open_db(tmp_path / "story.sqlite")
+    migrate(conn)
+    monkeypatch.setenv("ANIME_FACTORY_GPU_STILLS", "1")
+    calls = []
+    def unavailable(*args, **kwargs):
+        calls.append(kwargs["require_clip"])
+        raise RuntimeError("semantic scorer unavailable")
+    monkeypatch.setattr(video_visual_qc, "score_video_visual", unavailable)
+    verdict = incremental_qc_segment(conn, "EP001", "s001", {"width": 1280, "height": 720, "duration": 8}, 8,
+        video_path=tmp_path / "clip.mp4", story_root=tmp_path)
+    assert calls == [True]
+    assert verdict == "retry"
+    report = conn.execute("select verdict,details_json from qc_reports where gate='visual'").fetchone()
+    assert report["verdict"] == "retry"
+    assert "semantic scorer unavailable" in report["details_json"]
+
+
+def test_video_qc_uses_production_embed_scorer_protocol(tmp_path):
+    from anime_factory.video_visual_qc import _encode_paths, _encode_texts
+    from PIL import Image
+    image = tmp_path / "frame.png"
+    Image.new("RGB", (32, 32), "blue").save(image)
+    class Scorer:
+        def embed_images(self, images):
+            assert images[0].size == (32, 32)
+            return [[1., 0.]]
+        def embed_texts(self, texts):
+            assert texts == ["young man"]
+            return [[0., 1.]]
+    assert _encode_paths([image], Scorer()) == [[1., 0.]]
+    assert _encode_texts(["young man"], Scorer()) == [[0., 1.]]
