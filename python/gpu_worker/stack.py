@@ -1279,6 +1279,39 @@ def _attach_adaptations(handshake: dict | None, adapter: StackAdapter, **extra: 
     return payload
 
 
+def _has_approved_video_resume(progress: Callable[[str], None] | None = None) -> bool:
+    """A resume needs MOSS/FFmpeg, not fresh still/video model downloads.
+
+    Verify actual checkpoint clips; a control-plane stage label alone is
+    insufficient. Failure to restore falls back to the normal boot path.
+    """
+    story_id = (os.environ.get("AF_STORY_ID") or "").strip()
+    if not story_id:
+        return False
+    from gpu_worker import session
+    from anime_factory.db import open_db, migrate
+
+    root = Path(os.environ.get("AF_STORY_ROOT") or f"/work/{story_id}")
+    episode = os.environ.get("AF_EPISODE") or "EP001"
+    if progress:
+        progress("startup_stage:weights:resume_checkpoint")
+    try:
+        session.EP = session._normalize_episode_code(episode)
+        session.pull_story(story_id, root, episode_code=episode)
+        db_path = root / "story.sqlite"
+        if not db_path.is_file():
+            return False
+        conn = open_db(db_path)
+        try:
+            migrate(conn)
+            return session._completed_anim_from_disk(story_id, root, conn) is not None
+        finally:
+            conn.close()
+    except Exception as exc:
+        print(json.dumps({"resume_checkpoint": "normal_boot", "error": type(exc).__name__}), flush=True)
+        return False
+
+
 def boot_gpu_stack(progress: Callable[[str], None] | None = None) -> dict:
     profile_id = select_profile_id()
     handshake: dict | None = None
@@ -1435,12 +1468,17 @@ def boot_gpu_stack(progress: Callable[[str], None] | None = None) -> dict:
                 if k in weights
             },
         }
-    if progress:
-        progress("startup_stage:weights:h3_background")
-    h3_thread = start_h3_weights_background(COMFY_DIR, progress=progress)
-    if progress:
-        progress("startup_stage:weights:stills")
-    weights = ensure_still_weights(COMFY_DIR, progress=progress)
+    if _has_approved_video_resume(progress):
+        if progress:
+            progress("startup_stage:weights:approved_video_resume")
+        weights = {"kind": "compose_resume", "hits": [], "misses": [], "downloaded": [], "source": "checkpoint"}
+    else:
+        if progress:
+            progress("startup_stage:weights:h3_background")
+        h3_thread = start_h3_weights_background(COMFY_DIR, progress=progress)
+        if progress:
+            progress("startup_stage:weights:stills")
+        weights = ensure_still_weights(COMFY_DIR, progress=progress)
     if progress:
         progress("startup_stage:comfy_torch_probe")
     probe_comfy_torch_import()

@@ -23,6 +23,23 @@ from anime_factory.sfx_orchestrate import (
 from anime_factory.tts import voiced_dummy_wav
 
 
+def test_phone_fallback_is_audible_cached_and_does_not_replace_physical_sounds(tmp_path):
+    from anime_factory.sfx_common import run_audio_qc
+    from anime_factory.sfx_builtin import resolve_builtin_phone_cue
+    fs = FreesoundClient("k", opener=_fs_opener([], {}))
+    moss = MossSoundEffectClient(config=MossRunnerConfig("py", "bad.py", "weights"),
+                               runner=lambda *args: subprocess.CompletedProcess([], 1))
+    cue = SfxCue("transfer_sent", "phone transfer sent tiny whoosh", duration_target=0.6)
+    result = resolve_cue(cue, tmp_path, freesound_client=fs, moss_client=moss)
+    assert result.provenance.source == "builtin"
+    from pathlib import Path
+    assert run_audio_qc(Path(result.local_path).read_bytes(), target_duration=0.6).passed
+    cached = resolve_cue(cue, tmp_path, freesound_client=fs, moss_client=moss)
+    assert cached.provenance.cached is True
+    assert resolve_builtin_phone_cue(SfxCue("wrong_key", "door creak"), tmp_path) is None
+    assert resolve_builtin_phone_cue(SfxCue("notification", "phone notification", bus="ambience"), tmp_path) is None
+
+
 def _fs_opener(rows, previews):
     def opener(req):
         url = req.full_url

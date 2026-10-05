@@ -302,6 +302,25 @@ def assert_audio_qc(
     return report
 
 
+def normalize_generated_sfx(wav_bytes: bytes, *, bus: str = "sfx") -> bytes:
+    """Lift a quiet, measurable action sound without amplifying digital mute.
+
+    Keep ambience dynamics and reject effectively empty renders as before.
+    Gain is bounded and leaves headroom; final QC remains mandatory.
+    """
+    if bus != "sfx":
+        return wav_bytes
+    rate, samples = decode_pcm16_mono(wav_bytes)
+    rms = _wav_rms(samples)
+    peak = max((abs(s) for s in samples), default=0)
+    if rms < 8.0 or peak < 120 or rms >= 1000.0:
+        return wav_bytes
+    gain = min(8.0, 1000.0 / rms, 28000.0 / peak)
+    if gain <= 1.0:
+        return wav_bytes
+    return encode_pcm16_mono([int(round(s * gain)) for s in samples], rate)
+
+
 def loop_crossfade_wav(
     wav_bytes: bytes,
     target_duration_s: float,
@@ -368,6 +387,13 @@ def credit_line_from_provenance(prov: SfxProvenance | None) -> dict[str, Any] | 
             "model_commit": prov.model_commit,
             "query": prov.query,
             "text": f"MOSS-SoundEffect ({prov.model or MOSS_MODEL_REPO}) — {prov.query or 'sfx'}",
+            "requires_attribution": False,
+        }
+    if prov.source == "builtin":
+        return {
+            "source": "builtin", "license_kind": "generated",
+            "creator": prov.creator, "model": prov.model, "query": prov.query,
+            "text": f"Original procedural phone sound — {prov.query or 'sfx'}",
             "requires_attribution": False,
         }
     return None
@@ -458,6 +484,16 @@ def cache_lookup(cache_root: Path, cue: SfxCue) -> SfxResult | None:
         return None
     local_path = payload.get("local_path")
     if not local_path or not Path(local_path).is_file():
+        return None
+    try:
+        wav = Path(local_path).read_bytes()
+        provenance = payload.get("provenance") or {}
+        if content_hash(wav) != provenance.get("content_hash"):
+            return None
+        if not run_audio_qc(wav, target_duration=cue.duration_target,
+                            duration_tolerance=cue.duration_tolerance, bus=cue.bus).passed:
+            return None
+    except (OSError, ValueError):
         return None
     prov = dict(payload.get("provenance") or {})
     prov["tags"] = tuple(prov.get("tags") or ())

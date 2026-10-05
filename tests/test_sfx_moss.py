@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import subprocess
+import math
+from pathlib import Path
 
 import pytest
 
@@ -18,6 +20,50 @@ from anime_factory.sfx_moss import (
     resolve_via_moss,
 )
 from anime_factory.tts import voiced_dummy_wav
+from anime_factory.tts import encode_pcm16_mono
+from anime_factory.sfx_common import SfxQCError, normalize_generated_sfx, run_audio_qc
+
+
+def test_quiet_impulse_is_normalized_but_mute_and_clipping_still_fail():
+    samples = [0] * 44100
+    for i in range(2000):
+        samples[i] = round(250 * math.sin(2 * math.pi * 440 * i / 44100))
+    quiet = encode_pcm16_mono(samples, 44100)
+    assert "silence" in run_audio_qc(quiet).issues
+    assert run_audio_qc(normalize_generated_sfx(quiet)).passed
+    mute = encode_pcm16_mono([0] * 44100, 44100)
+    assert "silence" in run_audio_qc(normalize_generated_sfx(mute)).issues
+    clipped = encode_pcm16_mono([32767] * 44100, 44100)
+    assert "clipping" in run_audio_qc(normalize_generated_sfx(clipped)).issues
+    assert normalize_generated_sfx(quiet, bus="ambience") == quiet
+
+
+def test_moss_retries_qc_with_distinct_seeds_and_records_winning_seed(tmp_path):
+    seeds = []
+    def runner(args, env, timeout):
+        seeds.append(int(args[args.index("--seed") + 1]))
+        wav = (encode_pcm16_mono([0] * 44100, 44100) if len(seeds) < 3
+               else voiced_dummy_wav(1.0))
+        Path(args[args.index("--out") + 1]).write_bytes(wav)
+        return subprocess.CompletedProcess(args, 0)
+    result = resolve_via_moss(
+        MossSoundEffectClient(config=_config(tmp_path), runner=runner),
+        SfxCue("tap", "screen tap", duration_target=1.0, seed=42), tmp_path,
+    )
+    assert seeds == [42, 43, 44]
+    assert result.provenance.seed == 44
+
+
+def test_moss_mute_retries_are_bounded(tmp_path):
+    calls = []
+    def runner(args, env, timeout):
+        calls.append(1)
+        Path(args[args.index("--out") + 1]).write_bytes(encode_pcm16_mono([0] * 44100, 44100))
+        return subprocess.CompletedProcess(args, 0)
+    with pytest.raises(SfxQCError):
+        resolve_via_moss(MossSoundEffectClient(config=_config(tmp_path), runner=runner),
+                         SfxCue("tap", "tap", duration_target=1.0), tmp_path)
+    assert len(calls) == 3
 
 
 def _config(tmp_path) -> MossRunnerConfig:

@@ -990,8 +990,10 @@ def test_heartbeat_includes_handshake_fields():
     assert fields["progress"]["boot_log_tail"] == "ready"
 
 
-def test_stack_boot_reports_startup_stages_and_font_verification(monkeypatch):
+@pytest.mark.parametrize("resume", [False, True])
+def test_stack_boot_reports_startup_stages_and_font_verification(monkeypatch, resume):
     events = []
+    monkeypatch.setattr(stack, "_has_approved_video_resume", lambda *_a: resume)
     monkeypatch.setenv("AF_VIDEO_BACKEND", "h3")
     monkeypatch.setattr(stack, "run_hardware_preflight", lambda **_k: {"profile_id": "h3-comfy-cu130-sm120", "preflight": {"ok": True}})
     monkeypatch.setattr(stack, "ensure_torch", lambda: None)
@@ -1041,11 +1043,17 @@ def test_stack_boot_reports_startup_stages_and_font_verification(monkeypatch):
     assert "startup_stage:preflight" in events
     assert "startup_stage:weights:setup" in events
     assert "startup_stage:fonts" in events
-    assert "startup_stage:weights:stills" in events
     assert "startup_stage:comfy_torch_probe" in events
-    assert "startup_stage:weights:h3_background" in events
-    assert result["h3_weights_background"] is True
-    assert "startup_bytes:1024" in events
+    if resume:
+        assert "startup_stage:weights:approved_video_resume" in events
+        assert "startup_stage:weights:stills" not in events
+        assert "startup_stage:weights:h3_background" not in events
+        assert result["h3_weights_background"] is False
+    else:
+        assert "startup_stage:weights:stills" in events
+        assert "startup_stage:weights:h3_background" in events
+        assert result["h3_weights_background"] is True
+        assert "startup_bytes:1024" in events
     assert "startup_health:ready" in events
 
 
@@ -2169,6 +2177,85 @@ def test_compose_pairs_shots_to_clips_by_id_not_position(tmp_path, monkeypatch):
     # s003's dialogue onto s001's clip.
     assert [s["id"] for s in captured["shots"]] == ["s001", "s003"]
     assert [Path(p).parent.name for p in captured["video_paths"]] == ["s001", "s003"]
+
+
+def test_failed_sfx_restores_gpu_before_propagating_error(tmp_path, monkeypatch):
+    clip = tmp_path / "shots/s001/generation-001.mp4"
+    clip.parent.mkdir(parents=True)
+    clip.write_bytes(b"x" * 5000)
+    _compose_harness(tmp_path, monkeypatch, [("s001", "shots/s001/generation-001.mp4")],
+                     [{"id": "s001", "duration": 8.0}])
+    calls = []
+    monkeypatch.setattr(session, "select_video_backend", lambda **_k: "h3")
+    monkeypatch.setattr(session, "release_gpu_for_moss_sfx", lambda **_k: calls.append("release"))
+    monkeypatch.setattr(session, "restore_gpu_after_moss_sfx", lambda **_k: calls.append("restore"))
+    def fail(*_a, **kw):
+        kw["before_moss"]()
+        raise RuntimeError("required audio failed")
+    monkeypatch.setattr(session, "prepare_episode_sfx", fail)
+    with pytest.raises(RuntimeError, match="required audio failed"):
+        session.run_compose("story-1", tmp_path, object(), langs=("zh",))
+    assert calls == ["release", "restore"]
+
+
+def test_batch_reports_compose_error_and_stops_after_three_attempts(monkeypatch):
+    monkeypatch.setattr(session, "run_gpu_episode", lambda *_a, **_k: {
+        "remaining": 1, "anim": {"shots_total": 15, "shots_done": 15, "failed": []},
+        "compose": {"ok": False, "error": "required audio failed"},
+    })
+    checkpoints = []
+    monkeypatch.setattr(session, "best_effort_upload_checkpoint", lambda *_a: checkpoints.append(1) or {"ok": True})
+    runtime = session.LeaseRuntime(instance_id="123")
+    batch = {"batch_id": "b1", "story_id": "story-1", "episodes": [{"episode_code": "EP001"}]}
+    reports = []
+    for attempt in range(3):
+        out = session.run_gpu_batch(batch, runtime, report=lambda b: reports.append(b) or {"ok": True})
+        assert reports[-1]["stage"] == "compose"
+        assert reports[-1]["error"] == "required audio failed"
+        if attempt < 2:
+            assert out["destroy_reason"] is None
+        else:
+            assert reports[-1]["status"] == "failed"
+            assert out["destroy_reason"] == "explicit_abort"
+            assert out["limit"] == "compose_retry_exhausted"
+    assert len(checkpoints) == 1
+
+
+def test_complete_approved_clips_resume_without_model_setup(tmp_path, monkeypatch):
+    monkeypatch.setattr(session, "_board_shots", lambda *_a: [{"id": "s001"}, {"id": "s002"}])
+    monkeypatch.setattr(session, "select_passing_generation", lambda _c, root, sid: (root / f"shots/{sid}/generation-001.mp4", 1, "pass"))
+    monkeypatch.setattr(session, "_probe_video", lambda _p: {"duration": 8.0})
+    marked = []
+    monkeypatch.setattr(session, "mark_completed_passing", lambda _c, sid, path: marked.append((sid, path)))
+    result = session._completed_anim_from_disk("story-1", tmp_path, object())
+    assert result["shots_done"] == 2 and result["model_load_count"] == 0
+    assert len(marked) == 2
+    marked.clear()
+    monkeypatch.setattr(session, "_probe_video", lambda _p: {"duration": 0})
+    assert session._completed_anim_from_disk("story-1", tmp_path, object()) is None
+    assert marked == []
+
+
+def test_episode_with_approved_video_does_not_load_still_or_video_models(tmp_path, monkeypatch):
+    cached = {"shots_total": 15, "shots_done": 15, "failed": [], "gpu_done": True}
+    monkeypatch.setattr(session, "gpu_cycle_idle_reason", lambda *_a, **_k: None)
+    monkeypatch.setattr(session, "episode_finals_ready", lambda *_a, **_k: False)
+    monkeypatch.setattr(session, "pull_story", lambda *_a, **_k: [])
+    monkeypatch.setattr(session, "run_pre_gpu_if_needed", lambda *_a, **_k: {"skipped": True})
+    monkeypatch.setattr(session, "ensure_story_db", lambda *_a, **_k: object())
+    monkeypatch.setattr(session, "_completed_anim_from_disk", lambda *_a: cached)
+    monkeypatch.setattr(session, "ComfyRouter", lambda: None)
+    def forbidden(*_a, **_k):
+        raise AssertionError("approved video must skip image/video model work")
+    for name in ("generate_missing_stills", "join_h3_weights", "ensure_h3_dits_for_shots", "run_anim"):
+        monkeypatch.setattr(session, name, forbidden)
+    monkeypatch.setattr(session, "flush_gpu_artifacts", lambda *_a, **_k: None)
+    monkeypatch.setattr(session, "_checkpoint_story", lambda *_a, **_k: None)
+    monkeypatch.setattr(session, "run_compose", lambda *_a, **_k: {"final_keys": ["final.zh.mp4"]})
+    out = session.run_gpu_episode("story-1", root=tmp_path, skip_shorts=True)
+    assert out["remaining"] == 0
+    assert out["anim"] == cached
+    assert out["stills"]["skipped"] == "approved_video_resume"
 
 
 def test_run_compose_integrates_prepare_episode_sfx_into_compose_audio(tmp_path, monkeypatch):

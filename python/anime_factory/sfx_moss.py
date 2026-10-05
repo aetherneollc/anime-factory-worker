@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable
 
@@ -36,6 +36,7 @@ from anime_factory.sfx_common import (
     SfxCue,
     SfxProvenance,
     SfxResult,
+    SfxQCError,
     assert_audio_qc,
     cache_dir_for,
     cache_lookup,
@@ -43,6 +44,7 @@ from anime_factory.sfx_common import (
     cache_write,
     content_hash,
     deterministic_seed,
+    normalize_generated_sfx,
     redact_secrets,
 )
 from anime_factory.tts import decode_pcm16_mono
@@ -187,14 +189,26 @@ def resolve_via_moss(client: MossSoundEffectClient, cue: SfxCue, root: Path) -> 
     seed = cue.seed if cue.seed is not None else deterministic_seed(cue.cue_key, salt=MOSS_SOURCE_COMMIT)
     duration = float(cue.duration_target or 2.0)
     tmp_out = cache_root / f"_gen_{safe_cue_slug(cue.cue_key)}.wav"
-    wav = client.generate(cue, tmp_out)
-    assert_audio_qc(
-        wav,
-        label=f"{cue.cue_key}:moss",
-        target_duration=cue.duration_target,
-        duration_tolerance=cue.duration_tolerance,
-        bus=cue.bus,
-    )
+    base_seed = seed
+    for attempt in range(3):
+        seed = (base_seed + attempt) % (2**32)
+        tmp_out.unlink(missing_ok=True)
+        wav = normalize_generated_sfx(
+            client.generate(replace(cue, seed=seed), tmp_out), bus=cue.bus,
+        )
+        try:
+            assert_audio_qc(
+                wav,
+                label=f"{cue.cue_key}:moss",
+                target_duration=cue.duration_target,
+                duration_tolerance=cue.duration_tolerance,
+                bus=cue.bus,
+            )
+            break
+        except SfxQCError:
+            if attempt == 2:
+                raise
+            log.warning("MOSS cue=%s failed audio QC; retrying with another seed", cue.cue_key)
     digest = content_hash(wav)
     local_path = cache_write(cache_root, digest, wav)
     try:

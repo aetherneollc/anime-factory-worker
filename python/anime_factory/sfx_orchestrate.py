@@ -35,6 +35,7 @@ from anime_factory.sfx_common import (
 )
 from anime_factory.sfx_freesound import FreesoundClient, freesound_api_key, resolve_via_freesound
 from anime_factory.sfx_moss import MossConfigError, MossSoundEffectClient, resolve_via_moss
+from anime_factory.sfx_builtin import resolve_builtin_phone_cue
 
 log = logging.getLogger("anime_factory.sfx.orchestrate")
 
@@ -142,6 +143,13 @@ def resolve_cue(
     any network call or subprocess spawn — see `sfx_common.cache_lookup`.
     """
     fs_client = freesound_client or FreesoundClient(freesound_api_key())
+
+    def builtin_fallback() -> SfxResult | None:
+        fallback = resolve_builtin_phone_cue(cue, root)
+        if fallback is not None and conn is not None:
+            _record_cue(conn, story_id, cue, fallback)
+        return fallback
+
     freesound_error: Exception | None = None
     try:
         result = resolve_via_freesound(fs_client, cue, root)
@@ -156,6 +164,9 @@ def resolve_cue(
         try:
             before_moss()
         except Exception as exc:  # noqa: BLE001 — an uncleared GPU cannot safely load MOSS
+            fallback = builtin_fallback()
+            if fallback is not None:
+                return fallback
             failure = SfxResult(
                 cue_key=cue.cue_key,
                 status="failed",
@@ -173,6 +184,9 @@ def resolve_cue(
     try:
         result = resolve_via_moss(moss, cue, root)
     except MossConfigError as exc:
+        fallback = builtin_fallback()
+        if fallback is not None:
+            return fallback
         failure = SfxResult(
             cue_key=cue.cue_key,
             status="failed",
@@ -185,6 +199,9 @@ def resolve_cue(
             f"configured ({redact_secrets(str(exc))})"
         ) from exc
     except Exception as exc:  # noqa: BLE001 — surfaced as one resolution error
+        fallback = builtin_fallback()
+        if fallback is not None:
+            return fallback
         failure = SfxResult(cue_key=cue.cue_key, status="failed", reason=redact_secrets(str(exc)))
         if conn is not None:
             _record_cue(conn, story_id, cue, failure)

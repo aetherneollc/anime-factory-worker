@@ -445,6 +445,7 @@ class LeaseRuntime:
     startup_subphase_started_at: float | None = None
     handshake: dict[str, Any] | None = None
     completed_episodes: set[tuple[str, str]] = field(default_factory=set)
+    compose_failures: dict[tuple[str, str], int] = field(default_factory=dict)
 
     def elapsed_seconds(self) -> float:
         return max(0.0, self.clock() - self.started_at)
@@ -3181,6 +3182,33 @@ def run_anim(
     return _run_anim_h3(story_id, root, conn, router, progress=progress)
 
 
+def _completed_anim_from_disk(story_id: str, root: Path, conn) -> dict[str, Any] | None:
+    """Reuse a complete set of approved, decodable clips without loading a model."""
+    shots = _board_shots(root)
+    if not shots:
+        return None
+    selected_paths = []
+    for shot in shots:
+        sid = str(shot.get("id") or "")
+        selected = select_passing_generation(conn, root, sid)
+        if selected is None:
+            return None
+        path = selected[0]
+        try:
+            if float(_probe_video(path).get("duration") or 0) <= 0:
+                return None
+        except Exception:
+            return None
+        selected_paths.append((sid, path))
+    for sid, path in selected_paths:
+        mark_completed_passing(conn, sid, join_story(story_id, path.relative_to(root).as_posix()))
+    return {
+        "shots_total": len(shots), "shots_done": len(shots),
+        "generated": [], "skipped_existing": [sid for sid, _ in selected_paths], "failed": [],
+        "gpu_done": True, "model_load_count": 0,
+    }
+
+
 def _run_checked(
     command: list[str],
     progress: ProgressCallback | None = None,
@@ -3350,17 +3378,19 @@ def run_compose(
         release_gpu_for_moss_sfx(backend=video_backend)
         moss_handoff_done["done"] = True
 
-    sfx_prepared = prepare_episode_sfx(
-        shots,
-        root,
-        EP,
-        story_id=story_id,
-        conn=conn,
-        clip_durations=clip_durations or None,
-        before_moss=_before_moss_sfx,
-    )
-    if moss_handoff_done["done"]:
-        restore_gpu_after_moss_sfx(backend=video_backend)
+    try:
+        sfx_prepared = prepare_episode_sfx(
+            shots,
+            root,
+            EP,
+            story_id=story_id,
+            conn=conn,
+            clip_durations=clip_durations or None,
+            before_moss=_before_moss_sfx,
+        )
+    finally:
+        if moss_handoff_done["done"]:
+            restore_gpu_after_moss_sfx(backend=video_backend)
     mixed, timeline = compose_episode_audio(
         work,
         EP,
@@ -3861,6 +3891,7 @@ def run_gpu_episode(
         ensure_episode_rows(story_id, root, conn)
     else:
         conn = ensure_story_db(story_id, root)
+    cached_anim = _completed_anim_from_disk(story_id, root, conn)
     router = None
     try:
         router = ComfyRouter()
@@ -3871,7 +3902,7 @@ def run_gpu_episode(
     if control:
         control.job(story_id, "design", "running", episode_code=EP)
     try:
-        stills = generate_missing_stills(
+        stills = {"ok": True, "skipped": "approved_video_resume"} if cached_anim is not None else generate_missing_stills(
             story_id,
             root,
             conn,
@@ -3914,7 +3945,10 @@ def run_gpu_episode(
         backend = lock_video_backend(root=root)
     except VideoBackendLockError as exc:
         raise RuntimeError(str(exc)) from exc
-    if backend == "longlive":
+    if cached_anim is not None:
+        if progress:
+            progress("anim:reuse_approved_clips")
+    elif backend == "longlive":
         unload_still_models(router)
         stop_comfy_for_longlive()
         if progress:
@@ -3936,7 +3970,7 @@ def run_gpu_episode(
         join_h3_weights()
         ensure_h3_dits_for_shots(_board_shots(root))
         unload_still_models(router)
-    anim = run_anim(story_id, root, conn, router, progress=progress)
+    anim = cached_anim if cached_anim is not None else run_anim(story_id, root, conn, router, progress=progress)
     if backend != "longlive" and anim.get("gpu_done"):
         try:
             flush_gpu_artifacts(story_id, root, conn, progress=progress)
@@ -4236,6 +4270,19 @@ def run_gpu_batch(
                 status = "done"
                 current_stage = "compose"
                 runtime.remember_completed(story_id, episode_code)
+                runtime.compose_failures.pop((story_id, episode_code), None)
+            elif isinstance(episode_result.get("compose"), dict) and episode_result["compose"].get("ok") is False:
+                current_stage = "compose"
+                error = str(episode_result["compose"].get("error") or "compose failed")
+                key = (story_id, episode_code)
+                failures = runtime.compose_failures.get(key, 0) + 1
+                runtime.compose_failures[key] = failures
+                status = "failed" if failures >= 3 else "running"
+                runtime.last_error = error
+                if failures >= 3:
+                    stop_limit = "compose_retry_exhausted"
+                    stop_checkpoint = best_effort_upload_checkpoint(story_id, story_root)
+                    stop = True
             else:
                 remaining = int(episode_result.get("remaining") or 0)
                 status = "running"
@@ -4361,7 +4408,7 @@ def run_gpu_batch(
         # Code bug, not a bad host — destroy without Vast rating.
         destroy_reason = "explicit_abort"
         destroy_error = None
-    elif budget_stop:
+    elif budget_stop or stop_limit == "compose_retry_exhausted":
         destroy_reason = "explicit_abort"
     elif remaining_any or not all_done:
         # Remaining H3 work keeps the box. One Comfy 400 must not deallocate Vast.
