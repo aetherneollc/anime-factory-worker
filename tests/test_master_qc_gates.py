@@ -404,3 +404,33 @@ def test_view_aware_classification_keeps_bad_character_gate(view):
                            prompt="clothed full-body anime character standing", scorer=bad,
                            allow_placeholder=True)
     assert "character_classified_as_bad" in rejected.reasons
+
+
+def test_character_keyframe_repairs_cached_empty_plate(tmp_path, monkeypatch):
+    from anime_factory import keyframe as kf
+    from anime_factory.db import migrate, open_db
+    conn = open_db(tmp_path / "story.sqlite")
+    migrate(conn)
+    plate = synthetic_still_png(1344, 768, tag="empty-room", placeholder=True)
+    composed = synthetic_still_png(1344, 768, tag="character-in-room", placeholder=True)
+    dest = tmp_path / "episodes/EP001/keyframes/s001/f1.png"
+    dest.parent.mkdir(parents=True)
+    dest.write_bytes(plate)
+    (dest.parent / "f01.png").write_bytes(composed)
+    minted = []
+    monkeypatch.setattr(kf, "gate3_assets", lambda *_a, **_k: ([], []))
+    monkeypatch.setattr(kf, "locked_plate_png", lambda *_a: plate)
+    def mint(**kwargs):
+        minted.append(kwargs["dest"])
+        kwargs["dest"].write_bytes(composed)
+    monkeypatch.setattr(kf, "_mint_still", mint)
+    segment = {"id": "s001", "chain_index": 0, "character_id": "c1", "h3_mode": "fl2va_first",
+               "on_camera": True, "first_frame_prompt": "young man sitting in dorm room", "cuts": [{"seq": 1}]}
+    kf.ensure_keyframe(conn, "story-x", "EP001", segment, {}, {"items": []}, {},
+                       KolorsClient(["k"], live=False), None, "fiction", tmp_path)
+    assert dest in minted
+    assert dest.read_bytes() == composed
+    minted.clear()
+    kf.ensure_keyframe(conn, "story-x", "EP001", segment, {}, {"items": []}, {},
+                       KolorsClient(["k"], live=False), None, "fiction", tmp_path)
+    assert dest not in minted

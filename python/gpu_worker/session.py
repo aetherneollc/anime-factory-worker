@@ -1256,6 +1256,10 @@ def _reuse_scene_plate_as_fl2va_keyframe(root: Path, shot: dict) -> bool:
     sid = str(shot.get("id") or "").strip()
     if not sid:
         return False
+    if str(shot.get("character_id") or "").strip() and shot.get("on_camera") is not False:
+        return False
+    if str(shot.get("h3_mode") or "") not in {"fl2va_first", "fl2va_first_last"}:
+        return False
     kf = root / "episodes" / EP / "keyframes" / sid / "f1.png"
     if keyframe_file_ok(kf):
         return True

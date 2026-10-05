@@ -467,7 +467,15 @@ def ensure_keyframe(
     dest = story_root / rel
     dest.parent.mkdir(parents=True, exist_ok=True)
     live = bool(getattr(client, "live", False))
-    if not _file_ok(dest, allow_placeholder=not live):
+    plate_png = locked_plate_png(segment, assets_index, story_root)
+    # Older GPU workers copied an empty scene plate into every character head.
+    # A valid PNG is insufficient evidence of the requested character composition.
+    copied_empty_plate = bool(
+        str(segment.get("character_id") or "").strip()
+        and segment.get("on_camera") is not False
+        and plate_png and dest.is_file() and dest.read_bytes() == plate_png
+    )
+    if copied_empty_plate or not _file_ok(dest, allow_placeholder=not live):
         visual = shot_visual_prompt(segment)
         if not visual:
             cuts = [c for c in (segment.get("cuts") or []) if isinstance(c, dict)]

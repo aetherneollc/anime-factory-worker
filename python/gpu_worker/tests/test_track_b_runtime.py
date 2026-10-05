@@ -1959,6 +1959,16 @@ def test_reuse_scene_plate_as_fl2va_keyframe(tmp_path, monkeypatch):
     assert kf.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
 
 
+def test_character_head_cannot_reuse_empty_scene_plate(tmp_path, monkeypatch):
+    monkeypatch.setattr(session, "EP", "EP001")
+    plate = tmp_path / "assets" / "scenes" / "loc_dorm" / "plate_base.png"
+    plate.parent.mkdir(parents=True)
+    plate.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 12_000)
+    shot = {"id": "s001", "location_id": "loc_dorm", "h3_mode": "ref2va", "character_id": "c1", "on_camera": True}
+    assert session._reuse_scene_plate_as_fl2va_keyframe(tmp_path, shot) is False
+    assert not (tmp_path / "episodes/EP001/keyframes/s001/f1.png").exists()
+
+
 def test_heartbeat_reports_tunnel_down_only_after_startup():
     runtime = session.LeaseRuntime(instance_id="123")
     runtime.begin_startup()
