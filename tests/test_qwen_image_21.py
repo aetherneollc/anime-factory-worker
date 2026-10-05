@@ -90,3 +90,22 @@ def test_dry_run_does_not_download_weights(monkeypatch):
     assert png.startswith(b"\x89PNG")
     assert edited.startswith(b"\x89PNG")
     assert b"qwen21-dry" in png
+
+
+@pytest.mark.parametrize("vram_gb, expected", [(32, "offload"), (80, "cuda")])
+def test_pipeline_load_keeps_sampling_headroom_on_32gb(monkeypatch, vram_gb, expected):
+    import sys
+    from types import SimpleNamespace
+    import anime_factory.qwen_image_21 as qwen
+
+    moves = []
+    pipe = SimpleNamespace(enable_model_cpu_offload=lambda: moves.append("offload"),
+                           to=lambda device: moves.append(device))
+    torch = SimpleNamespace(bfloat16="bf16", cuda=SimpleNamespace(is_available=lambda: True,
+        current_device=lambda: 0, get_device_properties=lambda _id: SimpleNamespace(total_memory=vram_gb * 1024**3)))
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "diffusers", SimpleNamespace(QwenImage21Pipeline=SimpleNamespace(
+        from_pretrained=lambda *_a, **_k: pipe)))
+    monkeypatch.setattr(qwen, "_PIPE", None)
+    assert qwen._load_pipe() is pipe
+    assert moves == [expected]

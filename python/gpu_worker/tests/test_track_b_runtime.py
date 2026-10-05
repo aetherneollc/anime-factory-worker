@@ -146,6 +146,53 @@ def test_sr3_without_comfy_starts_tunnel_and_polls_work(monkeypatch):
     assert len(fetched) >= 2
 
 
+def test_ready_handshake_is_published_before_post_boot_work_poll(monkeypatch):
+    monkeypatch.setenv("AF_ONCE", "1")
+    monkeypatch.setenv("AF_START_COMFY", "1")
+    monkeypatch.setenv("VIDEO_BACKEND", "h3")
+    monkeypatch.setenv("VAST_DRY_RUN", "1")
+    monkeypatch.setenv("CONTROL_PLANE_URL", "https://control.example")
+    monkeypatch.delenv("AF_STORY_ID", raising=False)
+    events = []
+
+    def boot(**_kwargs):
+        events.append("boot")
+        return {"router_ready": True, "tunnel": {}, "handshake": {
+            "profile_id": "h3-comfy-cu130-sm120", "preflight": {"ok": True}}}
+
+    def notify(*_args, **kwargs):
+        if (kwargs.get("handshake") or {}).get("preflight", {}).get("ok"):
+            events.append("publish_ready")
+        return []
+
+    def fetch(*_args):
+        events.append("poll")
+        return {"ok": True, "batch": None, "jobs": [], "workers": []}
+
+    monkeypatch.setattr(stack, "boot_gpu_stack", boot)
+    monkeypatch.setattr(stack, "current_tunnel_status", lambda: {})
+    monkeypatch.setattr(stack, "probe_tunnel_status", lambda: {})
+    monkeypatch.setattr(worker_main, "maybe_notify_control_plane", notify)
+    monkeypatch.setattr(poll, "fetch_work", fetch)
+    monkeypatch.setattr("gpu_worker.comfy.ComfyRouter", lambda: None)
+    assert worker_main.main() == 0
+    after_boot = events[events.index("boot") + 1:]
+    assert after_boot.index("publish_ready") < after_boot.index("poll")
+
+
+def test_claim_conflict_keeps_control_plane_rejection_reason(monkeypatch):
+    from io import BytesIO
+
+    def reject(*_args, **_kwargs):
+        raise urllib.error.HTTPError("https://control.example/gpu/claim", 409, "Conflict", {},
+                                     BytesIO(b'{"error":"capability_mismatch:missing_handshake"}'))
+
+    monkeypatch.setattr(poll.urllib.request, "urlopen", reject)
+    result = poll.claim_job("https://control.example", "123", "story-1")
+    assert result["http_status"] == 409
+    assert result["error"] == "HTTP 409:capability_mismatch:missing_handshake"
+
+
 def test_start_tunnel_does_not_spawn_twice(monkeypatch):
     monkeypatch.setenv("CLOUDFLARE_TUNNEL_TOKEN", "token")
     monkeypatch.setattr(stack, "_tunnel_metrics_connected", lambda: False)
@@ -1819,6 +1866,29 @@ def test_run_gpu_episode_skips_design_anim_qc_compose_when_finals_exist(tmp_path
     )
     assert archived["skip_reason"] == "archived"
     assert archived["remaining"] == 0
+
+
+@pytest.mark.parametrize("error, stage", [("CUDA out of memory", "design"),
+    ("keyframe stage failed: missing f1.png", "keyframe")])
+def test_still_failures_do_not_approve_unfinished_character_assets(tmp_path, monkeypatch, error, stage):
+    jobs = []
+
+    class Control:
+        def job(self, _story, name, status, **_kwargs):
+            jobs.append((name, status))
+
+    monkeypatch.setattr(session, "gpu_cycle_idle_reason", lambda *_a, **_k: None)
+    monkeypatch.setattr(session, "episode_finals_ready", lambda *_a, **_k: False)
+    monkeypatch.setattr(session, "pull_story", lambda *_a, **_k: [])
+    monkeypatch.setattr(session, "run_pre_gpu_if_needed", lambda *_a, **_k: {"skipped": True})
+    monkeypatch.setattr(session, "ensure_story_db", lambda *_a, **_k: object())
+    monkeypatch.setattr(session, "ComfyRouter", lambda: None)
+    monkeypatch.setattr(session, "generate_missing_stills", lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError(error)))
+    monkeypatch.setattr(session, "_checkpoint_story", lambda *_a, **_k: None)
+    result = session.run_gpu_episode("story-x", root=tmp_path, control=Control())
+    assert result["stills"]["ok"] is False
+    assert (stage, "blocked") in jobs
+    assert (("design", "succeeded") in jobs) is (stage == "keyframe")
 
 
 def test_run_gpu_episode_compose_error_keeps_remaining_and_does_not_finish(tmp_path, monkeypatch):

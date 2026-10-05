@@ -3880,13 +3880,10 @@ def run_gpu_episode(
         )
     except Exception as exc:  # noqa: BLE001 — do not stamp keyframe succeeded with 0 files
         err = str(exc)[:500]
-        design_fail = (
-            "produced no character" in err
-            or "no character rows" in err
-            or "empty library" in err
-            or "design visual QC" in err
-            or "candidate R2 upload failed" in err
-        )
+        # Only the explicit keyframe aggregate proves asset generation got
+        # past its QC gate. Model-load/OOM and other early errors are design
+        # failures too; never stamp those assets succeeded.
+        design_fail = not err.startswith("keyframe stage failed:")
         if control:
             if design_fail:
                 control.job(story_id, "design", "blocked", error=err, episode_code=EP)

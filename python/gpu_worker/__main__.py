@@ -615,6 +615,16 @@ def main() -> int:
         runtime.mark_idle()
 
     stack_failed = bool(stack_info and not stack_info.get("router_ready"))
+    if not stack_failed and runtime.handshake is not None:
+        # Publish the completed handshake before the first claim, rather than
+        # waiting for the background heartbeat's next 30-second tick.
+        maybe_notify_control_plane(
+            instance_id,
+            runtime.status,
+            heartbeat_fields=runtime.heartbeat_fields(tunnel),
+            register=False,
+            handshake=runtime.handshake,
+        )
     if stack_failed:
         runtime.status = "booting"
         runtime.idle_since = None

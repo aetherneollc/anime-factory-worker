@@ -120,7 +120,14 @@ def _load_pipe() -> Any:
     if not torch.cuda.is_available():
         raise QwenImage21Error("CUDA required for Qwen-Image-2.1 (or set QWEN_IMAGE_21_DRY_RUN=1)")
     pipe = QwenImage21Pipeline.from_pretrained(model_id, torch_dtype=torch.bfloat16)
-    pipe.to("cuda")
+    # The text encoder and image transformer together leave little sampling
+    # headroom on the production 32GB 5090. Keep only the active component on
+    # CUDA; larger cards can keep the complete pipeline resident.
+    vram = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
+    if vram <= 40 * 1024**3:
+        pipe.enable_model_cpu_offload()
+    else:
+        pipe.to("cuda")
     _PIPE = pipe
     return pipe
 

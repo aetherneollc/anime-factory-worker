@@ -207,6 +207,14 @@ def claim_job(base: str, instance_id: str, story_id: str, episode_code: str = "E
         fast = fail_fast_http_payload(exc)
         if fast is not None:
             return fast
+        if isinstance(exc, urllib.error.HTTPError):
+            try:
+                body = json.loads(exc.read(4096).decode("utf-8"))
+                detail = body.get("error") or body.get("reason")
+                if isinstance(detail, str):
+                    return {"ok": False, "http_status": exc.code, "error": f"HTTP {exc.code}:{detail[:300]}"}
+            except (ValueError, OSError, AttributeError):
+                pass
         return {"ok": False, "error": f"{type(exc).__name__}:{exc}"}
 
 
