@@ -373,3 +373,14 @@ def test_ipadapter_keyframe_weight_separate_from_view_derive():
     )
     node = graph["prompt"]["1"]["inputs"]
     assert node["weight"] == pytest.approx(0.35)
+
+
+def test_side_vision_accepts_profile_without_eye_contact():
+    fields = dict(full_body=True, both_feet_visible=True, single_subject=True,
+                  strict_profile=True, looking_at_viewer=False)
+    assert evaluate_master_vision_fields("side", fields).passed
+    fields.pop("looking_at_viewer")
+    assert evaluate_master_vision_fields("side", fields).passed
+    fields["strict_profile"] = False
+    assert "not_strict_profile" in evaluate_master_vision_fields("side", fields).reasons
+    assert not evaluate_master_vision_fields("front", dict(fields, looking_at_viewer=False)).passed

@@ -35,7 +35,7 @@ MASTER_VISION_KINDS = frozenset({"character_sheet", "character_view_derive"})
 _JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 FRONT_VISION_FIELDS = ("full_body", "both_feet_visible", "single_subject", "looking_at_viewer")
-SIDE_VISION_FIELDS = FRONT_VISION_FIELDS + ("strict_profile",)
+SIDE_VISION_FIELDS = ("full_body", "both_feet_visible", "single_subject", "strict_profile")
 BACK_VISION_FIELDS = (
     "rear_view",
     "face_visible",
