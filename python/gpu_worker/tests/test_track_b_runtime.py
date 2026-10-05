@@ -2785,3 +2785,21 @@ def test_video_index_only_publishes_selected_passing_clips(tmp_path, monkeypatch
     assert index["shots"]["s001"]["path"] == "stories/story-x/shots/s001/generation-001.mp4"
     assert index["shots"]["s001"]["sha256"] == hashlib.sha256(dest.read_bytes()).hexdigest()
     assert (tmp_path / "episodes/EP001/approved_videos.json").is_file()
+
+
+def test_upload_head_uses_staged_source_not_stale_chain_first(tmp_path, monkeypatch):
+    monkeypatch.setattr(session, "EP", "EP001")
+    directory = tmp_path / "episodes/EP001/keyframes/s008"
+    directory.mkdir(parents=True)
+    correct = directory / "f1.png"
+    correct.write_bytes(b"new character composition")
+    (directory / "chain_first.png").write_bytes(b"old previous character frame")
+    uploads = []
+    router = type("Router", (), {"upload_image": lambda _self, name, blob: uploads.append((name, blob))})()
+    session._upload_h3_inputs(router, {"id": "s008", "chain_index": 0,
+        "first_frame_path": "s008_first_hash.png", "first_frame_source_path": str(correct)}, tmp_path)
+    assert uploads == [("s008_first_hash.png", b"new character composition")]
+    uploads.clear()
+    session._upload_h3_inputs(router, {"id": "s008", "chain_index": 0,
+        "first_frame_path": "s008_first_hash.png"}, tmp_path)
+    assert uploads == [("s008_first_hash.png", b"new character composition")]

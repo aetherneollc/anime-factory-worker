@@ -1847,17 +1847,23 @@ def _upload_h3_inputs(router: ComfyRouter, shot: dict, root: Path) -> None:
     sid = str(shot.get("id") or "?")
     first_name = shot.get("first_frame_path")
     first_src = None
-    if first_name:
+    source = Path(str(shot.get("first_frame_source_path") or ""))
+    if source.is_file():
+        first_src = source
+    elif first_name:
         candidate = Path(str(first_name))
         if candidate.is_file():
             first_src = candidate
         else:
-            kf = root / "episodes" / EP / "keyframes" / sid / "f1.png"
-            if kf.is_file():
-                first_src = kf
-            chained = root / "episodes" / EP / "keyframes" / sid / "chain_first.png"
-            if chained.is_file():
-                first_src = chained
+            chain_tail = int(shot.get("chain_index") or 0) > 0 or bool(shot.get("chain_source_last_frame"))
+            if chain_tail:
+                chained = root / "episodes" / EP / "keyframes" / sid / "chain_first.png"
+                if chained.is_file():
+                    first_src = chained
+            else:
+                kf = root / "episodes" / EP / "keyframes" / sid / "f1.png"
+                if kf.is_file():
+                    first_src = kf
             input_hit = _comfy_input_dir() / Path(str(first_name)).name
             if first_src is None and input_hit.is_file():
                 first_src = input_hit
