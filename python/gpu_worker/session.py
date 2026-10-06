@@ -3918,6 +3918,8 @@ def run_gpu_episode(
             "langs": list(episode_langs),
             "pulled": len(pulled),
             "pre_gpu": pre_gpu,
+            "blocked_stage": "board",
+            "blocked_error": str(pre_gpu.get("error") or "pre_gpu_blocked"),
             "stills": None,
             "anim": {"failed": [{"error": "pre_gpu_blocked"}], "shots_total": 0, "shots_done": 0},
             "compose": None,
@@ -3961,10 +3963,12 @@ def run_gpu_episode(
             else:
                 control.job(story_id, "design", "succeeded", episode_code=EP)
                 control.job(story_id, "keyframe", "blocked", error=err, episode_code=EP)
+            control.job(story_id, "anim", "blocked", error=f"upstream {'design' if design_fail else 'keyframe'} blocked: {err}", episode_code=EP)
         try:
             _checkpoint_story(conn, story_id, root, progress=progress, upload=True)
         except Exception:
             pass
+        pending_shots = _board_shots(root)
         return {
             "story_id": story_id,
             "episode_code": EP,
@@ -3972,9 +3976,11 @@ def run_gpu_episode(
             "pulled": len(pulled),
             "pre_gpu": pre_gpu,
             "stills": {"ok": False, "error": str(exc)[:500]},
-            "anim": {"failed": [{"error": f"keyframe:{exc}"}], "shots_total": 0, "shots_done": 0},
+            "blocked_stage": "design" if design_fail else "keyframe",
+            "blocked_error": err,
+            "anim": {"failed": [{"error": f"keyframe:{exc}"}], "shots_total": len(pending_shots), "shots_done": 0},
             "compose": None,
-            "remaining": 1,
+            "remaining": max(1, len(pending_shots)),
             "truncated": False,
         }
     if control:
@@ -4311,6 +4317,13 @@ def run_gpu_batch(
                 current_stage = "compose"
                 runtime.remember_completed(story_id, episode_code)
                 runtime.compose_failures.pop((story_id, episode_code), None)
+            elif episode_result.get("blocked_stage"):
+                current_stage = str(episode_result["blocked_stage"])
+                error = str(episode_result.get("blocked_error") or "preproduction blocked")
+                status = "blocked"
+                stop_limit = "preproduction_blocked"
+                stop_checkpoint = best_effort_upload_checkpoint(story_id, story_root)
+                stop = True
             elif isinstance(episode_result.get("compose"), dict) and episode_result["compose"].get("ok") is False:
                 current_stage = "compose"
                 error = str(episode_result["compose"].get("error") or "compose failed")
@@ -4448,7 +4461,7 @@ def run_gpu_batch(
         # Code bug, not a bad host — destroy without Vast rating.
         destroy_reason = "explicit_abort"
         destroy_error = None
-    elif budget_stop or stop_limit == "compose_retry_exhausted":
+    elif budget_stop or stop_limit in {"compose_retry_exhausted", "preproduction_blocked"}:
         destroy_reason = "explicit_abort"
     elif remaining_any or not all_done:
         # Remaining H3 work keeps the box. One Comfy 400 must not deallocate Vast.

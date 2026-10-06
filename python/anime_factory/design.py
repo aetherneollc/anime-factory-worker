@@ -2571,6 +2571,11 @@ def generate_asset_library(
                         rel_locked = rel
                     spec["path"] = rel_locked
                     _record_round_view(round_views, spec, rel_locked)
+                    _upsert_asset_row(
+                        conn, aid, spec, asset_path(story_id, rel_locked),
+                        spec["prompt"], spec.get("seed"), Path(locked).read_bytes(),
+                        selected_image_id=Path(rel_locked).name,
+                    )
                 if kind in {"character_sheet", "costume_derive"} and spec.get("character_id"):
                     alias = Path(story_root) / character_asset_rel(str(spec["character_id"]), FRONT_ALIAS_FILENAME)
                     if locked and locked.suffix.lower() == ".png" and not still_file_ok(alias):
@@ -2584,6 +2589,11 @@ def generate_asset_library(
             if reused:
                 spec["path"] = reused
                 _record_round_view(round_views, spec, reused)
+                _upsert_asset_row(
+                    conn, aid, spec, asset_path(story_id, reused),
+                    spec["prompt"], spec.get("seed"), (Path(story_root) / reused).read_bytes(),
+                    selected_image_id=Path(reused).name,
+                )
                 created.append(aid)
                 continue
             existing = story_root / rel if story_root is not None else None
@@ -2996,11 +3006,40 @@ def seed_cast_from_story_root(conn: sqlite3.Connection, story_root: Path | None)
                             name=name,
                             exclusions=exclusions_map.get(cid) or identity_exclusions(prompt),
                         ),
-                        fail_closed_if_locked=False,
+                        fail_closed_if_locked=True,
                     )
                 continue
             locked = bool(is_qc_locked(root, character_id=cid)) if is_qc_locked else False
             if locked and sync_character_source_hash is not None and character_source_hash is not None:
+                # Old checkpoints seeded placeholder names/ages before approving
+                # the portrait. Correct metadata only when the visual prompt is
+                # identical and explicitly confirms the requested age.
+                index = load_assets_index(root)
+                rec = (index.get("characters") or {}).get(cid) or {}
+                exclusions = exclusions_map.get(cid) or identity_exclusions(prompt)
+                old_hash = character_source_hash(
+                    identity_prompt=old_prompt, age=old_age,
+                    name=str(existing["name"] or ""), exclusions=exclusions,
+                )
+                new_hash = character_source_hash(
+                    identity_prompt=prompt, age=age, name=name, exclusions=exclusions,
+                )
+                if (old_prompt == prompt
+                    and str(existing["name"] or "") in {cid, name}
+                    and parse_identity_age(prompt, default=None) == int(age)
+                    and rec.get("source_hash") == old_hash):
+                    rec["source_hash"] = new_hash
+                    rec["identity_source_hash"] = new_hash
+                    save_assets_index(
+                        root, index,
+                        extra=json.loads((root / "assets/index.json").read_text(encoding="utf-8")),
+                    )
+                    conn.execute(
+                        "UPDATE characters SET name = ?, age = ? WHERE id = ?",
+                        (name, int(age), cid),
+                    )
+                    updated_chars += 1
+                    continue
                 sync_character_source_hash(
                     root,
                     character_id=cid,

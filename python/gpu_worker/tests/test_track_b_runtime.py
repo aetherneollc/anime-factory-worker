@@ -2208,6 +2208,24 @@ def test_failed_sfx_restores_gpu_before_propagating_error(tmp_path, monkeypatch)
     assert calls == ["release", "restore"]
 
 
+def test_batch_stops_on_design_block_without_reporting_anim_progress(monkeypatch):
+    monkeypatch.setattr(session, "run_gpu_episode", lambda *_a, **_k: {
+        "remaining": 1, "blocked_stage": "design", "blocked_error": "source_hash changed",
+    })
+    monkeypatch.setattr(session, "best_effort_upload_checkpoint", lambda *_a: {"ok": True})
+    reports = []
+    out = session.run_gpu_batch(
+        {"batch_id": "b1", "story_id": "story-1", "episodes": [{"episode_code": "EP001"}]},
+        session.LeaseRuntime(instance_id="123"),
+        report=lambda b: reports.append(b) or {"ok": True},
+    )
+    assert reports[0]["stage"] == "design"
+    assert reports[0]["status"] == "blocked"
+    assert reports[0]["error"] == "source_hash changed"
+    assert out["destroy_reason"] == "explicit_abort"
+    assert out["limit"] == "preproduction_blocked"
+
+
 def test_batch_reports_compose_error_and_stops_after_three_attempts(monkeypatch):
     monkeypatch.setattr(session, "run_gpu_episode", lambda *_a, **_k: {
         "remaining": 1, "anim": {"shots_total": 15, "shots_done": 15, "failed": []},

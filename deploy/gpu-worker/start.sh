@@ -4,6 +4,13 @@
 # Weights: HuggingFace → instance disk. HF_TOKEN optional. Never R2 weight cache.
 # /opt/venv holds the image Python (official PyTorch runtime + system site-packages).
 
+# Vast may mount authorized_keys with permissions rejected by OpenSSH.
+if [ "$(id -u)" = 0 ] && [ -f /root/.ssh/authorized_keys ]; then
+  chown root:root /root/.ssh /root/.ssh/authorized_keys
+  chmod 700 /root/.ssh
+  chmod 600 /root/.ssh/authorized_keys
+fi
+
 export VIRTUAL_ENV="${VIRTUAL_ENV:-/opt/venv}"
 if [ -x /opt/venv/bin/python ]; then
   export PATH="/opt/venv/bin:${PATH}"

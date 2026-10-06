@@ -175,12 +175,19 @@ def test_bind_or_generate_skips_locked_identity(tmp_path):
     items = {item["id"]: item for item in index["items"]}
     assert items["char_hero_turnaround"]["path"].endswith(TURNAROUND_FILENAME)
     assert "items" in index
+    conn.execute("DELETE FROM assets WHERE character_id = 'hero'")
+    conn.commit()
     client2 = KolorsClient(["k"], opener=sized_placeholder_opener("two"), live=False)
     second = generate_asset_library(
         conn, "story-x", chars, locs, props, client2, None, "fiction", tmp_path, interiors=interiors, skip_existing=False, clip_scorer=passing_scorer()
     )
     assert "char_hero_sheet" not in second["created"]
     assert turnaround.read_bytes() == first_blob
+    restored = conn.execute("SELECT path, fingerprint FROM assets WHERE id='char_hero_sheet'").fetchone()
+    assert restored["path"].endswith("assets/characters/hero/sheet_front.png")
+    import hashlib
+    assert restored["fingerprint"] == "sha256:" + hashlib.sha256(front.read_bytes()).hexdigest()
+    assert not any(p.get("_kind") in {"character_sheet", "character_view_derive"} for p in client2.last_payloads)
 
 
 def test_locked_identity_and_h3_session_bind_front_not_turnaround(tmp_path):

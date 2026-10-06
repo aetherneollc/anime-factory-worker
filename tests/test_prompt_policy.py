@@ -248,6 +248,45 @@ def test_extract_wiki_identity_translates_cjk_identity_value():
     assert not any("\u4e00" <= ch <= "\u9fff" for ch in validated)
 
 
+@pytest.mark.parametrize("changed_identity", [False, True])
+def test_locked_placeholder_metadata_repair_preserves_visual_lock(tmp_path, changed_identity):
+    from anime_factory.db import migrate, open_db
+    from anime_factory.asset_lock import save_assets_index, load_assets_index
+    from anime_factory.h3_storyboard import character_source_hash
+
+    prompt = "1boy, young adult, 21 y/o, short black hair, brown eyes, white shirt, black trousers, white sneakers, lean build"
+    prompt = validate_character_identity(prompt, character_id="c1", name="张润泽")
+    conn = open_db(tmp_path / "story.sqlite")
+    migrate(conn)
+    conn.execute("INSERT INTO characters (id,name,age,identity_prompt) VALUES (?,?,?,?)", ("c1", "c1", 16, prompt))
+    conn.commit()
+    portrait = tmp_path / "assets/characters/c1/sheet_front.png"
+    portrait.parent.mkdir(parents=True)
+    portrait.write_bytes(synthetic_still_png(768, 1344, tag="locked-portrait"))
+    save_assets_index(tmp_path, {"characters": {"c1": {
+        "selected": "sheet_front.png", "qc_verdict": "pass",
+        "qc_version": "visual_qc_v1", "qc_scorer": "open_clip:ViT-B-32:openai",
+        "source_hash": character_source_hash(identity_prompt=prompt, age=16, name="c1"),
+    }}})
+    wiki = tmp_path / "canon/wiki/characters"
+    wiki.mkdir(parents=True)
+    target = prompt.replace("black hair", "red hair") if changed_identity else prompt
+    (wiki / "c1.md").write_text(f"# 张润泽\n\n- **编号**：`c1`\n- **身份**：{target}\n", encoding="utf-8")
+    if changed_identity:
+        with pytest.raises(ValueError, match="source_hash changed"):
+            seed_cast_from_story_root(conn, tmp_path)
+        assert conn.execute("SELECT age FROM characters WHERE id='c1'").fetchone()[0] == 16
+    else:
+        seed_cast_from_story_root(conn, tmp_path)
+        row = conn.execute("SELECT name,age FROM characters WHERE id='c1'").fetchone()
+        assert tuple(row) == ("张润泽", 21)
+        rec = load_assets_index(tmp_path)["characters"]["c1"]
+        assert rec["selected"] == "sheet_front.png"
+        assert rec["qc_verdict"] == "pass"
+        seed_cast_from_story_root(conn, tmp_path)  # restart remains idempotent
+        assert load_assets_index(tmp_path)["characters"]["c1"]["qc_verdict"] == "pass"
+
+
 def test_seed_cast_from_story_root_accepts_chinese_wiki_labels(tmp_path):
     from anime_factory.db import migrate, open_db
 
