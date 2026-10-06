@@ -305,7 +305,10 @@ def test_run_anim_longlive_one_load_and_native_dims(tmp_path, monkeypatch):
         lambda *a, **k: scaled.append(a) or (_ for _ in ()).throw(AssertionError("must not scale native")),
     )
 
-    out = session.run_anim("story-ll", tmp_path, object(), router=None)
+    from anime_factory.db import migrate, open_db
+    conn = open_db(tmp_path / "story.sqlite")
+    migrate(conn)
+    out = session.run_anim("story-ll", tmp_path, conn, router=None)
     assert out["failed"] == []
     assert set(out["generated"]) == {"take-01", "take-02"}
     assert out["model_load_count"] == 1

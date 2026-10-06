@@ -673,6 +673,24 @@ def test_generation_versions_stay_monotonic_with_sparse_checkpoint(tmp_path):
     assert rel.endswith("generation-005.mp4")
 
 
+def test_generation_versions_preserve_history_when_candidate_files_are_missing(tmp_path):
+    from anime_factory.qc import next_generation_path, record_generation_result
+    conn = open_db(tmp_path / "story.sqlite")
+    migrate(conn)
+    record_generation_result(conn, "s001", 7, "missing/generation-007.mp4", 11, "ref2va", "failed", "fail")
+    record_generation_result(conn, "s002", 20, "missing/generation-020.mp4", 11, "ref2va", "failed", "fail")
+    directory = tmp_path / "shots/s001"
+    directory.mkdir(parents=True)
+    (directory / "generation-004.mp4").write_bytes(b"old candidate")
+    version, rel = next_generation_path(tmp_path, "s001", conn)
+    assert version == 8
+    record_generation_result(conn, "s001", version, rel, 28, "ref2va", "completed", "pass")
+    old = conn.execute("SELECT path,status,qc_verdict FROM generation_results WHERE id='s001-g007'").fetchone()
+    assert tuple(old) == ("missing/generation-007.mp4", "failed", "fail")
+    assert next_generation_path(None, "s001", conn)[0] == 9
+    assert next_generation_path(tmp_path, "s003", conn)[0] == 1
+
+
 def test_production_video_qc_cannot_pass_when_visual_scorer_fails(tmp_path, monkeypatch):
     from anime_factory.qc import incremental_qc_segment
     from anime_factory import video_visual_qc

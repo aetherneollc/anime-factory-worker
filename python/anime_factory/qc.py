@@ -413,8 +413,16 @@ def select_passing_generation(
     return best[2], best[1], best[3]
 
 
-def next_generation_path(root: Path | None, segment_id: str) -> tuple[int, str]:
+def next_generation_path(
+    root: Path | None, segment_id: str, conn: sqlite3.Connection | None = None,
+) -> tuple[int, str]:
     version = 1
+    if conn is not None:
+        row = conn.execute(
+            "SELECT MAX(version) FROM generation_results WHERE segment_id = ?", (segment_id,)
+        ).fetchone()
+        if row is not None and row[0] is not None:
+            version = int(row[0]) + 1
     if root is not None:
         import re
         current_dir = (root / shot_version_path(segment_id, 1)).parent

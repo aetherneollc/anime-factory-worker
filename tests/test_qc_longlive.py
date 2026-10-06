@@ -239,7 +239,10 @@ def test_run_anim_longlive_passes_prev_segment_to_qc(tmp_path: Path, monkeypatch
 
     monkeypatch.setattr(session, "_longlive_infer_hook", infer)
 
-    out = session.run_anim("story-chain", tmp_path, object(), router=None)
+    from anime_factory.db import migrate, open_db
+    conn = open_db(tmp_path / "story.sqlite")
+    migrate(conn)
+    out = session.run_anim("story-chain", tmp_path, conn, router=None)
     assert out["failed"] == []
     assert {call["segment_id"] for call in qc_calls} == {"take-01", "take-02"}
 

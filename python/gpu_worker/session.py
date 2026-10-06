@@ -2546,7 +2546,7 @@ def _run_anim_longlive(
                     )
                 except Exception:
                     pass
-            version, rel = next_generation_path(root, sid)
+            version, rel = next_generation_path(root, sid, conn)
             dest = root / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
             take_id = str(shot.get("take_id") or sid)
@@ -2822,7 +2822,7 @@ def _run_anim_h3(
                 next_shot = shots[index + 1] if index + 1 < len(shots) else None
                 if next_shot is not None and can_prefetch_staging(next_shot):
                     prep_pool.schedule(next_shot)
-                version, rel = next_generation_path(root, sid)
+                version, rel = next_generation_path(root, sid, conn)
                 dest = root / rel
                 used_mode = select_mode(shot)
                 session_tracker.note_mode(used_mode)
@@ -2918,7 +2918,7 @@ def _run_anim_h3(
                         h3_mode=repair.get("h3_mode") or shot.get("h3_mode"),
                     )
                     shots[index] = shot
-                    version, rel = next_generation_path(root, sid)
+                    version, rel = next_generation_path(root, sid, conn)
                     dest = root / rel
                     used_mode = select_mode(shot)
                     session_tracker.note_mode(used_mode)
@@ -3158,7 +3158,7 @@ def _run_anim_skyreels(
                     except Exception:
                         pass
                 continue
-            version, rel = next_generation_path(root, sid)
+            version, rel = next_generation_path(root, sid, conn)
             dest = root / rel
             _submit_skyreels(shot, root, dest, references)
             _upload_finished_shot(story_id, dest, rel, sid, progress)
