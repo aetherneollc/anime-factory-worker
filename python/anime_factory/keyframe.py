@@ -476,11 +476,11 @@ def ensure_keyframe(
         and plate_png and dest.is_file() and dest.read_bytes() == plate_png
     )
     if copied_empty_plate or not _file_ok(dest, allow_placeholder=not live):
+        from anime_factory.h3_storyboard import ensure_cuts_for_segment
+        cuts = ensure_cuts_for_segment(segment)
         visual = shot_visual_prompt(segment)
-        if not visual:
-            cuts = [c for c in (segment.get("cuts") or []) if isinstance(c, dict)]
-            if cuts:
-                visual = compose_cut_still_prompt(segment, cuts[0], story_root=story_root)
+        if cuts and (visual or cuts[0].get("frame_prompt")):
+            visual = compose_cut_still_prompt(segment, cuts[0], story_root=story_root)
         if not visual:
             raise RuntimeError(
                 f"segment {segment.get('id')} has no first_frame_prompt; refusing to draw a keyframe "

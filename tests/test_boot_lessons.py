@@ -1,6 +1,7 @@
 """Historical Vast boot failures encoded as fixtures (not markdown)."""
 
 from pathlib import Path
+import pytest
 
 from gpu_worker.boot import (
     DESTROY_REASONS,
@@ -595,3 +596,18 @@ def test_probe_comfy_torch_import_maps_sigsegv_to_preflight(monkeypatch):
         assert exc.code == "torch_import_sigsegv"
         assert "cudaMallocAsync" in exc.message
 
+
+@pytest.mark.parametrize("healthy", [True, False])
+def test_torch_probe_avoids_second_cuda_context_only_with_healthy_comfy(monkeypatch, healthy):
+    from gpu_worker import stack
+    from types import SimpleNamespace
+    seen = {}
+    monkeypatch.setattr(stack, "_port_open", lambda *a: True)
+    monkeypatch.setattr(stack, "probe_comfy_system_stats", lambda *a: healthy)
+    monkeypatch.setenv("AF_INTERNAL_EXISTING_COMFY", "1")
+    def run(args, **kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+    monkeypatch.setattr(stack.subprocess, "run", run)
+    stack.probe_comfy_torch_import()
+    assert (seen["env"].get("AF_INTERNAL_EXISTING_COMFY") == "1") == healthy

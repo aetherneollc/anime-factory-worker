@@ -80,7 +80,10 @@ def test_run_anim_skyreels_uploads_finished_shots_without_last_png(tmp_path, mon
     monkeypatch.setattr(session, "record_generation_result", lambda *_a, **_k: None)
     monkeypatch.setattr(session, "_checkpoint_story", lambda *_a, **_k: {"ok": True})
     events: list[str] = []
-    out = session.run_anim("story-1", tmp_path, object(), router=None, progress=events.append)
+    from anime_factory.db import open_db, migrate
+    conn = open_db(tmp_path / "story.sqlite")
+    migrate(conn)
+    out = session.run_anim("story-1", tmp_path, conn, router=None, progress=events.append)
     assert out["generated"] == ["s001", "s002"]
     assert out["failed"] == []
     assert out["gpu_done"] is True

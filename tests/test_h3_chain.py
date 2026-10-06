@@ -725,3 +725,66 @@ def test_video_qc_uses_production_embed_scorer_protocol(tmp_path):
             return [[0., 1.]]
     assert _encode_paths([image], Scorer()) == [[1., 0.]]
     assert _encode_texts(["young man"], Scorer()) == [[0., 1.]]
+
+
+@pytest.mark.parametrize("frames,expected", [([[1., 0.], [0., 1.], [1., 0.]], "retry"), ([[1., 0.]] * 3, "pass")])
+def test_video_identity_probe_checks_every_frame(tmp_path, monkeypatch, frames, expected):
+    from anime_factory import video_visual_qc as qc
+    monkeypatch.setattr(qc, "extract_qc_frames", lambda *a, **k: {str(i): tmp_path / f"{i}.jpg" for i in range(3)})
+    monkeypatch.setattr(qc, "_frame_entropy", lambda p: 7.)
+    monkeypatch.setattr(qc, "_encode_paths", lambda paths, scorer: frames)
+    def texts(prompts, scorer):
+        if prompts[0].startswith("anime image of a young woman"):
+            return [[1., 0.], [0., 1.]]
+        return [[1., 1.], [1., 1.]]
+    monkeypatch.setattr(qc, "_encode_texts", texts)
+    result = qc.score_video_visual(tmp_path / "clip.mp4", segment={"duration": 8}, identity_prompt="young woman with long black hair", scorer=object())
+    assert result.verdict == expected
+    assert ("identity_gender_drift" in result.reasons) == (expected == "retry")
+
+
+def test_head_keyframe_includes_canonical_costume_when_pose_omits_it(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from anime_factory import keyframe as kf
+    conn = open_db(tmp_path / "story.sqlite")
+    migrate(conn)
+    conn.execute("INSERT INTO characters(id,name,age,identity_prompt) VALUES ('hero','Hero',20, 'young woman, long black hair, grey jacket, blue jeans')")
+    conn.commit()
+    monkeypatch.setattr(kf, "gate3_assets", lambda *a, **kw: ([], []))
+    monkeypatch.setattr(kf, "sheet_file_on_disk", lambda *a: tmp_path / "sheet.png")
+    monkeypatch.setattr(kf, "locked_plate_png", lambda *a: None)
+    prompts = []
+    def mint(**kwargs):
+        prompts.append(kwargs['prompt'])
+        kwargs['dest'].write_bytes(synthetic_still_png(1440,800,tag="keyframe",placeholder=True))
+    monkeypatch.setattr(kf, "_mint_still", mint)
+    ensure_keyframe(conn, 'story-x', 'EP001', {'id':'s001','character_id':'hero','h3_mode':'ref2va','first_frame_prompt':'standing in a corridor, phone at ear'}, {}, {}, {}, SimpleNamespace(live=False), None, 'fiction', tmp_path)
+    assert 'blue jeans' in prompts[0]
+    assert 'phone at ear' in prompts[0]
+
+
+@pytest.mark.parametrize("has_board", [False, True])
+def test_background_board_text_is_not_hidden_by_foreground_person(tmp_path, has_board):
+    from PIL import Image
+    from anime_factory.video_visual_qc import score_board_regions
+    frame = tmp_path / 'frame.png'
+    Image.new('RGB', (160, 90), 'blue').save(frame)
+    class Scorer:
+        def embed_images(self, images):
+            assert len(images) == 4
+            assert all(image.size == (80, 45) for image in images)
+            return [[0., 1.] if has_board and i == 0 else [1., 0.] for i in range(4)]
+        def embed_texts(self, prompts):
+            return [[1., 0.], [0., 1.], [0., 1.]]
+    detected, scores = score_board_regions([frame], Scorer())
+    assert detected == has_board
+
+
+def test_board_region_probe_fails_closed_on_incomplete_embeddings(tmp_path):
+    from PIL import Image
+    from types import SimpleNamespace
+    from anime_factory.video_visual_qc import score_board_regions
+    frame = tmp_path / 'frame.png'
+    Image.new('RGB', (160,90), 'blue').save(frame)
+    with pytest.raises(RuntimeError, match='incomplete'):
+        score_board_regions([frame], SimpleNamespace(embed_images=lambda images: []))

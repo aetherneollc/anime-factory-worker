@@ -300,6 +300,8 @@ def compile_picture_prompt(segment: dict[str, Any]) -> str:
             clause = f"{label}: {clause}"
         parts.append(clause)
     prompt = " [cut] ".join(parts) if parts else DEFAULT_FRAME_PROMPT
+    if len(cuts) == 1 and len(cuts[0].get("characters") or []) == 1:
+        prompt += ", one continuous shot of the same character throughout, preserve hair and clothing, do not cut to a different person"
     # Prefer an explicit compiled visual field when present (and not dialogue).
     for key in ("h3_prompt", "first_frame_prompt", "action", "prompt"):
         # Skip fields that are clearly the packed dialogue-polluted cineflow body

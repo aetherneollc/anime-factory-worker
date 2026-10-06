@@ -801,7 +801,7 @@ comfy.options.enable_args_parsing()
 import cuda_malloc  # noqa: F401 — must run before torch, same as Comfy main.py
 import torch
 
-if torch.cuda.is_available():
+if torch.cuda.is_available() and os.environ.get("AF_INTERNAL_EXISTING_COMFY") != "1":
     x = torch.zeros(1, device="cuda")
     torch.cuda.synchronize()
     if int((x + 1).item()) != 1:
@@ -820,10 +820,16 @@ def probe_comfy_torch_import(
     main_path = Path(launch[1])
     comfy_root = str(main_path.parent)
     flags = launch[2:]
+    probe_env = comfy_subprocess_env()
+    probe_env.pop("AF_INTERNAL_EXISTING_COMFY", None)
+    if _port_open("127.0.0.1", 8188) and probe_comfy_system_stats(ROUTER_URL):
+        # A healthy Comfy process can own all VRAM during recovery. Validate
+        # imports here without allocating a second CUDA context beside it.
+        probe_env["AF_INTERNAL_EXISTING_COMFY"] = "1"
     try:
         proc = subprocess.run(
             [sys.executable, "-c", _COMFY_TORCH_PROBE_SCRIPT, *flags, comfy_root],
-            env=comfy_subprocess_env(),
+            env=probe_env,
             capture_output=True,
             text=True,
             timeout=max(1.0, float(timeout_s)),

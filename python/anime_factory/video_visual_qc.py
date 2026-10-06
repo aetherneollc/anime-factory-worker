@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,7 +20,7 @@ from anime_factory.visual_qc import (
     shannon_entropy,
 )
 
-QC_VERSION = "video_visual_qc_v1"
+QC_VERSION = "video_visual_qc_v2"
 MAX_VISUAL_RETRIES = 2
 
 # Soft thresholds — fail closed only when clearly broken; limb detail is not guaranteed.
@@ -175,6 +176,30 @@ def _mean_sim(frame_vecs: Sequence[Sequence[float]], ref_vec: Sequence[float] | 
     return sum(identity_similarity(fv, ref_vec) for fv in frame_vecs) / max(1, len(frame_vecs))
 
 
+def score_board_regions(frames: Sequence[Path], scorer: Any) -> tuple[bool, dict[str, float]]:
+    """Inspect background quadrants so a foreground face cannot hide board text."""
+    crops = []
+    for path in frames:
+        image = _load_rgb(path)
+        w, h = image.size
+        crops.extend(image.crop((x*w//2, y*h//2, (x+1)*w//2, (y+1)*h//2))
+                     for y in range(2) for x in range(2))
+    encode = getattr(scorer, "embed_images", None)
+    if encode is None:
+        raise RuntimeError("board region scorer lacks image embeddings")
+    vectors = encode(crops)
+    if len(vectors) != len(crops) or not vectors:
+        raise RuntimeError("board region embeddings incomplete")
+    plain, chalk, numbers = _encode_texts([
+        "a plain empty wall", "a green chalkboard with chalk handwriting",
+        "a blackboard with written numbers",
+    ], scorer)
+    evidence = [(max(cosine(v, chalk), cosine(v, numbers)), cosine(v, plain)) for v in vectors]
+    detected = any(board >= 0.24 and board - wall > 0.025 for board, wall in evidence)
+    return detected, {"board_region_peak": max(board for board, _ in evidence),
+                      "board_region_margin": max(board-wall for board, wall in evidence)}
+
+
 def cut_boundaries_from_segment(segment: dict | None) -> list[float]:
     if not segment:
         return []
@@ -262,6 +287,14 @@ def score_video_visual(
 
     if clip is not None:
         frame_vecs = _encode_paths(list(frames.values()), clip)
+        if require_clip and (segment or {}).get("text_policy", "no_generated_text") == "no_generated_text":
+            try:
+                detected, region_scores = score_board_regions(list(frames.values()), clip)
+                scores.update(region_scores)
+                if detected:
+                    reasons.append("generated_board_text")
+            except Exception:
+                reasons.append("board_probe_unavailable")
         if keyframe_path and Path(keyframe_path).is_file():
             ref = _encode_paths([Path(keyframe_path)], clip)
             sim = _mean_sim(frame_vecs, ref[0] if ref else None)
@@ -274,6 +307,26 @@ def score_video_visual(
             scores["character_sim"] = sim
             if sim < CHARACTER_SIM_MIN:
                 reasons.append("identity_drift")
+        # A matching first frame must not conceal a different actor later.
+        female = bool(re.search(r"\b(woman|female|1girl)\b", identity_prompt, re.I))
+        male = bool(re.search(r"\b(man|male|1boy)\b", identity_prompt, re.I))
+        if female != male:
+            try:
+                hair_lock = bool(re.search(r"long\s+black\s+hair", identity_prompt, re.I)) if female else bool(re.search(r"short\s+black\s+hair", identity_prompt, re.I))
+                woman, man = _encode_texts([
+                    "anime image of a young woman" + (" with long black hair" if hair_lock else ""),
+                    "anime image of a young man" + (" with short black hair" if hair_lock else ""),
+                ], clip)
+                margins = [cosine(v, woman) - cosine(v, man) for v in frame_vecs]
+                if male:
+                    margins = [-m for m in margins]
+                if not margins:
+                    raise RuntimeError("no identity frame embeddings")
+                scores["identity_gender_min_margin"] = min(margins)
+                if min(margins) < -0.01:
+                    reasons.append("identity_gender_drift")
+            except Exception:
+                reasons.append("identity_probe_unavailable")
         if scene_lock_path and Path(scene_lock_path).is_file():
             ref = _encode_paths([Path(scene_lock_path)], clip)
             sim = _mean_sim(frame_vecs, ref[0] if ref else None)

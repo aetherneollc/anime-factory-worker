@@ -1383,11 +1383,14 @@ def test_run_anim_progress_requires_qc_and_successful_r2_upload(tmp_path, monkey
         "checkpoint_and_upload",
         lambda _conn, dest: Path(dest),
     )
+    from anime_factory.db import open_db, migrate
+    conn = open_db(tmp_path / "story.sqlite")
+    migrate(conn)
     events = []
     result = session.run_anim(
         "story-1",
         tmp_path,
-        object(),
+        conn,
         router=object(),
         progress=events.append,
     )

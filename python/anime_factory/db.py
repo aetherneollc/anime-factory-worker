@@ -149,6 +149,12 @@ def checkpoint_and_upload(conn: sqlite3.Connection, dest: str | Path) -> Path:
     wal_checkpoint(conn)
     dest_p = Path(dest)
     dest_p.parent.mkdir(parents=True, exist_ok=True)
+    current = next((row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main"), "")
+    if current and Path(current).resolve() == dest_p.resolve():
+        # Replacing an open SQLite file leaves the writer on the old inode.
+        # Later commits can disappear when that connection closes. The WAL
+        # checkpoint already makes the current file ready to upload.
+        return dest_p
     tmp = dest_p.with_name(dest_p.name + ".tmp")
     backup = sqlite3.connect(str(tmp))
     try:

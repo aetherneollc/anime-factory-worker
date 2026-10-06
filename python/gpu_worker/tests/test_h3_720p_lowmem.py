@@ -255,7 +255,7 @@ def test_h3_oom_skips_shot_without_killing_episode(tmp_path, monkeypatch):
     monkeypatch.setattr(
         session,
         "next_generation_path",
-        lambda _root, sid: (1, f"episodes/EP001/shots/{sid}/v001.mp4"),
+        lambda _root, sid, _conn=None: (1, f"episodes/EP001/shots/{sid}/v001.mp4"),
     )
 
     class _NoopPrepPool:
