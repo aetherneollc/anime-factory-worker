@@ -803,3 +803,27 @@ def test_video_prompt_resolves_character_id_to_canonical_appearance(tmp_path):
     assert 'one continuous shot' in prompt
     assert 'dialogue must stay out' not in prompt
     conn.close()
+
+
+def test_identity_repair_preserves_cast_and_reaches_compiled_cut_prompt():
+    from anime_factory.qc import plan_repair
+    from anime_factory.h3_storyboard import compile_picture_prompt
+    shot = {'id':'s007','duration':8,'character_id':'c2','identity_prompt':'1girl, long black hair, grey jacket, blue jeans',
+            'h3_prompt':'woman using phone','cuts':[{'seq':1,'seconds':8,'characters':['c2'],'frame_prompt':'woman using phone'}]}
+    repair = plan_repair(shot, ['identity_gender_drift'], 1)
+    prompt = compile_picture_prompt(dict(shot, **{k: repair[k] for k in ['h3_prompt','h3_repair_constraints']}))
+    assert 'keep exact locked face' in prompt
+    assert 'grey jacket, blue jeans' in prompt
+    assert 'navy worker uniform' not in prompt
+    assert 'epaulettes' not in prompt
+
+
+def test_board_text_repair_reaches_compiled_cuts():
+    from anime_factory.qc import plan_repair
+    from anime_factory.h3_storyboard import compile_picture_prompt
+    from anime_factory.video_visual_qc import map_reasons_to_strategy
+    shot = {'id':'s014','duration':8,'cuts':[{'seq':1,'seconds':8,'frame_prompt':'woman by window'}]}
+    assert map_reasons_to_strategy(['generated_board_text']) == 'reinforce_no_text'
+    repair = plan_repair(shot, ['generated_board_text'], 1)
+    assert repair['strategy'] == 'reinforce_no_text'
+    assert 'no blackboard writing' in compile_picture_prompt(dict(shot, h3_repair_constraints=repair['h3_repair_constraints']))

@@ -463,6 +463,7 @@ def plan_repair(segment: dict, issues: list[str], attempt: int) -> dict:
     strategy = "change_seed"
     prompt = str(segment.get("h3_prompt") or "")
     new_prompt = prompt
+    clause = ""
     joined = " ".join(issues)
     if "character_used_i2v" in issues or "missing_character_refs" in issues or "chain_dropped_refs" in issues:
         strategy = "restore_ref2va"
@@ -470,11 +471,11 @@ def plan_repair(segment: dict, issues: list[str], attempt: int) -> dict:
         strategy = "relink_last_frame"
     elif "eyeline_jump" in issues:
         strategy = "flip_eyeline_prompt"
-        new_prompt = f"{prompt}, hold established eyeline, do not cross the 180 line"
-    elif "generated_text" in joined or "logo" in joined or "reinforce_no_text" in joined:
+        clause = "hold established eyeline, do not cross the 180 line"
+    elif "generated_text" in joined or "generated_board_text" in joined or "logo" in joined or "reinforce_no_text" in joined:
         strategy = "reinforce_no_text"
-        new_prompt = (
-            f"{prompt}, no readable text, no whiteboard, no blackboard writing, "
+        clause = (
+            "no readable text, no whiteboard, no blackboard writing, "
             "no logos, no chinese characters on surfaces"
         )
     elif (
@@ -485,18 +486,25 @@ def plan_repair(segment: dict, issues: list[str], attempt: int) -> dict:
         or "worker_uniform" in joined
     ):
         strategy = "reinforce_identity"
-        new_prompt = (
-            f"{prompt}, keep exact locked face age and navy worker uniform, "
-            "no military uniform, no epaulettes, no costume swap"
-        )
+        identity = str(segment.get("identity_prompt") or "").strip()
+        clause = "keep exact locked face, age, hair and clothing, no costume swap"
+        if identity:
+            clause += f", locked appearance: {identity}"
     elif "keyframe" in joined or "restore_refs" in joined or "scene_mismatch" in joined:
         strategy = "restore_refs"
     elif attempt >= 1:
         strategy = "change_seed"
+    raw_constraints = segment.get("h3_repair_constraints") or []
+    constraints = list(raw_constraints) if isinstance(raw_constraints, list) else []
+    if clause and clause not in constraints:
+        constraints.append(clause)
+    if clause and clause not in prompt:
+        new_prompt = f"{prompt}, {clause}"
     return {
         "strategy": strategy,
         "seed": seed,
         "h3_prompt": new_prompt,
+        "h3_repair_constraints": constraints,
         "h3_mode": "ref2va" if strategy == "restore_ref2va" else segment.get("h3_mode"),
         "attempt": attempt,
     }

@@ -2923,6 +2923,7 @@ def _run_anim_h3(
                         shot,
                         seed=repair["seed"],
                         h3_prompt=repair["h3_prompt"],
+                        h3_repair_constraints=repair["h3_repair_constraints"],
                         h3_mode=repair.get("h3_mode") or shot.get("h3_mode"),
                     )
                     shots[index] = shot

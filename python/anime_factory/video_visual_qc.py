@@ -398,7 +398,7 @@ def score_video_visual(
 
 def map_reasons_to_strategy(reasons: Sequence[str]) -> str:
     text = " ".join(reasons)
-    if "generated_text" in text or "logo" in text:
+    if "generated_text" in text or "generated_board_text" in text or "logo" in text:
         return "reinforce_no_text"
     if "identity" in text or "military" in text or "semantic_age" in text or "worker" in text:
         return "reinforce_identity"

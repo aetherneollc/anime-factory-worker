@@ -320,6 +320,10 @@ def compile_picture_prompt(segment: dict[str, Any]) -> str:
     if int(segment.get("chain_index") or 0) > 0 or segment.get("chain_source_last_frame"):
         if CONTINUE_CLAUSE not in prompt:
             prompt = f"{CONTINUE_CLAUSE}. {prompt}"
+    for constraint in segment.get("h3_repair_constraints") or []:
+        text = _CJK_RE.sub(" ", _text(constraint)).strip(" ,")
+        if text:
+            prompt += f", {text}"
     prompt = f"{prompt}, {MOTION_KEEP_ALIVE}"
     if DEFAULT_TEXT_POLICY == "no_generated_text":
         prompt = f"{prompt}, no readable text, no whiteboard writing, no logos"
