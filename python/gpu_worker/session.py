@@ -1217,9 +1217,17 @@ def _cast_map_from_shots(shots: list[dict]) -> dict[str, dict]:
     return cast
 
 
-def _hydrate_board_shots(shots: list[dict]) -> list[dict]:
+def _hydrate_board_shots(shots: list[dict], root: Path | None = None) -> list[dict]:
     cast = _cast_map_from_shots(shots)
-    return normalize_chain_boundaries([hydrate_shot_identity(shot, cast=cast) for shot in shots])
+    rows = normalize_chain_boundaries([hydrate_shot_identity(shot, cast=cast) for shot in shots])
+    if root is not None:
+        from anime_factory.keyframe import _identity_lock_text
+        for row in rows:
+            if row.get("on_camera") is not False:
+                identity = _identity_lock_text(row, root)
+                if identity:
+                    row["identity_prompt"] = identity
+    return rows
 
 
 def _board_shots(root: Path) -> list[dict]:
@@ -1229,11 +1237,11 @@ def _board_shots(root: Path) -> list[dict]:
         data = json.loads(board.read_text(encoding="utf-8"))
         segs = list(data.get("segments") or [])
         if segs:
-            return _hydrate_board_shots(segs)
+            return _hydrate_board_shots(segs, root)
         shots = list(data.get("shots") or [])
         if shots:
             limit = max_seconds_for_backend(select_video_backend(root=root))
-            return _hydrate_board_shots(expand_shots_to_segments(shots, max_s=limit))
+            return _hydrate_board_shots(expand_shots_to_segments(shots, max_s=limit), root)
     return []
 
 

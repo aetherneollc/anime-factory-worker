@@ -300,6 +300,10 @@ def compile_picture_prompt(segment: dict[str, Any]) -> str:
             clause = f"{label}: {clause}"
         parts.append(clause)
     prompt = " [cut] ".join(parts) if parts else DEFAULT_FRAME_PROMPT
+    identity = _text(segment.get("identity_prompt"))
+    if identity and len(cuts) == 1 and len(cuts[0].get("characters") or []) == 1:
+        identity = _CJK_RE.sub(" ", identity).strip(" ,")
+        prompt = f"Locked character appearance: {identity}. {prompt}"
     if len(cuts) == 1 and len(cuts[0].get("characters") or []) == 1:
         prompt += ", one continuous shot of the same character throughout, preserve hair and clothing, do not cut to a different person"
     # Prefer an explicit compiled visual field when present (and not dialogue).

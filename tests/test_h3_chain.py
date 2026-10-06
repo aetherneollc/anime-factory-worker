@@ -788,3 +788,18 @@ def test_board_region_probe_fails_closed_on_incomplete_embeddings(tmp_path):
     Image.new('RGB', (160,90), 'blue').save(frame)
     with pytest.raises(RuntimeError, match='incomplete'):
         score_board_regions([frame], SimpleNamespace(embed_images=lambda images: []))
+
+
+def test_video_prompt_resolves_character_id_to_canonical_appearance(tmp_path):
+    from gpu_worker.session import _hydrate_board_shots
+    from anime_factory.h3_storyboard import compile_picture_prompt
+    conn = open_db(tmp_path / 'story.sqlite')
+    migrate(conn)
+    conn.execute("INSERT INTO characters(id,name,age,identity_prompt) VALUES ('c2','Hero',20, '1girl, long black hair, grey jacket, blue jeans')")
+    conn.commit()
+    shots = _hydrate_board_shots([{'id':'s007','character_id':'c2','on_camera':True,'duration':8,'first_frame_prompt':'woman in corridor','h3_prompt':'@c2 walking while using phone','line':{'zh':'dialogue must stay out'}}], tmp_path)
+    prompt = compile_picture_prompt(shots[0])
+    assert 'Locked character appearance: 1girl, long black hair, grey jacket, blue jeans' in prompt
+    assert 'one continuous shot' in prompt
+    assert 'dialogue must stay out' not in prompt
+    conn.close()

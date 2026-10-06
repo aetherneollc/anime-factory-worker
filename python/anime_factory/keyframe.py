@@ -479,7 +479,8 @@ def ensure_keyframe(
         from anime_factory.h3_storyboard import ensure_cuts_for_segment
         cuts = ensure_cuts_for_segment(segment)
         visual = shot_visual_prompt(segment)
-        if cuts and (visual or cuts[0].get("frame_prompt")):
+        explicit_cuts = [c for c in (segment.get("cuts") or []) if isinstance(c, dict)]
+        if cuts and (visual or (explicit_cuts and explicit_cuts[0].get("frame_prompt"))):
             visual = compose_cut_still_prompt(segment, cuts[0], story_root=story_root)
         if not visual:
             raise RuntimeError(
