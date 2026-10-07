@@ -111,6 +111,7 @@ class ComposePlan:
     srt_outputs: list[str]
     filter_graph: str
     loudness_i: int = LOUDNESS_I
+    encodes: list[list[str]] | None = None
 
 
 def shot_line_text(shot: dict, lang: str = "zh") -> str:
@@ -629,35 +630,29 @@ def build_compose_plan(
     shot_paths: list[Path],
     langs: Sequence[str] | None = None,
     require_audio: bool = False,
+    lang_shot_paths: dict[str, list[Path]] | None = None,
 ) -> ComposePlan:
     _ = shot_paths
-    concat = workdir / "concat.txt"
-    encoded = workdir / f"{episode_code}.video.mp4"
     filter_graph = f"loudnorm=I={LOUDNESS_I}:TP=-1.5:LRA=11"
-    encode = [
-        "ffmpeg",
-        "-y",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        str(concat),
-        "-vf",
-        SCALE_PAD_FILTER,
-        "-an",
-        "-c:v",
-        "libx264",
-        "-pix_fmt",
-        "yuv420p",
-        str(encoded),
-    ]
-    blob = " ".join(str(x) for x in encode).lower()
-    if "xfade" in blob:
-        raise RuntimeError("compose encode must hard-cut; xfade is forbidden")
+    resolved_langs = normalize_langs(langs)
+    encode_by_lang: dict[str, list[str]] = {}
+    for lang in resolved_langs:
+        concat = workdir / (f"concat.{lang}.txt" if lang_shot_paths else "concat.txt")
+        paths = (lang_shot_paths or {}).get(lang, shot_paths)
+        if lang_shot_paths:
+            concat.write_text("".join(f"file '{p}'\n" for p in paths), encoding="utf-8")
+        encoded = workdir / (f"{episode_code}.{lang}.video.mp4" if lang_shot_paths else f"{episode_code}.video.mp4")
+        encode = [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat),
+            "-vf", SCALE_PAD_FILTER, "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(encoded),
+        ]
+        if "xfade" in " ".join(str(x) for x in encode).lower():
+            raise RuntimeError("compose encode must hard-cut; xfade is forbidden")
+        encode_by_lang[lang] = encode
+    encode = encode_by_lang[resolved_langs[0]]
     muxes = []
     srts = []
-    for lang in normalize_langs(langs):
+    for lang in resolved_langs:
         audio = workdir / f"{episode_code}.{lang}.wav"
         if require_audio:
             assert_wav_not_silent(audio)
@@ -668,7 +663,7 @@ def build_compose_plan(
                 "ffmpeg",
                 "-y",
                 "-i",
-                str(encoded),
+                str(workdir / (f"{episode_code}.{lang}.video.mp4" if lang_shot_paths else f"{episode_code}.video.mp4")),
                 "-i",
                 str(audio),
                 "-map",
@@ -685,7 +680,13 @@ def build_compose_plan(
             ]
         )
         srts.append(str(srt))
-    return ComposePlan(encode=encode, muxes=muxes, srt_outputs=srts, filter_graph=filter_graph)
+    return ComposePlan(
+        encode=encode,
+        muxes=muxes,
+        srt_outputs=srts,
+        filter_graph=filter_graph,
+        encodes=list(encode_by_lang.values()),
+    )
 
 
 def collect_shot_paths(conn: sqlite3.Connection, episode_code: str) -> list[tuple[str, str]]:

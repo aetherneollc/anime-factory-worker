@@ -37,6 +37,7 @@ from anime_factory.compose import (
     fit_clip_durations_to_speech,
     write_srt,
 )
+from anime_factory.tts import decode_pcm16_mono, encode_pcm16_mono, resample_pcm16_mono
 from anime_factory.sfx_orchestrate import prepare_episode_sfx
 from anime_factory.db import checkpoint_and_upload, migrate, open_db, utcnow
 from anime_factory.design import KolorsClient
@@ -3326,12 +3327,132 @@ def compose_gate(anim: dict[str, Any] | None) -> tuple[int, bool]:
     return remaining, allow
 
 
+def _visible_dialogue(shot: dict) -> bool:
+    line = shot.get("line") if isinstance(shot.get("line"), dict) else {}
+    mode = str(shot.get("delivery_mode") or line.get("delivery_mode") or "").strip().lower()
+    return mode == "dialogue" and shot.get("on_camera") is True and bool(str(shot.get("character_id") or "").strip())
+
+
+def _make_lipsync_audio_reference(
+    work: Path,
+    shot: dict,
+    lang: str,
+    duration_s: float,
+    *,
+    lead_in_s: float = 0.35,
+) -> str:
+    """Create a full-shot, silence-padded reference WAV on the H3 32 kHz timebase."""
+    sid = str(shot.get("id") or "").strip()
+    source = next(
+        (
+            path
+            for path in (
+                work / "audio" / "lines" / f"{sid}.{lang}.wav",
+                work / "audio" / f"{sid}.{lang}.wav",
+            )
+            if path.is_file()
+        ),
+        None,
+    )
+    if source is None:
+        raise RuntimeError(f"lip-sync audio missing for visible dialogue {sid}.{lang}")
+    sample_rate, samples = decode_pcm16_mono(source.read_bytes())
+    if not samples:
+        raise RuntimeError(f"lip-sync audio is empty or invalid for {sid}.{lang}")
+    target_rate = 32000
+    speech = resample_pcm16_mono(samples, sample_rate, target_rate)
+    total_samples = max(1, int(round(float(duration_s) * target_rate)))
+    lead_samples = max(0, int(round(float(lead_in_s) * target_rate)))
+    if lead_samples + len(speech) > total_samples:
+        raise RuntimeError(
+            f"lip-sync audio exceeds fitted shot {sid}.{lang}: "
+            f"speech={len(speech) / target_rate:.3f}s lead={lead_in_s:.3f}s shot={duration_s:.3f}s"
+        )
+    padded = [0] * lead_samples + speech
+    padded.extend([0] * (total_samples - len(padded)))
+    out_dir = work / "lipsync" / "audio"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"{sid}.{lang}.wav"
+    path.write_bytes(encode_pcm16_mono(padded, target_rate))
+    name = f"{sid}_lipsync_{lang}.wav"
+    staged = _stage_named_image(path, name)
+    if not staged:
+        raise RuntimeError(f"failed to stage H3 lip-sync audio for {sid}.{lang}")
+    return staged
+
+
+def _condition_visible_dialogue_clips(
+    root: Path,
+    work: Path,
+    shots: list[dict],
+    source_paths: list[Path],
+    clip_durations: dict[str, float],
+    langs: tuple[str, ...],
+    router: ComfyRouter | None,
+    progress: ProgressCallback | None,
+) -> tuple[dict[str, list[Path]], list[dict[str, Any]]]:
+    """Render localized dialogue shots from their exact language WAVs through H3 ref2va."""
+    lang_paths = {lang: list(source_paths) for lang in langs}
+    eligible = [(index, shot) for index, shot in enumerate(shots) if _visible_dialogue(shot)]
+    if not eligible:
+        return lang_paths, []
+    if router is None:
+        raise RuntimeError("lip-sync blocked: visible dialogue needs the H3 audio-conditioning router")
+    audio_shots: list[dict] = []
+    for _index, shot in eligible:
+        for lang in langs:
+            reference = _make_lipsync_audio_reference(
+                work,
+                shot,
+                lang,
+                float(clip_durations.get(str(shot.get("id") or "")) or shot.get("duration") or 8.0),
+            )
+            audio_shots.append(
+                {
+                    **shot,
+                    "h3_mode": "ref2va",
+                    "lip_sync_audio": reference,
+                    "on_camera": True,
+                    "delivery_mode": "dialogue",
+                }
+            )
+    from gpu_worker.weights import ensure_h3_dits_for_shots
+
+    ensure_h3_dits_for_shots(audio_shots, progress=progress)
+    rendered: list[dict[str, Any]] = []
+    for index, base_shot in eligible:
+        sid = str(base_shot.get("id") or "")
+        for lang in langs:
+            shot = next(
+                row
+                for row in audio_shots
+                if str(row.get("id") or "") == sid and row.get("lip_sync_audio") == f"{sid}_lipsync_{lang}.wav"
+            )
+            output = work / "lipsync" / lang / f"{sid}.mp4"
+            if progress:
+                progress(f"lip_sync:{sid}:{lang}")
+            output.parent.mkdir(parents=True, exist_ok=True)
+            _sample_h3_with_oom_policy(router, shot, root, output, progress, "ref2va", {})
+            if not output.is_file() or output.stat().st_size < 2048:
+                raise RuntimeError(f"H3 lip-sync did not produce a usable clip for {sid}.{lang}")
+            lang_paths[lang][index] = output
+            rendered.append({"shot_id": sid, "lang": lang, "path": output.relative_to(root).as_posix()})
+    manifest = work / "audio" / "lip_sync_manifest.json"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(
+        json.dumps({"backend": "minimax_h3_reference_audio", "clips": rendered}, indent=2),
+        encoding="utf-8",
+    )
+    return lang_paths, rendered
+
+
 def run_compose(
     story_id: str,
     root: Path,
     conn,
     langs: tuple[str, ...] = ("zh", "en", "ja"),
     progress: ProgressCallback | None = None,
+    router: ComfyRouter | None = None,
 ) -> dict[str, Any]:
     pairs = collect_shot_paths(conn, EP)
     local: list[Path] = []
@@ -3415,6 +3536,16 @@ def run_compose(
             if sid:
                 clip_durations[sid] = shot["duration"]
         local = trimmed
+    lang_shot_paths, lip_sync_manifest = _condition_visible_dialogue_clips(
+        root,
+        work,
+        shots,
+        local,
+        clip_durations,
+        langs,
+        router,
+        progress,
+    )
     # Backend-aware MOSS handoff: LongLive clears ownership + vacates leftovers;
     # H3 stops Comfy without setting longlive_owns_gpu so Comfy can restore.
     try:
@@ -3498,10 +3629,18 @@ def run_compose(
             pass
     concat = work / "concat.txt"
     concat.write_text("".join(f"file '{p}'\n" for p in local), encoding="utf-8")
-    plan: ComposePlan = build_compose_plan(work, EP, local, langs=langs, require_audio=True)
+    plan: ComposePlan = build_compose_plan(
+        work,
+        EP,
+        local,
+        langs=langs,
+        require_audio=True,
+        lang_shot_paths=lang_shot_paths if lip_sync_manifest else None,
+    )
     _ensure_compose_subtitles(plan, shots, langs)
     (work / "final").mkdir(parents=True, exist_ok=True)
-    _run_checked(plan.encode, progress=progress)
+    for encode in getattr(plan, "encodes", None) or [plan.encode]:
+        _run_checked(encode, progress=progress)
     for mux in plan.muxes:
         _run_checked(mux, progress=progress)
     uploads = []
@@ -3537,6 +3676,7 @@ def run_compose(
         ("timeline.json", f"episodes/{EP}/audio/timeline.json", "application/json"),
         ("sfx_evidence.json", f"episodes/{EP}/audio/sfx_evidence.json", "application/json"),
         ("sfx_credits.json", f"episodes/{EP}/audio/sfx_credits.json", "application/json"),
+        ("lip_sync_manifest.json", f"episodes/{EP}/audio/lip_sync_manifest.json", "application/json"),
     ):
         artifact = work / "audio" / local_name
         if not artifact.is_file():
@@ -4057,6 +4197,7 @@ def run_gpu_episode(
                 conn,
                 langs=episode_langs,
                 progress=progress,
+                router=router,
             )
             if skip_shorts:
                 compose["shorts"] = {"keys": [], "errors": [], "skipped": "short"}

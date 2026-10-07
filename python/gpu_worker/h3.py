@@ -535,7 +535,13 @@ def native_h3_graph(segment: dict, mode: str) -> dict:
     """Comfy 0.34+ API graph. Stub class MiniMaxH3 400s; use MiniMaxH3ImageToVideo."""
     seconds = float(segment.get("duration") or 8.0)
     length = h3_length_frames(seconds)
+    lip_sync_audio = str(segment.get("lip_sync_audio") or "").strip()
     prompt = segment_prompt(segment)
+    if lip_sync_audio:
+        prompt = prompt.replace(
+            "do not generate spoken dialogue",
+            "do not synthesize audio; visibly articulate the supplied reference speech",
+        )
     seed = int(segment.get("seed") or 11)
     steps = int(os.environ.get("H3_SAMPLER_STEPS") or 8)
     first = image_filename(segment.get("first_frame_path"))
@@ -571,6 +577,15 @@ def native_h3_graph(segment: dict, mode: str) -> dict:
                 f"reference pack for this story. Keep face and costume of these refs; "
                 f"no face drift; no costume swap; 禁止五官漂移/换装. "
                 f"Do not mint a new first frame. {prompt}"
+            )
+        if lip_sync_audio:
+            if not bool(segment.get("on_camera", False)) or str(segment.get("delivery_mode") or "") != "dialogue":
+                raise ValueError("H3 audio conditioning is only allowed for visible on-camera dialogue")
+            cond_inputs["audio_vae"] = ["audio_vae", 0]
+            cond_inputs["ref_audios.ref_audio_0"] = ["audio_ref", 0]
+            cond_inputs["prompt"] = (
+                f"{cond_inputs['prompt']} <Audio 1> is the exact locked dialogue audio for this shot. "
+                "Synchronize the visible character's mouth to its speech; mouth stays closed during silence. "
             )
     else:
         if not first:
@@ -644,6 +659,15 @@ def native_h3_graph(segment: dict, mode: str) -> dict:
                 "_meta": {"role": ref_autogrow_input_key(i)},
                 "inputs": {"image": filename},
             }
+        if lip_sync_audio:
+            graph["audio_vae"] = {
+                "class_type": "VAELoader",
+                "inputs": {"vae_name": H3_AUDIO_VAE},
+            }
+            graph["audio_ref"] = {
+                "class_type": "LoadAudio",
+                "inputs": {"audio": Path(lip_sync_audio).name},
+            }
         # Optional composition guide only when a real first frame exists. Never LoadImage f1.png.
         if first:
             graph["5"] = {
@@ -679,7 +703,7 @@ def native_h3_graph(segment: dict, mode: str) -> dict:
         if node.get("class_type") in FORBIDDEN_H3_SPEECH_NODES:
             graph.pop(nid, None)
             continue
-        if (node.get("inputs") or {}).get("vae_name") == H3_AUDIO_VAE:
+        if (node.get("inputs") or {}).get("vae_name") == H3_AUDIO_VAE and not lip_sync_audio:
             graph.pop(nid, None)
     if "14" in graph:
         graph["14"]["inputs"].pop("audio", None)

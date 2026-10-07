@@ -228,7 +228,7 @@ def test_chain_tail_graph_has_addguide_same_refs_and_image_tags():
     assert "prev_last.png" not in (linked.get("refs") or [])
 
 
-def test_concat_drops_frame_zero_same_chain_hard_cut_cross_scene():
+def test_concat_drops_frame_zero_same_chain_hard_cut_cross_scene(tmp_path):
     shots = [
         {"id": "a", "chain_id": "sc01", "chain_index": 0},
         {"id": "b", "chain_id": "sc01", "chain_index": 1},
@@ -242,11 +242,33 @@ def test_concat_drops_frame_zero_same_chain_hard_cut_cross_scene():
     assert "fade=" not in blob
     from anime_factory.compose import build_compose_plan
 
-    plan = build_compose_plan(Path("."), "EP001", [Path("a.mp4")], require_audio=False)
+    plan = build_compose_plan(tmp_path, "EP001", [Path("a.mp4")], require_audio=False)
     encode = " ".join(str(x) for x in plan.encode).lower()
     assert "concat" in encode
     assert "xfade" not in encode
     assert "fade=" not in encode
+
+
+def test_compose_can_encode_language_specific_lipsynced_video_tracks(tmp_path):
+    from anime_factory.compose import build_compose_plan
+
+    plan = build_compose_plan(
+        tmp_path,
+        "EP001",
+        [Path("shared.mp4")],
+        langs=("zh", "en"),
+        lang_shot_paths={
+            "zh": [Path("shared.mp4"), Path("zh/s001.mp4")],
+            "en": [Path("shared.mp4"), Path("en/s001.mp4")],
+        },
+    )
+    assert len(plan.encodes or []) == 2
+    assert "EP001.zh.video.mp4" in " ".join(plan.encodes[0])
+    assert "EP001.en.video.mp4" in " ".join(plan.encodes[1])
+    assert "EP001.zh.video.mp4" in " ".join(plan.muxes[0])
+    assert "EP001.en.video.mp4" in " ".join(plan.muxes[1])
+    assert "zh/s001.mp4" in (tmp_path / "concat.zh.txt").read_text()
+    assert "en/s001.mp4" in (tmp_path / "concat.en.txt").read_text()
 
 
 def test_session_locked_sheet_not_all_siblings(tmp_path):

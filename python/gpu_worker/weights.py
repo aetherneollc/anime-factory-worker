@@ -110,7 +110,13 @@ H3_REF2VA_FILES: list[dict[str, str]] = [
         "dest": "models/diffusion_models/minimax_h3_ref2va_pruned_nvfp4.safetensors",
     },
 ]
-# Audio VAE is never decoded (CosyVoice2 is the mix). Do not download it.
+# Reference-audio conditioning uses the H3 audio VAE to encode locked TTS into
+# the joint AV conditioning stream. H3 audio is still never decoded/muxed.
+H3_AUDIO_VAE_FILE: dict[str, str] = {
+    "repo": H3_ORG_REPO,
+    "hf": "vae/minimax_h3_audio_vae_fp32.safetensors",
+    "dest": "models/vae/minimax_h3_audio_vae_fp32.safetensors",
+}
 H3_FILES: list[dict[str, str]] = [*H3_CORE_FILES, *H3_FL2VA_FILES, *H3_REF2VA_FILES]
 ANIMAGINE_STILL_FILES: list[dict[str, str]] = [
     {
@@ -713,7 +719,27 @@ def ensure_h3_dits_for_shots(
     from gpu_worker.h3 import select_mode
 
     modes = {select_mode(shot) for shot in shots or []}
-    return ensure_h3_weights(comfy_dir, progress=progress, modes=modes)
+    result = ensure_h3_weights(comfy_dir, progress=progress, modes=modes)
+    if any(str(shot.get("lip_sync_audio") or "").strip() for shot in shots or []):
+        audio_vae = ensure_h3_audio_vae(comfy_dir, progress=progress)
+        result["audio_vae"] = audio_vae
+    return result
+
+
+def ensure_h3_audio_vae(
+    comfy_dir: Path | str | None = None,
+    progress: Callable[[str], None] | None = None,
+) -> dict:
+    """Fetch the 605 MB H3 audio encoder only for audio-conditioned lip-sync shots."""
+    _refuse_h3_on_longlive()
+    root = Path(comfy_dir or os.environ.get("COMFYUI_DIR") or "/opt/ComfyUI")
+    yaml_path = write_extra_model_paths(root)
+    if _skip_weights():
+        return _empty_materialize(root, yaml_path)
+    out = _materialize_items([H3_AUDIO_VAE_FILE], root, progress=progress)
+    out["extra_model_paths"] = str(yaml_path)
+    out["kind"] = "h3_audio_vae"
+    return out
 
 
 def materialize_runtime_weights(

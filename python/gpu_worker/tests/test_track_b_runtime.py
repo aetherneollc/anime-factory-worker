@@ -655,6 +655,116 @@ def test_native_h3_graph_loads_nvfp4_dits(monkeypatch):
     assert (fl2va["6"]["inputs"]["width"], fl2va["6"]["inputs"]["height"]) == (1024, 576)
 
 
+def test_native_h3_graph_conditions_visible_dialogue_on_exact_audio(monkeypatch):
+    monkeypatch.setattr(h3, "gpu_vram_mb", lambda: 32_640)
+    graph = h3.native_h3_graph(
+        {
+            "id": "E01-01",
+            "refs": ["char_ke_sheet.png"],
+            "character_id": "ke",
+            "delivery_mode": "dialogue",
+            "on_camera": True,
+            "lip_sync_audio": "E01-01_lipsync_zh.wav",
+        },
+        "ref2va",
+    )
+    inputs = graph["6"]["inputs"]
+    assert inputs["audio_vae"] == ["audio_vae", 0]
+    assert inputs["ref_audios.ref_audio_0"] == ["audio_ref", 0]
+    assert "<Audio 1>" in inputs["prompt"]
+    assert "do not synthesize audio" in inputs["prompt"]
+    assert "do not generate spoken dialogue" not in inputs["prompt"]
+    assert graph["audio_vae"]["inputs"]["vae_name"] == h3.H3_AUDIO_VAE
+    assert graph["audio_ref"] == {
+        "class_type": "LoadAudio",
+        "inputs": {"audio": "E01-01_lipsync_zh.wav"},
+    }
+    assert "VAEDecodeAudio" not in {node.get("class_type") for node in graph.values()}
+
+
+def test_native_h3_graph_refuses_audio_for_thought_or_off_camera():
+    with pytest.raises(ValueError, match="visible on-camera dialogue"):
+        h3.native_h3_graph(
+            {
+                "id": "E01-01",
+                "refs": ["char_ke_sheet.png"],
+                "delivery_mode": "thought",
+                "on_camera": False,
+                "lip_sync_audio": "E01-01_lipsync_zh.wav",
+            },
+            "ref2va",
+        )
+
+
+def test_h3_lipsync_reference_is_timed_and_padded_to_silent_shot(tmp_path, monkeypatch):
+    monkeypatch.setenv("COMFYUI_DIR", str(tmp_path / "ComfyUI"))
+    work = tmp_path / "episodes" / "EP001"
+    source = work / "audio" / "lines" / "s001.zh.wav"
+    source.parent.mkdir(parents=True)
+    from anime_factory.tts import decode_pcm16_mono, encode_pcm16_mono
+
+    source.write_bytes(encode_pcm16_mono([1200] * 24_000, 24_000))
+    name = session._make_lipsync_audio_reference(
+        work,
+        {"id": "s001"},
+        "zh",
+        2.0,
+    )
+    staged = tmp_path / "ComfyUI" / "input" / name
+    rate, samples = decode_pcm16_mono(staged.read_bytes())
+    assert rate == 32_000
+    assert len(samples) == 64_000
+    assert samples[:11_200] == [0] * 11_200
+    assert samples[11_200:43_200] != [0] * 32_000
+    assert samples[43_200:] == [0] * 20_800
+
+
+def test_only_visible_direct_dialogue_is_lipsync_eligible():
+    assert session._visible_dialogue({"delivery_mode": "dialogue", "on_camera": True, "character_id": "ke"})
+    assert not session._visible_dialogue({"delivery_mode": "thought", "on_camera": False, "character_id": "ke"})
+    assert not session._visible_dialogue({"delivery_mode": "phone", "on_camera": False, "character_id": "ke"})
+    assert not session._visible_dialogue({"delivery_mode": "dialogue", "on_camera": False, "character_id": "ke"})
+
+
+def test_compose_builds_a_localized_sync_clip_for_each_language(tmp_path, monkeypatch):
+    shots = [
+        {"id": "s001", "character_id": "ke", "delivery_mode": "dialogue", "on_camera": True},
+        {"id": "s002", "character_id": "ke", "delivery_mode": "thought", "on_camera": False},
+    ]
+    source = [tmp_path / "s001.mp4", tmp_path / "s002.mp4"]
+    for path in source:
+        path.write_bytes(b"source")
+    monkeypatch.setattr(
+        session,
+        "_make_lipsync_audio_reference",
+        lambda _work, shot, lang, _duration: f"{shot['id']}_lipsync_{lang}.wav",
+    )
+    monkeypatch.setattr(weights, "ensure_h3_dits_for_shots", lambda *_a, **_k: {"ok": True})
+    captured = []
+
+    def sample(_router, shot, _root, dest, *_args):
+        captured.append((shot["id"], shot["lip_sync_audio"]))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"rendered" * 1024)
+
+    monkeypatch.setattr(session, "_sample_h3_with_oom_policy", sample)
+    outputs, manifest = session._condition_visible_dialogue_clips(
+        tmp_path,
+        tmp_path / "episodes" / "EP001",
+        shots,
+        source,
+        {"s001": 4.0, "s002": 4.0},
+        ("zh", "en"),
+        object(),
+        None,
+    )
+    assert outputs["zh"][0] == tmp_path / "episodes" / "EP001" / "lipsync" / "zh" / "s001.mp4"
+    assert outputs["en"][0] == tmp_path / "episodes" / "EP001" / "lipsync" / "en" / "s001.mp4"
+    assert outputs["zh"][1] == source[1] and outputs["en"][1] == source[1]
+    assert captured == [("s001", "s001_lipsync_zh.wav"), ("s001", "s001_lipsync_en.wav")]
+    assert len(manifest) == 2
+
+
 def test_still_weights_do_not_block_on_h3(tmp_path, monkeypatch):
     pulled = []
 
