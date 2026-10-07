@@ -107,6 +107,9 @@ def line_beat_id(line: dict | str | None) -> str:
 def line_on_camera(line: dict | None) -> bool:
     if not isinstance(line, dict):
         return True
+    delivery_mode = str(line.get("delivery_mode") or "").strip().lower()
+    if delivery_mode in {"thought", "narration", "phone", "message", "offscreen"}:
+        return False
     if line.get("on_camera") is not None:
         return bool(line.get("on_camera"))
     return line_beat_id(line) not in REMOTE_BEATS

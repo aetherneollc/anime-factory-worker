@@ -62,6 +62,16 @@ def test_compile_picture_prompt_never_uses_dialogue_line():
     seg["line"] = {"zh": "这段对白绝不能进画面提示词"}
     prompt = compile_picture_prompt(seg)
     assert "对白" not in prompt
+
+
+def test_picture_prompt_keeps_thought_mouth_closed_and_motion_bounded():
+    seg = _two_cut_segment()
+    seg["on_camera"] = False
+    seg["line"] = {"zh": "奖学金到了。", "delivery_mode": "thought"}
+    prompt = compile_picture_prompt(seg).lower()
+    assert "keep lips closed" in prompt
+    assert "no torso sway or hand waving" in prompt
+    assert "no camera shake" in prompt
     assert "绝不能" not in prompt
     assert "navy blue worker uniform" in prompt or "janitor" in prompt
     assert "no readable text" in prompt

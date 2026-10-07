@@ -57,8 +57,8 @@ CONTINUE_CLAUSE = (
     "same identity, same costume, same set"
 )
 MOTION_KEEP_ALIVE = (
-    "camera and subject motion are the changing terms this shot; "
-    "do not freeze a still photograph; keep face and costume of the named character refs; "
+    "preserve the locked composition and character position; motion stays minimal, smooth and story-motivated; "
+    "no camera shake, no repeated swaying, no sudden pose changes; keep face and costume of the named character refs; "
     "no face drift, no costume swap; do not generate spoken dialogue; no text, no watermark"
 )
 DEFAULT_FRAME_PROMPT = (
@@ -273,11 +273,15 @@ def cut_frame_ranges(
     return rows
 
 
-def _camera_motion_clause(cam: str) -> str:
+def _camera_motion_clause(cam: str, *, speaking: bool) -> str:
     text = normalize_camera(cam)
     if text == "Static Shot":
-        return "subtle body and face motion, speaking gesture, do not freeze as a still"
-    return f"camera move: {text}"
+        mouth = "subtle natural mouth motion while visibly speaking" if speaking else "keep lips closed"
+        return (
+            "locked steady camera, stable framing, restrained blink and tiny head motion only, "
+            f"{mouth}, no torso sway or hand waving"
+        )
+    return f"one slow, steady camera move: {text}; subject position stays stable, no shake or extra gestures"
 
 
 def compile_picture_prompt(segment: dict[str, Any]) -> str:
@@ -294,7 +298,10 @@ def compile_picture_prompt(segment: dict[str, Any]) -> str:
             frame = re.sub(r"\s{2,}", " ", frame).strip(" ,")
         size = normalize_size(cut.get("size"))
         cam = normalize_camera(cut.get("camera"))
-        clause = f"{frame}, framing {size}, camera: {cam}, {_camera_motion_clause(cam)}"
+        line = segment.get("line") if isinstance(segment.get("line"), dict) else {}
+        delivery_mode = str(segment.get("delivery_mode") or line.get("delivery_mode") or "dialogue").lower()
+        speaking = bool(segment.get("on_camera", True)) and delivery_mode == "dialogue"
+        clause = f"{frame}, framing {size}, camera: {cam}, {_camera_motion_clause(cam, speaking=speaking)}"
         if len(cuts) > 1:
             label = "First" if i == 0 else ("Finally" if i == len(cuts) - 1 else "Then")
             clause = f"{label}: {clause}"

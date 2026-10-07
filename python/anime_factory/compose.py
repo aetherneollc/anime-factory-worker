@@ -713,17 +713,49 @@ def non_gpu_stages_passed(flags: dict[str, str]) -> bool:
     return all(flags.get(stage) == "passed" for stage in NON_GPU_STAGES)
 
 
-def subtitle_cues(shots: list[dict], lang: str, lead_in: float = 0.35) -> list[tuple[float, float, str]]:
+def _delivery_mode(shot: dict) -> str:
+    line = shot.get("line") if isinstance(shot.get("line"), dict) else {}
+    mode = str(shot.get("delivery_mode") or line.get("delivery_mode") or "dialogue").strip().lower()
+    return mode if mode in {"dialogue", "thought", "narration", "phone", "message", "offscreen"} else "dialogue"
+
+
+def _subtitle_delivery_prefix(mode: str, lang: str) -> str:
+    labels = {
+        "thought": {"zh": "（内心）", "en": "(Thought) ", "ja": "（心の声）"},
+        "narration": {"zh": "（旁白）", "en": "(Narration) ", "ja": "（ナレーション）"},
+        "phone": {"zh": "（电话）", "en": "(Phone) ", "ja": "（電話）"},
+        "message": {"zh": "（消息）", "en": "(Message) ", "ja": "（メッセージ）"},
+        "offscreen": {"zh": "（画外音）", "en": "(Off-screen) ", "ja": "（画面外）"},
+    }
+    return labels.get(mode, {}).get(lang, labels.get(mode, {}).get("en", ""))
+
+
+def _estimated_caption_seconds(text: str, lang: str) -> float:
+    if lang == "en":
+        units = len(text.split())
+        return min(6.0, max(1.0, units * 0.38))
+    if lang == "ja":
+        return min(6.0, max(1.0, len(text) * 0.18))
+    return min(6.0, max(1.0, len(text) * 0.22))
+
+
+def subtitle_cues(
+    shots: list[dict],
+    lang: str,
+    lead_in: float = 0.35,
+    speech_durations: dict[str, float] | None = None,
+) -> list[tuple[float, float, str]]:
     starts = shot_start_times(shots)
     cues: list[tuple[float, float, str]] = []
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, str]] = set()
     for shot in shots:
         text = shot_line_text(shot, lang)
         sid = str(shot.get("id") or "")
         parent = shot_parent_id(shot)
         if not text or not sid:
             continue
-        key = (parent or sid, text)
+        mode = _delivery_mode(shot)
+        key = (parent or sid, mode, text)
         if key in seen:
             continue
         seen.add(key)
@@ -731,10 +763,16 @@ def subtitle_cues(shots: list[dict], lang: str, lead_in: float = 0.35) -> list[t
         same = [
             float(s.get("duration") or 8.0)
             for s in shots
-            if shot_parent_id(s) == parent and shot_line_text(s, lang) == text
+            if shot_parent_id(s) == parent
+            and shot_line_text(s, lang) == text
+            and _delivery_mode(s) == mode
         ]
         span = sum(same) if same else float(shot.get("duration") or 8.0)
-        cues.append((start, start + max(span - lead_in, 1.0), text))
+        measured = (speech_durations or {}).get(parent) or (speech_durations or {}).get(sid)
+        spoken_s = float(measured) if measured is not None and float(measured) > 0 else _estimated_caption_seconds(text, lang)
+        end = start + min(spoken_s, max(span - lead_in, 1.0))
+        caption = f"{_subtitle_delivery_prefix(mode, lang)}{text}"
+        cues.append((start, end, caption))
     return cues
 
 
@@ -748,7 +786,13 @@ def write_episode_srts(
     out: dict[str, str] = {}
     for lang in normalize_langs(langs):
         path = workdir / "final" / f"{episode_code}.{lang}.srt"
-        write_srt(path, subtitle_cues(shots, lang))
+        speech_durations: dict[str, float] = {}
+        for shot in shots:
+            parent = shot_parent_id(shot)
+            wav = _line_wav_for_shot(workdir, shot, lang)
+            if parent and wav is not None and parent not in speech_durations:
+                speech_durations[parent] = pcm_duration_seconds(wav.read_bytes())
+        write_srt(path, subtitle_cues(shots, lang, speech_durations=speech_durations))
         out[lang] = str(path)
     return out
 

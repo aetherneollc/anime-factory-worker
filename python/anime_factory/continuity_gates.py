@@ -320,7 +320,8 @@ def repair_collapsed_staging(script: dict) -> dict:
             beat = line_beat_id(line)
             staging = STAGING_FOR_BEAT.get(beat) or STAGING_FOR_BEAT["dialogue"]
             line["staging"] = f"{line.get('character_id') or 'speaker'} {staging} ({loc})"
-            line["on_camera"] = beat not in REMOTE_BEATS
+            delivery_mode = str(line.get("delivery_mode") or "dialogue").strip().lower()
+            line["on_camera"] = delivery_mode == "dialogue" and beat not in REMOTE_BEATS
     return fixed
 
 

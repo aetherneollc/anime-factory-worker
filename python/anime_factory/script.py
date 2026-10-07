@@ -28,6 +28,10 @@ DRAFT_SYSTEM = (
     "画面描述必须是这部片子自己的角色、道具、场景，不许写成任何知名电影剧照或某位导演的风格。"
     "每条台词的 staging 必须随场次、道具、电话/微信 vs 当面变化；禁止整集复制同一便利店对白。"
     "电话、微信、睡着、在外面的角色不要写成便利店特写，除非 on_camera 为 true。"
+    "故事必须有清晰的开场钩子、冲突升级、中段变化、主角选择和结果；每次升级都改变处境或代价，禁止把同一种拒绝/付钱/争吵重复成多条台词。"
+    "每句必须标 delivery_mode：dialogue（镜头内当面说话）、thought（内心独白）、narration（旁白）、phone（电话另一端）、message（手机文字/语音消息）、offscreen（画外音）。"
+    "只有可见且正在说话的人物才设 on_camera=true；thought/narration/phone/message/offscreen 必须设 false，并设计不露说话者嘴部的反应镜头或道具镜头。"
+    "motion_zh 只写一个主要人物动作和至多一个缓慢镜头运动；明确动作幅度克制、机位稳定，禁止身体摇摆、镜头抖动或无意义重复动作。"
     "每条台词必须同时给两种画面描述："
     "visual_en 是**纯英文静帧**描述（人物外貌+服装+动作+表情+环境+光线+景别），"
     "里面禁止出现中文、@标记、运镜词（camera/dolly/pan/zoom/motion）、分辨率和 shot N of M；"
@@ -54,6 +58,7 @@ DRAFT_SCHEMA = """{
                          "staging": "English staging note for this one shot — must change with the beat",
                          "visual_en": "English still description: appearance, clothing, action, expression, setting, light, framing. No Chinese, no @tags, no camera words",
                          "motion_zh": "中文运镜与动势：镜头如何移动、人物如何动作",
+                         "delivery_mode": "dialogue|thought|narration|phone|message|offscreen",
                          "on_camera": true,
                          "mentions_event_ids": []}]}]
 }"""
@@ -204,6 +209,14 @@ def normalize_draft(
             for code in langs:
                 if not texts[code]:
                     texts[code] = texts[primary]
+            delivery_mode = str(line.get("delivery_mode") or "dialogue").strip().lower()
+            if delivery_mode not in {"dialogue", "thought", "narration", "phone", "message", "offscreen"}:
+                delivery_mode = "dialogue"
+            on_camera = None if line.get("on_camera") is None else bool(line.get("on_camera"))
+            if delivery_mode in {"thought", "narration", "phone", "message", "offscreen"}:
+                on_camera = False
+            elif on_camera is False:
+                delivery_mode = "offscreen"
             line_no += 1
             mentions = [str(e) for e in (line.get("mentions_event_ids") or [])]
             kept = [e for e in mentions if e in known]
@@ -221,7 +234,8 @@ def normalize_draft(
                     # still model cannot read (CJK, @tags, camera direction).
                     "visual_en": still_prompt_text(_clean_prompt(line.get("visual_en") or "")),
                     "motion_zh": _clean_prompt(line.get("motion_zh") or ""),
-                    "on_camera": None if line.get("on_camera") is None else bool(line.get("on_camera")),
+                    "delivery_mode": delivery_mode,
+                    "on_camera": on_camera,
                     "mentions_event_ids": kept,
                 }
             )
