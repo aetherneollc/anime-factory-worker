@@ -37,6 +37,21 @@
       ]
     },
     {
+      "id": "fal",
+      "enabled": true,
+      "dockerfile": "deploy/cpu-worker/Dockerfile.fal",
+      "image_name": "anime-factory-worker-fal",
+      "platforms": ["linux/amd64"],
+      "capabilities": ["fal", "image-gen", "agent"],
+      "watch_paths": [
+        "deploy/cpu-worker/Dockerfile.fal",
+        "deploy/cpu-worker/start-fal.sh",
+        "python/",
+        "schema",
+        "config"
+      ]
+    },
+    {
       "id": "sr3",
       "enabled": true,
       "dockerfile": "deploy/gpu-worker/Dockerfile.sr3",

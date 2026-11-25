@@ -1,4 +1,4 @@
-"""Production video generate backend: MiniMax H3.
+"""Production video generate backends: fal.ai (default) and MiniMax H3.
 
 SkyReels stays importable for the frozen sr3 image. It is not a production
 enum. LongLive is not registered. A missing reference pack is a refusal;
@@ -20,8 +20,11 @@ from anime_factory.contracts import (
     ref_pack_from_keyframe,
 )
 
-PLUGGABLE_VIDEO_BACKENDS = ("h3",)
-DEFAULT_PLUGGABLE_VIDEO_BACKEND = "h3"
+from anime_factory.models import (
+    DEFAULT_VIDEO_BACKEND as DEFAULT_PLUGGABLE_VIDEO_BACKEND,
+    VIDEO_BACKENDS as PLUGGABLE_VIDEO_BACKENDS,
+)
+
 H3_ALIASES = frozenset({"h3", "wan", "minimax", "minimax-h3", "minimaxh3"})
 SKYREELS_ALIASES = frozenset(
     {
@@ -88,7 +91,7 @@ class VideoGenerateBackend(ABC):
 
 
 def select_pluggable_video_backend(env: Mapping[str, str] | None = None) -> str:
-    """VIDEO_BACKEND → production select (H3)."""
+    """VIDEO_BACKEND → production select (fal by default, h3 when asked)."""
     mapping = env if env is not None else os.environ
     raw = str(mapping.get("VIDEO_BACKEND") or "").strip().lower().replace(" ", "")
     if raw:
@@ -101,10 +104,15 @@ def select_pluggable_video_backend(env: Mapping[str, str] | None = None) -> str:
 def normalize_pluggable_video_backend(value: Any) -> str:
     raw = str(value or "").strip().lower().replace(" ", "")
     folded = raw.replace("-", "_")
-    if not raw or raw in H3_ALIASES or folded in H3_ALIASES:
-        return "h3"
-    from anime_factory.video_backend import normalize_video_backend
+    from anime_factory.video_backend import FAL_ALIASES, normalize_video_backend
 
+    fal_folded = {name.replace("-", "_") for name in FAL_ALIASES}
+    if raw in FAL_ALIASES or folded in fal_folded:
+        return "fal"
+    if raw in H3_ALIASES or folded in H3_ALIASES:
+        return "h3"
+    if not raw:
+        return "fal"
     return normalize_video_backend(raw)
 
 
@@ -191,6 +199,40 @@ def gated_video_generate(
     return impl.generate(request)
 
 
+class FalVideoGenerateBackend(VideoGenerateBackend):
+    """Remote fal.ai video. Does not touch local Qwen or H3 weights."""
+
+    name = "fal"
+
+    def generate(self, request: VideoGenerateRequest) -> VideoGenerateResult:
+        from anime_factory.fal_models import generate_fal_video
+
+        dry = request.meta.get("dry_run")
+        mode = "r2v" if request.references or request.ref_images else "i2v"
+        produced = generate_fal_video(
+            mode,
+            request.prompt,
+            duration_s=float(request.duration or request.duration_s or 6),
+            seed=request.seed,
+            char_ref_pngs=list(request.ref_images or []),
+            out_path=request.meta.get("out_path"),
+            dry_run=None if dry is None else bool(dry),
+        )
+        refs = [str(item) for item in (request.ref_images or request.references or [])]
+        return VideoGenerateResult(
+            path=str(produced),
+            backend=self.name,
+            status="ready",
+            meta={
+                "delegated": "anime_factory.fal_models",
+                **dict(request.meta),
+                "references": refs,
+                "ref_images": refs,
+                "duration": float(request.duration or request.duration_s or 6),
+            },
+        )
+
+
 class H3VideoGenerateBackend(VideoGenerateBackend):
     """Production H3 wrapper. Real sampling stays in gpu_worker.h3."""
 
@@ -216,6 +258,7 @@ class H3VideoGenerateBackend(VideoGenerateBackend):
 
 
 _BACKENDS: dict[str, type[VideoGenerateBackend]] = {
+    "fal": FalVideoGenerateBackend,
     "h3": H3VideoGenerateBackend,
 }
 

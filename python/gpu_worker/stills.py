@@ -336,6 +336,56 @@ def unload_still_models(router) -> dict:
         return {"ok": False, "error": str(exc)}
 
 
+def _fal_still(payload: dict) -> bytes:
+    """fal.ai stills. One T2I master; side/back/costume edit from master.png."""
+    from anime_factory.design import assert_no_reference_images
+    from anime_factory.fal_models import edit_fal_image, generate_fal_image_t2i
+    from anime_factory.qwen_image_21 import MasterReferenceError, assert_side_master_reference
+
+    spec = still_payload_to_prompt(payload)
+    kind = str(spec.get("kind") or "")
+    view = str(payload.get("_view") or payload.get("view") or "").strip().lower()
+    master_path = str(payload.get("_master_path") or "")
+    parent = payload.get("_parent_png")
+    if kind in {"scene_plate", "scene_derive"}:
+        assert_no_reference_images({k: v for k, v in payload.items() if not str(k).startswith("_")})
+        if parent:
+            raise RuntimeError("scene plate must not bind a parent image (reference-image bleed)")
+        return generate_fal_image_t2i(
+            spec["prompt"],
+            spec["width"],
+            spec["height"],
+            negative_prompt=str(spec["negative"] or ""),
+            seed=spec["seed"],
+        )
+    if kind in REFERENCE_REQUIRED_KINDS:
+        if view == "side":
+            assert_side_master_reference(master_path)
+        elif not str(master_path).replace("\\", "/").endswith("master.png"):
+            raise MasterReferenceError(
+                f"{kind} requires master.png reference, got {master_path!r}"
+            )
+        if not isinstance(parent, (bytes, bytearray)) or not parent:
+            raise MasterReferenceError(f"{kind} requires master.png reference bytes")
+        return edit_fal_image(
+            spec["prompt"],
+            [bytes(parent)],
+            spec["width"],
+            spec["height"],
+            negative_prompt=str(spec["negative"] or ""),
+            seed=spec["seed"],
+            master_path=master_path,
+            view=view or None,
+        )
+    return generate_fal_image_t2i(
+        spec["prompt"],
+        spec["width"],
+        spec["height"],
+        negative_prompt=str(spec["negative"] or ""),
+        seed=spec["seed"],
+    )
+
+
 def _qwen_still(payload: dict) -> bytes:
     """Qwen-Image-2.1. One T2I master; side/back/costume edit from master.png."""
     from anime_factory.qwen_image_21 import (
@@ -414,8 +464,10 @@ def generate_still(payload: dict, router=None) -> bytes:
             raise RuntimeError("scene plate must not bind a parent image (reference-image bleed)")
     width, height = parse_size(payload.get("image_size"))
     image_backend = (os.environ.get("IMAGE_BACKEND") or "").strip().lower()
-    # Unset IMAGE_BACKEND is the production Qwen-Image-2.1 path.
-    if image_backend in {"", "qwen_image_21"}:
+    # Unset IMAGE_BACKEND is the production fal.ai path. Qwen stays explicit.
+    if image_backend in {"", "fal"}:
+        blob = _fal_still(payload)
+    elif image_backend == "qwen_image_21":
         blob = _qwen_still(payload)
     elif image_backend == "flux2_klein4b":
         blob = _klein_still(payload)

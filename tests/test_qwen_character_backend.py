@@ -26,17 +26,23 @@ from anime_factory.qwen_image import image_size_for_dashscope
 
 
 @pytest.mark.qwen_character_default
-def test_default_character_backend_is_qwen(monkeypatch):
+def test_default_character_backend_is_fal_unless_qwen_image(monkeypatch):
     monkeypatch.delenv("CHARACTER_STILL_BACKEND", raising=False)
+    monkeypatch.delenv("IMAGE_BACKEND", raising=False)
     monkeypatch.setenv("CHARACTER_STILL_BACKEND", "")
     from anime_factory.models import (
         DEFAULT_CHARACTER_STILL_BACKEND,
         character_still_backend,
     )
 
-    assert DEFAULT_CHARACTER_STILL_BACKEND == "qwen"
-    assert character_still_backend() == "qwen"
+    assert DEFAULT_CHARACTER_STILL_BACKEND == "fal"
+    assert character_still_backend() == "fal"
     assert character_still_backend() != "hunyuan"
+    monkeypatch.setenv("IMAGE_BACKEND", "qwen_image_21")
+    assert character_still_backend() == "qwen"
+    monkeypatch.setenv("CHARACTER_STILL_BACKEND", "qwen")
+    monkeypatch.setenv("IMAGE_BACKEND", "fal")
+    assert character_still_backend() == "qwen"
 
 
 def test_invalid_character_backend_fails_closed(monkeypatch):
@@ -164,4 +170,4 @@ def test_scene_plate_still_uses_gpu_when_qwen_is_character_default(monkeypatch):
     assert len(gpu_calls) == 1
     from anime_factory.models import character_still_backend
 
-    assert character_still_backend() == "qwen"
+    assert character_still_backend() == "fal"

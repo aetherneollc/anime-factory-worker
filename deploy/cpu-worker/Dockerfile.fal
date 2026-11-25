@@ -1,0 +1,38 @@
+# Lightweight CPU worker. Image and video are fal.ai API calls.
+# No CUDA, Comfy, or Vast GPU. FAL_KEY is injected at runtime and is never baked in.
+
+FROM python:3.12-slim
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONPATH=/opt/anime-factory-worker/python \
+    AF_WORKER_MODE=fal \
+    AF_START_COMFY=0 \
+    IMAGE_BACKEND=fal \
+    VIDEO_BACKEND=fal \
+    AF_VIDEO_BACKEND=fal \
+    AF_IMAGE_CAPABILITY=fal \
+    AF_GPU_PROFILE=fal-api-cpu \
+    AF_VISUAL_QC_DEVICE=cpu \
+    CHARACTER_STILL_BACKEND=fal \
+    SFX_BACKEND=freesound
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install the CPU torch wheel last so open-clip does not replace it with a CUDA build.
+RUN pip install --no-cache-dir boto3 Pillow numpy \
+    && pip install --no-cache-dir open-clip-torch==2.32.0 \
+    && pip install --no-cache-dir --force-reinstall --index-url https://download.pytorch.org/whl/cpu torch
+
+WORKDIR /opt/anime-factory-worker
+COPY python /opt/anime-factory-worker/python
+COPY schema /opt/anime-factory-worker/schema
+COPY config /opt/anime-factory-worker/config
+COPY deploy/cpu-worker/start-fal.sh /usr/local/bin/start-fal.sh
+RUN chmod +x /usr/local/bin/start-fal.sh
+
+CMD ["start-fal.sh"]

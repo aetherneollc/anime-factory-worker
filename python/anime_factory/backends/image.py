@@ -1,4 +1,4 @@
-"""Production image backend: local Qwen-Image-2.1 only."""
+"""Production image backends: fal.ai (default) and local Qwen-Image-2.1."""
 
 from __future__ import annotations
 
@@ -7,8 +7,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
-IMAGE_BACKENDS = ("qwen_image_21",)
-DEFAULT_IMAGE_BACKEND = "qwen_image_21"
+from anime_factory.models import DEFAULT_IMAGE_BACKEND, IMAGE_BACKENDS
 
 
 class ImageBackendError(ValueError):
@@ -42,7 +41,7 @@ class ImageBackend(ABC):
 
 
 def select_image_backend(env: Mapping[str, str] | None = None) -> str:
-    """Production T2I is Qwen-Image-2.1. ``STILL_BACKEND=kolors`` does not override it."""
+    """Production T2I defaults to fal.ai. ``STILL_BACKEND=kolors`` does not override it."""
     mapping = env if env is not None else os.environ
     raw = str(mapping.get("IMAGE_BACKEND") or "").strip().lower()
     if not raw:
@@ -50,6 +49,39 @@ def select_image_backend(env: Mapping[str, str] | None = None) -> str:
     if raw not in IMAGE_BACKENDS:
         raise ImageBackendError(f"IMAGE_BACKEND must be one of {IMAGE_BACKENDS}, got {raw!r}")
     return raw
+
+
+def _env_flag(mapping: Mapping[str, str], name: str) -> bool | None:
+    if name not in mapping:
+        return None
+    return str(mapping.get(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+class FalImageBackend(ImageBackend):
+    """fal.ai text-to-image. Dry-run when FAL_DRY_RUN=1. No local GPU."""
+
+    name = "fal"
+
+    def __init__(self, *, dry_run: bool | None = None) -> None:
+        self.dry_run = dry_run
+
+    def generate(self, request: ImageGenerateRequest) -> ImageGenerateResult:
+        from anime_factory.fal_models import generate_fal_image_t2i, resolve_fal_value
+
+        png = generate_fal_image_t2i(
+            request.prompt,
+            request.width,
+            request.height,
+            negative_prompt=request.negative_prompt,
+            seed=request.seed,
+            dry_run=self.dry_run,
+        )
+        return ImageGenerateResult(
+            png=png,
+            backend=self.name,
+            seed=request.seed,
+            meta={"model": resolve_fal_value("image_t2i_model"), **dict(request.meta)},
+        )
 
 
 class QwenImage21ImageBackend(ImageBackend):
@@ -112,16 +144,19 @@ class Flux2KleinImageBackend(ImageBackend):
 
 
 _BACKENDS: dict[str, type[ImageBackend]] = {
+    "fal": FalImageBackend,
     "qwen_image_21": QwenImage21ImageBackend,
 }
 
 
 def get_image_backend(name: str | None = None, *, env: Mapping[str, str] | None = None) -> ImageBackend:
     chosen = (name or select_image_backend(env=env)).strip().lower()
-    if chosen not in _BACKENDS:
+    cls = _BACKENDS.get(chosen)
+    if cls is None:
         raise ImageBackendError(f"IMAGE_BACKEND must be one of {IMAGE_BACKENDS}, got {chosen!r}")
-    dry: bool | None = None
     mapping = env if env is not None else os.environ
-    if "QWEN_IMAGE_21_DRY_RUN" in mapping:
-        dry = str(mapping.get("QWEN_IMAGE_21_DRY_RUN") or "").strip().lower() in {"1", "true", "yes", "on"}
-    return QwenImage21ImageBackend(dry_run=dry)
+    if chosen == "fal":
+        return FalImageBackend(dry_run=_env_flag(mapping, "FAL_DRY_RUN"))
+    if chosen == "qwen_image_21":
+        return QwenImage21ImageBackend(dry_run=_env_flag(mapping, "QWEN_IMAGE_21_DRY_RUN"))
+    return cls()

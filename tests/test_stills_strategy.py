@@ -125,11 +125,11 @@ def test_character_master_relpath():
 def test_image_backend_env_and_still_adapter(monkeypatch):
     monkeypatch.delenv("IMAGE_BACKEND", raising=False)
     monkeypatch.delenv("STILL_BACKEND", raising=False)
-    assert IMAGE_BACKENDS == ("qwen_image_21",)
-    assert select_image_backend() == "qwen_image_21"
+    assert IMAGE_BACKENDS == ("fal", "qwen_image_21")
+    assert select_image_backend() == "fal"
 
     monkeypatch.setenv("STILL_BACKEND", "kolors")
-    assert select_image_backend() == "qwen_image_21"
+    assert select_image_backend() == "fal"
 
     monkeypatch.setenv("IMAGE_BACKEND", "qwen_image_21")
     assert select_image_backend() == "qwen_image_21"
@@ -162,10 +162,11 @@ def test_production_enums_reject_legacy_backends(monkeypatch):
     monkeypatch.delenv("AF_VIDEO_BACKEND", raising=False)
     monkeypatch.delenv("AF_VIDEO_BACKEND_LOCKED", raising=False)
     monkeypatch.delenv("AF_IMAGE_CAPABILITY", raising=False)
-    assert VIDEO_BACKENDS == ("h3",)
-    assert normalize_video_backend(None) == "h3"
+    assert VIDEO_BACKENDS == ("fal", "h3")
+    assert normalize_video_backend(None) == "fal"
+    assert normalize_video_backend("h3") == "h3"
     assert normalize_pluggable_video_backend("wan") == "h3"
-    assert select_video_backend() == "h3"
+    assert select_video_backend() == "fal"
     for legacy in ("skyreels", "skyreels_v3_r2v", "longlive", "flux2_klein4b"):
         with pytest.raises(ProductionBackendError):
             normalize_video_backend(legacy)
@@ -507,11 +508,11 @@ def test_consecutive_shots_share_stable_reference_pack(tmp_path: Path, monkeypat
     assert "last-frame" not in blob
     kf = run_keyframe_phase(shot_a, story_root=tmp_path, episode_code="EP001", dry_run=True)
     video = run_video_phase(kf, prompt="dock night", camera="wide", motion="push in", duration=5, seed=7)
-    assert video.backend == "h3"
+    assert video.backend == "fal"
     assert video.camera == "wide"
     assert video.motion == "push in"
     assert video.references == paths_a
-    assert video.meta.get("delegated") == "gpu_worker.h3"
+    assert video.meta.get("delegated") == "anime_factory.fal_models"
 
 
 def test_skyreels_truncates_characters_first_and_refuses_empty():

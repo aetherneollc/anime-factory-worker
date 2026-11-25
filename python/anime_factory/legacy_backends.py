@@ -76,15 +76,22 @@ class LongliveVideoGenerateBackend(VideoGenerateBackend):
 
 
 def normalize_legacy_video_backend(value: Any) -> str:
-    """Worker-only name fold. Empty is production H3. Unknown names stay SkyReels."""
+    """Worker-only name fold. Empty stays H3 so an unlabelled Vast image keeps H3.
+
+    ``fal`` is a first-class line. Unknown names stay SkyReels.
+    """
     raw = str(value or "").strip().lower().replace(" ", "")
     if not raw:
         return "h3"
+    from anime_factory.video_backend import FAL_ALIASES
+
+    folded = raw.replace("-", "_")
+    if raw in FAL_ALIASES or folded in {name.replace("-", "_") for name in FAL_ALIASES}:
+        return "fal"
     if raw.startswith("longlive") or raw in LONGLIVE_ALIASES:
         return "longlive"
     if raw in H3_ALIASES or raw == "h3":
         return "h3"
-    folded = raw.replace("-", "_")
     if folded in {"skyreels_v3_r2v", "skyreels", "skyreels_v3", "skyreelsv3", "sr3", "r2v"} or folded.startswith(
         "skyreels"
     ):
@@ -135,6 +142,9 @@ def select_legacy_video_backend(
     if legacy:
         return normalize_legacy_video_backend(legacy)
     image_cap = str(mapping.get("AF_IMAGE_CAPABILITY") or "").strip().lower()
-    if image_cap in {"h3", "longlive", "skyreels_v3_r2v"}:
+    if image_cap in {"h3", "longlive", "skyreels_v3_r2v", "fal"}:
         return normalize_legacy_video_backend(image_cap)
+    if str(mapping.get("AF_WORKER_MODE") or "").strip().lower() == "fal":
+        return "fal"
+    # Unlabelled GPU workers stay on the Vast H3 line. fal is opt-in here.
     return "h3"

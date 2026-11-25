@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import socket
 import sys
 import threading
 import time
@@ -14,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from gpu_worker.entrypoint import main_dry_run
-from gpu_worker.images import default_register_capabilities
+from gpu_worker.images import default_register_capabilities, is_fal_worker_mode
 from gpu_worker.poll import control_headers
 from gpu_worker.registry import GpuRegistry
 from gpu_worker.vast_client import VastClient
@@ -54,6 +55,27 @@ def ensure_r2_client() -> None:
 
         subprocess.check_call(
             [sys.executable, "-m", "pip", "install", "--no-cache-dir", "boto3==1.35.81"]
+        )
+
+
+def _ensure_fal_cpu_runtime() -> None:
+    """Optional OpenCLIP weights for CPU visual QC. Offline failure is not fatal."""
+    clip_dir = (
+        os.environ.get("VISUAL_QC_CLIP_DIR")
+        or os.environ.get("AF_VISUAL_QC_CLIP_DIR")
+        or ""
+    ).strip()
+    if not clip_dir:
+        return
+    try:
+        from gpu_worker.weights import VISUAL_QC_STILL_FILES, _materialize_items
+
+        _materialize_items(VISUAL_QC_STILL_FILES, clip_dir)
+        os.environ.setdefault("AF_VISUAL_QC_DEVICE", "cpu")
+    except Exception as exc:  # noqa: BLE001 — QC can fall back; do not kill the CPU worker
+        print(
+            json.dumps({"visual_qc_clip": f"fal_cpu_skip:{type(exc).__name__}:{exc}"}, ensure_ascii=False),
+            flush=True,
         )
 
 
@@ -97,22 +119,44 @@ def maybe_notify_control_plane(
     hs = handshake or {}
     try:
         if register:
-            register_body: dict[str, Any] = {
-                "vast_instance_id": instance_id,
-                "gpu_type": os.environ.get("GPU_TYPE") or "RTX",
-                "capabilities": {
-                    "comfy": bool(caps.get("comfy")),
-                    "h3": bool(caps.get("h3")),
-                    "longlive": bool(caps.get("longlive")),
-                    "video_backend": caps.get("video_backend") or "",
-                    "kolors": bool(caps.get("kolors")),
-                    "image_gen": bool(caps.get("image_gen")),
-                    "agent": True,
-                    "nvenc": True,
-                    "profile_id": hs.get("profile_id") or caps.get("profile_id"),
-                    "image_digest": hs.get("image_digest") or caps.get("image_digest"),
-                },
-            }
+            if is_fal_worker_mode():
+                worker_id = fal_worker_instance_id(instance_id)
+                register_body = {
+                    "vast_instance_id": worker_id,
+                    "gpu_type": "CPU (fal.ai)",
+                    "profile_id": "fal-api-cpu",
+                    "capabilities": {
+                        "fal": True,
+                        "provider": "fal",
+                        "comfy": False,
+                        "h3": False,
+                        "longlive": False,
+                        "kolors": False,
+                        "image_gen": True,
+                        "video_backend": "fal",
+                        "agent": True,
+                        "nvenc": False,
+                        "profile_id": "fal-api-cpu",
+                    },
+                }
+                instance_id = worker_id
+            else:
+                register_body = {
+                    "vast_instance_id": instance_id,
+                    "gpu_type": os.environ.get("GPU_TYPE") or "RTX",
+                    "capabilities": {
+                        "comfy": bool(caps.get("comfy")),
+                        "h3": bool(caps.get("h3")),
+                        "longlive": bool(caps.get("longlive")),
+                        "video_backend": caps.get("video_backend") or "",
+                        "kolors": bool(caps.get("kolors")),
+                        "image_gen": bool(caps.get("image_gen")),
+                        "agent": True,
+                        "nvenc": True,
+                        "profile_id": hs.get("profile_id") or caps.get("profile_id"),
+                        "image_digest": hs.get("image_digest") or caps.get("image_digest"),
+                    },
+                }
             for key in ("host", "stack", "resources", "preflight", "adaptations"):
                 if hs.get(key) is not None:
                     register_body[key] = hs[key]
@@ -199,7 +243,20 @@ class _HeartbeatLoop:
             self.thread.join(timeout=2)
 
 
+def fal_worker_instance_id(fallback: str = "") -> str:
+    """Stable id for a long-lived CPU worker. ``AF_WORKER_ID`` wins over the hostname."""
+    explicit = (os.environ.get("AF_WORKER_ID") or "").strip()
+    if explicit:
+        return explicit
+    if str(fallback or "").startswith("fal-cpu-"):
+        return str(fallback)
+    host = (socket.gethostname() or os.environ.get("HOSTNAME") or fallback or "worker").strip() or "worker"
+    return f"fal-cpu-{host}"
+
+
 def _instance_id() -> str:
+    if is_fal_worker_mode():
+        return fal_worker_instance_id()
     label = (os.environ.get("VAST_CONTAINERLABEL") or "").strip()
     label_id = label.split(".", 1)[1] if label.startswith("C.") else label
     return (
@@ -209,6 +266,19 @@ def _instance_id() -> str:
         or os.environ.get("HOSTNAME")
         or "local-dry"
     )
+
+
+def suppress_fal_self_destroy(pending: dict[str, Any] | None, *, once: bool) -> tuple[dict[str, Any] | None, int | None]:
+    """fal CPU workers never call Vast teardown. ``AF_ONCE`` exits without destroying."""
+    if not is_fal_worker_mode() or not pending:
+        return pending, None
+    if once:
+        try:
+            code = int(pending.get("exit_code") or 0)
+        except (TypeError, ValueError):
+            code = 0
+        return None, code
+    return None, None
 
 
 def maybe_pm_control() -> object | None:
@@ -402,10 +472,15 @@ def main() -> int:
         runtime,
         tunnel,
         heartbeat_s,
-        on_stop=monitored_teardown,
+        on_stop=None if is_fal_worker_mode() else monitored_teardown,
     )
     heartbeat.start()
-    if start_comfy_enabled:
+    fal_worker = is_fal_worker_mode()
+    if fal_worker:
+        _ensure_fal_cpu_runtime()
+        runtime.mark_idle()
+        stack_info = {"router_ready": True, "comfy_skipped_fal": True, "weights": {"kind": "fal"}}
+    elif start_comfy_enabled:
         try:
             stack_info = boot_gpu_stack(progress=runtime.observe_progress)
         except PreflightFailure as exc:
@@ -614,7 +689,7 @@ def main() -> int:
     else:
         runtime.mark_idle()
 
-    stack_failed = bool(stack_info and not stack_info.get("router_ready"))
+    stack_failed = False if fal_worker else bool(stack_info and not stack_info.get("router_ready"))
     if not stack_failed and runtime.handshake is not None:
         # Publish the completed handshake before the first claim, rather than
         # waiting for the background heartbeat's next 30-second tick.
@@ -679,7 +754,7 @@ def main() -> int:
     idle_comfy = ComfyRouter() if start_comfy_enabled and not stack_info.get("comfy_skipped_longlive") else None
     control = maybe_pm_control()
     once = _env_bool("AF_ONCE", False)
-    can_run = (start_comfy_enabled or production_without_comfy()) and not stack_failed
+    can_run = True if fal_worker else (start_comfy_enabled or production_without_comfy()) and not stack_failed
     wanted_story = (os.environ.get("AF_STORY_ID") or "").strip()
     processed_legacy: set[tuple[str, str]] = set()
     pending_reports: dict[str, Any] | None = None
@@ -743,6 +818,15 @@ def main() -> int:
                         "last_attempt": 0.0,
                     }
                     pending_reports = None
+
+            pending_destroy, fal_exit = suppress_fal_self_destroy(pending_destroy, once=once)
+            if fal_exit is not None:
+                runtime.mark_idle()
+                print(
+                    json.dumps({"fal_cpu_keep_alive": "af_once", "exit_code": fal_exit}, ensure_ascii=False),
+                    flush=True,
+                )
+                return fal_exit
 
             if pending_destroy and not destroy_blocked:
                 now = time.monotonic()
@@ -878,6 +962,8 @@ def main() -> int:
                             story_status=str(item.get("story_status") or item.get("status") or "") or None,
                             until_stage=str(item.get("until_stage") or "") or None,
                             episode_status=str(item.get("episode_status") or "") or None,
+                            fal_config=item.get("fal_config") if isinstance(item.get("fal_config"), dict) else None,
+                            render_mode=str(item.get("render_mode") or "") or None,
                         )
                         if episode.get("remaining"):
                             runtime.mark_busy()
@@ -980,6 +1066,8 @@ def main() -> int:
                                     or None,
                                     until_stage=str(job.get("until_stage") or "") or None,
                                     episode_status=str(job.get("episode_status") or "") or None,
+                                    fal_config=job.get("fal_config") if isinstance(job.get("fal_config"), dict) else None,
+                                    render_mode=str(job.get("render_mode") or "") or None,
                                 )
                                 processed_legacy.add(legacy_key)
                                 if episode.get("remaining"):
@@ -1016,7 +1104,10 @@ def main() -> int:
                     runtime.mark_idle()
 
             registry.heartbeat(instance_id, runtime.status if runtime.status in {"busy", "idle"} else "idle")
-            if not pending_destroy and not destroy_blocked:
+            if fal_worker:
+                # Long-lived CPU container: idle and budget stops do not self-destroy.
+                pass
+            elif not pending_destroy and not destroy_blocked:
                 limit = runtime.limit_reached()
                 if limit:
                     pending_destroy = {

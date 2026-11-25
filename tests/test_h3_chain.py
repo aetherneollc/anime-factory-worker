@@ -109,6 +109,7 @@ def test_persist_board_splits_10s_shot(tmp_path):
             }
         ],
         kind="short",
+        video_backend="h3",
     )
     segs = conn.execute("SELECT id, shot_id, chain_id, chain_index, duration, h3_mode, status FROM segments ORDER BY seq").fetchall()
     assert len(segs) == 2

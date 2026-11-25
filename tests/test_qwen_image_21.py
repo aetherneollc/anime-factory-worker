@@ -24,11 +24,15 @@ def test_production_enums_reject_skyreels_and_klein_as_defaults(monkeypatch):
     monkeypatch.delenv("IMAGE_BACKEND", raising=False)
     monkeypatch.delenv("VIDEO_BACKEND", raising=False)
     monkeypatch.delenv("AF_VIDEO_BACKEND", raising=False)
-    assert IMAGE_BACKENDS == ("qwen_image_21",)
-    assert VIDEO_BACKENDS == ("h3",)
+    assert IMAGE_BACKENDS == ("fal", "qwen_image_21")
+    assert VIDEO_BACKENDS == ("fal", "h3")
+    assert select_image_backend() == "fal"
+    assert select_video_backend() == "fal"
+    assert normalize_video_backend(None) == "fal"
+    assert normalize_video_backend("h3") == "h3"
+    monkeypatch.setenv("IMAGE_BACKEND", "qwen_image_21")
     assert select_image_backend() == "qwen_image_21"
-    assert select_video_backend() == "h3"
-    assert normalize_video_backend(None) == "h3"
+    monkeypatch.delenv("IMAGE_BACKEND", raising=False)
     for name in ("skyreels", "skyreels_v3_r2v", "longlive"):
         with pytest.raises(ProductionBackendError):
             normalize_video_backend(name)

@@ -1,9 +1,10 @@
-"""Production video line: MiniMax H3.
+"""Production video line: fal.ai by default, MiniMax H3 retained.
 
-``normalize_video_backend`` and ``select_video_backend`` select H3 (native
-duration up to about 8 seconds). SkyReels and LongLive are refused.
-Frozen worker images still lock their own line through
-``normalize_legacy_video_backend`` inside ``lock_video_backend``.
+``normalize_video_backend`` and ``select_video_backend`` select fal when unset.
+``h3`` stays a first-class production backend. SkyReels and LongLive are refused.
+Frozen Vast images still lock their own line through
+``normalize_legacy_video_backend`` inside ``lock_video_backend``
+(``AF_IMAGE_CAPABILITY=h3``, ``VIDEO_BACKEND=h3``, or factory.json ``h3``).
 """
 
 from __future__ import annotations
@@ -14,16 +15,17 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from anime_factory.models import (
+    DEFAULT_VIDEO_BACKEND,
+    FAL_MAX_SECONDS,
     H3_MAX_SECONDS,
     LONGLIVE_MAX_SECONDS,
     LONGLIVE_SHORT_MAX_SECONDS,
     SKYREELS_MAX_SECONDS,
+    VIDEO_BACKENDS,
 )
 
-VIDEO_BACKENDS = ("h3",)
-DEFAULT_VIDEO_BACKEND = "h3"
 # Image-capability labels the worker lock still understands. Not production enums.
-_WORKER_IMAGE_LINES = frozenset({"h3", "longlive", "skyreels_v3_r2v"})
+_WORKER_IMAGE_LINES = frozenset({"fal", "h3", "longlive", "skyreels_v3_r2v"})
 FACTORY_JSON_NAME = "factory.json"
 LOCKED_ENV = "AF_VIDEO_BACKEND_LOCKED"
 CAPABILITY_MISMATCH = "capability_mismatch:video_backend"
@@ -50,6 +52,11 @@ SKYREELS_ALIASES = frozenset(
     }
 )
 H3_ALIASES = frozenset({"h3", "wan", "minimax", "minimax-h3", "minimaxh3"})
+FAL_ALIASES = frozenset({"fal", "fal.ai", "fal_ai", "fal-ai", "fal_api"})
+
+
+def _folded_aliases(names: frozenset[str]) -> frozenset[str]:
+    return frozenset(name.replace("-", "_") for name in names)
 
 
 class VideoBackendLockError(RuntimeError):
@@ -66,10 +73,13 @@ def _is_skyreels(raw: str) -> bool:
 
 
 def normalize_video_backend(value: Any) -> str:
-    """Production normalize. Empty selects H3. SkyReels and LongLive are refused."""
+    """Production normalize. Empty selects fal. H3 aliases stay H3. SkyReels and LongLive are refused."""
     raw = str(value or "").strip().lower().replace(" ", "")
-    if not raw or raw in H3_ALIASES:
-        return DEFAULT_VIDEO_BACKEND
+    folded = raw.replace("-", "_")
+    if not raw or raw in FAL_ALIASES or folded in _folded_aliases(FAL_ALIASES):
+        return "fal"
+    if raw in H3_ALIASES or folded in _folded_aliases(H3_ALIASES):
+        return "h3"
     raise ProductionBackendError(
         f"production VIDEO_BACKEND rejects {raw!r}; allowed {VIDEO_BACKENDS}"
     )
@@ -90,6 +100,8 @@ def max_seconds_for_backend(backend: str | None = None) -> float:
             return LONGLIVE_MAX_SECONDS
     if chosen == "skyreels_v3_r2v":
         return SKYREELS_MAX_SECONDS
+    if chosen == "fal":
+        return FAL_MAX_SECONDS
     return H3_MAX_SECONDS
 
 
@@ -104,6 +116,8 @@ def short_take_max_seconds(backend: str | None = None) -> float:
         return min(max_seconds_for_backend("longlive"), LONGLIVE_SHORT_MAX_SECONDS)
     if chosen == "skyreels_v3_r2v":
         return SKYREELS_MAX_SECONDS
+    if chosen == "fal":
+        return FAL_MAX_SECONDS
     return H3_MAX_SECONDS
 
 
@@ -190,7 +204,7 @@ def select_video_backend(
     root: Path | None = None,
     env: Mapping[str, str] | None = None,
 ) -> str:
-    """Production selection. Unset env is H3. SkyReels and LongLive raise."""
+    """Production selection. Unset env is fal. SkyReels and LongLive raise."""
     mapping = env if env is not None else os.environ
     explicit = _first_explicit_backend(segment, root, mapping)
     if explicit:
@@ -228,8 +242,8 @@ def lock_video_backend(
         if requested is not None and str(requested).strip()
         else select_legacy_video_backend(root=root, env=mapping)
     )
-    # No explicit request: a frozen image keeps its own line.
-    # Otherwise the production default is MiniMax H3.
+    # No explicit request: a frozen image keeps its own line (h3 / longlive / sr3 / fal).
+    # Otherwise the production default is fal.ai.
     env_set = str(mapping.get("AF_VIDEO_BACKEND") or "").strip()
     factory = read_factory_backend(root)
     image_cap = image_video_capability(mapping)

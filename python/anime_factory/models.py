@@ -12,13 +12,13 @@ QC_MODEL = "Qwen/Qwen3.5-4B"
 IMAGE_MODEL = "cagliostrolab/animagine-xl-4.0"
 IMAGE_CKPT = "animagine-xl-4.0.safetensors"
 # GPU stills: scene plates / keyframes stay on Kwai Kolors (backup for characters too).
-# Character sheets default to local Qwen-Image-2.1 (see qwen_image_21.py).
+# Character sheets default to fal.ai. IMAGE_BACKEND=qwen_image_21 keeps local Qwen-Image-2.1.
 # DashScope qwen-image-2.0-pro is not the production path.
 # Kolors is not an SDXL checkpoint: ChatGLM3 encodes text, so it cannot reuse anime_t2i.
 STILL_BACKENDS = ("kolors", "animagine")
 DEFAULT_STILL_BACKEND = "kolors"
-CHARACTER_STILL_BACKENDS = ("hunyuan", "qwen", "kolors", "animagine")
-DEFAULT_CHARACTER_STILL_BACKEND = "qwen"
+CHARACTER_STILL_BACKENDS = ("fal", "hunyuan", "qwen", "kolors", "animagine")
+DEFAULT_CHARACTER_STILL_BACKEND = "fal"
 HUNYUAN_IMAGE_MODEL = "hy-image-v3"
 # Hosted DashScope id. Production stills do not call this model.
 QWEN_IMAGE_MODEL = "qwen-image-2.0-pro"
@@ -155,7 +155,7 @@ class StillBackendError(ValueError):
 
 
 class CharacterStillBackendError(ValueError):
-    """CHARACTER_STILL_BACKEND is not hunyuan, qwen, kolors, or animagine."""
+    """CHARACTER_STILL_BACKEND is not fal, hunyuan, qwen, kolors, or animagine."""
 
 
 class QwenImageError(ValueError):
@@ -173,13 +173,20 @@ def still_backend() -> str:
 
 
 def character_still_backend() -> str:
-    """Backend for character_sheet / view_derive / costume_derive. Default: qwen.
+    """Backend for character_sheet / view_derive / costume_derive.
 
-    Unset or blank never falls through to hunyuan.
+    Unset ``CHARACTER_STILL_BACKEND`` follows the image line: ``qwen`` when
+    ``IMAGE_BACKEND=qwen_image_21``, otherwise ``fal``. An explicit ``qwen``
+    (or any other allow-listed name) always wins. Unset never falls through
+    to hunyuan.
     """
     raw = (os.environ.get("CHARACTER_STILL_BACKEND") or "").strip().lower()
     if not raw:
-        raw = DEFAULT_CHARACTER_STILL_BACKEND
+        image = (os.environ.get("IMAGE_BACKEND") or "").strip().lower()
+        if image == "qwen_image_21":
+            raw = "qwen"
+        else:
+            raw = "fal"
     if raw not in CHARACTER_STILL_BACKENDS:
         raise CharacterStillBackendError(
             f"CHARACTER_STILL_BACKEND must be one of {CHARACTER_STILL_BACKENDS}, got {raw!r}"
@@ -271,6 +278,8 @@ VIDEO_FPS = 24
 TARGET_EPISODE_SECONDS = 600
 DEFAULT_SHORT_SECONDS = 120.0
 H3_MAX_SECONDS = 8.0
+# fal.ai Hailuo / Kling reference clips. A 10s shot stays one request.
+FAL_MAX_SECONDS = 10.0
 # SkyReels V3 R2V recommended shot unit.
 SKYREELS_MAX_SECONDS = 5.0
 # NVlabs LongLive inference.yaml default num_output_frames=384 latent frames.
@@ -282,11 +291,11 @@ LONGLIVE_SHORT_MAX_SECONDS = 60.0
 LONGLIVE_SHORT_TARGET_SECONDS = 120.0
 LONGLIVE_SHORT_MIN_TAKES = 2
 LONGLIVE_SHORT_MAX_TAKES = 3
-VIDEO_BACKENDS = ("h3",)
-DEFAULT_VIDEO_BACKEND = "h3"
-# Production stills. Klein is not selectable here.
-IMAGE_BACKENDS = ("qwen_image_21",)
-DEFAULT_IMAGE_BACKEND = "qwen_image_21"
+VIDEO_BACKENDS = ("fal", "h3")
+DEFAULT_VIDEO_BACKEND = "fal"
+# Production stills. Klein is not selectable here. Qwen-Image-2.1 stays available.
+IMAGE_BACKENDS = ("fal", "qwen_image_21")
+DEFAULT_IMAGE_BACKEND = "fal"
 CONTROL_BACKENDS = ("qwen_image_21_ref", "flux2_klein_ref", "composite", "kolors_ipadapter", "none")
 DEFAULT_CONTROL_BACKEND = "qwen_image_21_ref"
 H3_MAX_REFS = 9

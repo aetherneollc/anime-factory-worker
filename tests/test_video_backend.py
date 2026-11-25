@@ -64,13 +64,15 @@ def _clear_backend_env(monkeypatch):
     monkeypatch.delenv("CUDA_PATH", raising=False)
 
 
-def test_normalize_defaults_to_h3():
+def test_normalize_defaults_to_fal():
     from anime_factory.video_backend import ProductionBackendError
 
-    assert normalize_video_backend(None) == "h3"
-    assert normalize_video_backend("") == "h3"
+    assert normalize_video_backend(None) == "fal"
+    assert normalize_video_backend("") == "fal"
+    assert normalize_video_backend("fal.ai") == "fal"
     assert normalize_video_backend("wan") == "h3"
-    assert DEFAULT_VIDEO_BACKEND == "h3"
+    assert normalize_video_backend("h3") == "h3"
+    assert DEFAULT_VIDEO_BACKEND == "fal"
     for legacy in ("skyreels", "skyreels_v3_r2v", "longlive", "klein"):
         with pytest.raises(ProductionBackendError):
             normalize_video_backend(legacy)
@@ -95,13 +97,13 @@ def test_select_priority_segment_over_file_over_env(tmp_path: Path, monkeypatch)
     with pytest.raises(ProductionBackendError):
         select_video_backend(root=tmp_path / "missing")
     monkeypatch.delenv("AF_VIDEO_BACKEND")
-    assert select_video_backend() == "h3"
+    assert select_video_backend() == "fal"
 
 
-def test_missing_factory_defaults_to_h3(tmp_path: Path):
-    """No factory.json and no explicit backend selects MiniMax H3."""
+def test_missing_factory_defaults_to_fal(tmp_path: Path):
+    """No factory.json and no explicit backend selects fal.ai."""
     assert not (tmp_path / "factory.json").exists()
-    assert select_video_backend(root=tmp_path) == "h3"
+    assert select_video_backend(root=tmp_path) == "fal"
 
 
 def test_max_seconds_longlive_does_not_split_12s(tmp_path: Path):
@@ -542,7 +544,7 @@ def test_h3_backend_unchanged_by_longlive_defaults():
     with pytest.raises(ProductionBackendError):
         normalize_video_backend("longlive")
     assert max_seconds_for_backend("h3") == H3_MAX_SECONDS
-    assert max_seconds_for_backend() == H3_MAX_SECONDS
+    assert max_seconds_for_backend() == 10.0
 
 
 def test_dockerfile_h3_only_no_compile():

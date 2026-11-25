@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
+from typing import Mapping
 
 from gpu_worker.stack_contracts import H3_STACK, LONGLIVE_STACK
 
@@ -224,13 +225,47 @@ def stills_capable(capabilities: dict | None) -> bool:
     return bool(capabilities.get("kolors") or capabilities.get("image_gen") or capabilities.get("image-gen"))
 
 
+_FAL_NAMES = frozenset({"fal", "fal.ai", "fal_ai", "fal-ai", "fal_api"})
+
+
+def _is_fal_name(value: str | None) -> bool:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return False
+    return raw in _FAL_NAMES or raw.replace("-", "_") in {name.replace("-", "_") for name in _FAL_NAMES}
+
+
+def _env_falsy(mapping: Mapping[str, str], name: str) -> bool:
+    if name not in mapping:
+        return True
+    raw = mapping.get(name)
+    if raw is None or str(raw).strip() == "":
+        return True
+    return str(raw).strip().lower() in {"0", "false", "no", "off"}
+
+
+def is_fal_worker_mode(env: Mapping[str, str] | None = None) -> bool:
+    """CPU worker that calls fal.ai and does not boot Comfy.
+
+    True when ``AF_WORKER_MODE=fal``, or when the video backend is fal and
+    ``AF_START_COMFY`` is unset or false.
+    """
+    mapping = env if env is not None else os.environ
+    if _is_fal_name(str(mapping.get("AF_WORKER_MODE") or "")):
+        return True
+    backend = str(mapping.get("VIDEO_BACKEND") or mapping.get("AF_VIDEO_BACKEND") or "")
+    return _is_fal_name(backend) and _env_falsy(mapping, "AF_START_COMFY")
+
+
 def video_capability(capabilities: dict | None) -> str:
-    """Return the video line this image may run: skyreels_v3_r2v, h3, longlive, or empty."""
+    """Return the video line this image may run: fal, skyreels_v3_r2v, h3, longlive, or empty."""
     if not capabilities:
         return ""
     explicit = str(capabilities.get("video_backend") or "").strip().lower()
-    if explicit in {"skyreels_v3_r2v", "h3", "longlive"}:
+    if explicit in {"fal", "skyreels_v3_r2v", "h3", "longlive"}:
         return explicit
+    if capabilities.get("fal") or str(capabilities.get("provider") or "").strip().lower() == "fal":
+        return "fal"
     if capabilities.get("skyreels"):
         return "skyreels_v3_r2v"
     if capabilities.get("longlive") and not capabilities.get("h3"):
@@ -273,7 +308,7 @@ def running_image_name() -> str | None:
 def running_image_capability() -> str:
     """Video line baked into this container. Unset still reports h3 for the hub image."""
     raw = (os.environ.get(IMAGE_CAPABILITY_ENV) or "").strip().lower()
-    if raw in {"h3", "longlive", "skyreels_v3_r2v"}:
+    if raw in {"fal", "h3", "longlive", "skyreels_v3_r2v"}:
         return raw
     image = running_image_name()
     if image:
@@ -301,6 +336,21 @@ def default_register_capabilities() -> dict:
         caps["h3"] = False
         caps["longlive"] = False
         caps["video_backend"] = "skyreels_v3_r2v"
+    elif cap == "fal":
+        caps = {
+            "comfy": False,
+            "h3": False,
+            "longlive": False,
+            "skyreels": False,
+            "kolors": False,
+            "image_gen": True,
+            "agent": True,
+            "install_comfy": False,
+            "video_backend": "fal",
+            "fal": True,
+            "provider": "fal",
+            "nvenc": False,
+        }
     else:
         caps = image_capabilities(name or AGENT_IMAGE)
         caps.setdefault("longlive", False)
@@ -355,6 +405,17 @@ CAPABILITY_PROFILES: dict[str, CapabilityProfile] = {
         expected_flash_attn=LONGLIVE_STACK.flash_attn,
         note="LongLive NVFP4 on Blackwell sm_120; wheels must be baked.",
     ),
+    "fal-api-cpu": CapabilityProfile(
+        profile_id="fal-api-cpu",
+        supported_sm=("cpu",),
+        min_vram_mb=0,
+        min_disk_gb=8.0,
+        min_mem_gb=2.0,
+        require_torch=False,
+        require_flash_attn=False,
+        require_fouroversix=False,
+        note="Long-lived CPU worker. Image and video go to fal.ai. No CUDA, Comfy, or Vast self-destroy.",
+    ),
     "sr3-cu128-sm120": CapabilityProfile(
         profile_id="sr3-cu128-sm120",
         supported_sm=("sm_120",),
@@ -375,6 +436,8 @@ CAPABILITY_PROFILES: dict[str, CapabilityProfile] = {
 
 def profile_for_video_backend(backend: str) -> str:
     raw = str(backend or "").strip().lower()
+    if _is_fal_name(raw):
+        return "fal-api-cpu"
     if raw == "longlive" or raw.startswith("longlive"):
         return "longlive-nvfp4-sm120"
     if raw in {"h3", "wan"} or raw.startswith("h3"):
@@ -400,7 +463,7 @@ def default_profile_id() -> str:
     if backend:
         return profile_for_video_backend(backend)
     cap = (os.environ.get(IMAGE_CAPABILITY_ENV) or "").strip().lower()
-    if cap in {"h3", "longlive", "skyreels_v3_r2v"}:
+    if cap in {"fal", "h3", "longlive", "skyreels_v3_r2v"}:
         return profile_for_video_backend(cap)
     return "h3-comfy-cu130-sm120"
 

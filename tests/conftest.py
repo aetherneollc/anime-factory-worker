@@ -20,9 +20,9 @@ def _clear_video_backend_lock(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _unit_tests_use_kolors_characters(request, monkeypatch):
-    """Production default is CHARACTER_STILL_BACKEND=qwen; unit tests inject Kolors/GPU fakes.
+    """Unit tests inject Kolors/GPU fakes. Production default is fal unless IMAGE_BACKEND=qwen_image_21.
 
-    Mark a test with ``@pytest.mark.qwen_character_default`` to assert the real default.
+    Mark a test with ``@pytest.mark.qwen_character_default`` to exercise the real default.
     """
     if request.node.get_closest_marker("qwen_character_default"):
         monkeypatch.delenv("CHARACTER_STILL_BACKEND", raising=False)

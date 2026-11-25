@@ -1,8 +1,8 @@
 """Production image and video backends for the stills pipeline.
 
 Env:
-  IMAGE_BACKEND=qwen_image_21
-  VIDEO_BACKEND=h3
+  IMAGE_BACKEND=fal
+  VIDEO_BACKEND=fal
 
 ``STILL_BACKEND=kolors`` does not override IMAGE_BACKEND.
 ``CONTROL_BACKEND`` is an asset-generation knob, not part of the video lease.

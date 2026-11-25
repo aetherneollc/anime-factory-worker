@@ -4,8 +4,9 @@ Identity is one approved portrait master (`master.png`). The reference board
 is composed from independently approved front/side/back renders. Side, back, and costume
 views are reference edits of that master, not a second text-to-image.
 Locked seed + assets/index.json selected pointer. Character sheets default to
-local Qwen-Image-2.1 (CHARACTER_STILL_BACKEND=qwen). Unset does not fall
-through to Hunyuan. DashScope qwen-image-2.0-pro is not the production path.
+fal.ai. IMAGE_BACKEND=qwen_image_21 or CHARACTER_STILL_BACKEND=qwen keeps
+local Qwen-Image-2.1. Unset does not fall through to Hunyuan. DashScope
+qwen-image-2.0-pro is not the production path.
 Scene plates stay empty of people. Kolors remains a character rollback.
 
 Every blob that reaches disk goes through `assert_still_blob`: PNG magic, the
@@ -1004,6 +1005,23 @@ class KolorsClient:
             width, height = parse_image_size(payload.get("image_size"), default=(CHAR_VIEW_WIDTH, CHAR_VIEW_HEIGHT))
             label = str(payload.get("_label") or kind or "still")
             return self._generate_hunyuan_character(clean, width, height, label)
+        # fal.ai. The master is one T2I. Derives edit master.png. No local GPU.
+        if char_backend == "fal":
+            from anime_factory.fal_models import resolve_fal_value
+
+            clean = {k: v for k, v in payload.items() if k not in {"image", "reference_images"}}
+            derive_kind = kind in {"character_view_derive", "costume_derive"}
+            clean["model"] = resolve_fal_value("image_edit_model" if derive_kind else "image_t2i_model")
+            if kind == "character_sheet":
+                clean.pop("_parent_png", None)
+            self.last_payloads.append({k: v for k, v in clean.items() if k != "_parent_png"})
+            Counters.kolors_requests += 1
+            width, height = parse_image_size(
+                payload.get("image_size"),
+                default=(1344, 768) if kind == "character_sheet" else (CHAR_VIEW_WIDTH, CHAR_VIEW_HEIGHT),
+            )
+            label = str(payload.get("_label") or kind or "still")
+            return self._generate_fal_character(clean, width, height, label)
         # Local Qwen-Image-2.1. The master is one T2I. Derives edit master.png.
         if char_backend == "qwen":
             from anime_factory.models import QWEN_IMAGE_21_MODEL_ID
@@ -1110,6 +1128,65 @@ class KolorsClient:
             self._last_call = time.time()
             raise KolorsPayloadError(str(exc)) from exc
         self._last_call = time.time()
+        return self._checked(blob, width, height, label)
+
+    def _generate_fal_character(self, payload: dict, width: int, height: int, label: str) -> bytes:
+        from anime_factory.fal_client import FalApiError
+        from anime_factory.fal_models import edit_fal_image, generate_fal_image_t2i
+        from anime_factory.models import FIXED_NEGATIVE, STYLE_PREFIX_CHARACTER
+        from anime_factory.qwen_image_21 import MasterReferenceError
+
+        attempt = dict(payload)
+        attempt["image_size"] = f"{width}x{height}"
+        kind = str(payload.get("_kind") or "")
+        view = str(payload.get("_view") or payload.get("view") or "")
+        master_path = str(payload.get("_master_path") or "")
+        parent = payload.get("_parent_png")
+        prompt = str(payload.get("prompt") or "")
+        if STYLE_PREFIX_CHARACTER.lower() not in prompt.lower():
+            prompt = f"{STYLE_PREFIX_CHARACTER}, {prompt}" if prompt else STYLE_PREFIX_CHARACTER
+        negative = str(payload.get("negative_prompt") or "")
+        if "photorealistic" not in negative.lower():
+            negative = f"{negative}, {FIXED_NEGATIVE}" if negative else FIXED_NEGATIVE
+        derive = kind in {"character_view_derive", "costume_derive"} and isinstance(parent, (bytes, bytearray)) and parent
+        if not derive:
+            assert_no_reference_images(
+                {k: v for k, v in payload.items() if not str(k).startswith("_") and k != "_parent_png"}
+            )
+        dry = True if not self.live else None
+        try:
+            if derive:
+                blob = edit_fal_image(
+                    prompt,
+                    [bytes(parent)],
+                    width,
+                    height,
+                    negative_prompt=negative,
+                    seed=payload.get("seed"),
+                    dry_run=dry,
+                    master_path=master_path,
+                    view=view or None,
+                )
+            else:
+                blob = generate_fal_image_t2i(
+                    prompt,
+                    width,
+                    height,
+                    negative_prompt=negative,
+                    seed=payload.get("seed"),
+                    dry_run=dry,
+                )
+        except MasterReferenceError:
+            raise
+        except FalApiError as exc:
+            if not self.live:
+                blob = self._offline_still(attempt, width, height)
+            else:
+                self._last_call = time.time()
+                raise KolorsPayloadError(str(exc)) from exc
+        else:
+            if self.live:
+                self._last_call = time.time()
         return self._checked(blob, width, height, label)
 
     def _generate_qwen_character(self, payload: dict, width: int, height: int, label: str) -> bytes:

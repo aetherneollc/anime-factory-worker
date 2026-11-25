@@ -61,11 +61,11 @@ def test_force_all_and_zero_before_select_every_enabled_target():
         raise AssertionError("diff must not run")
 
     forced = select_targets(targets, before="abc", sha="def", force_all=True, diff_quiet=_never)
-    assert {t["id"] for t in forced} == {"h3", "sr3"}
+    assert {t["id"] for t in forced} == {"h3", "sr3", "fal"}
     zero = select_targets(targets, before=ZERO_SHA, sha="def", force_all=False, diff_quiet=_never)
-    assert {t["id"] for t in zero} == {"h3", "sr3"}
+    assert {t["id"] for t in zero} == {"h3", "sr3", "fal"}
     empty = select_targets(targets, before="", sha="def", force_all=False, diff_quiet=_never)
-    assert {t["id"] for t in empty} == {"h3", "sr3"}
+    assert {t["id"] for t in empty} == {"h3", "sr3", "fal"}
 
 
 def test_quiet_diff_skips_unchanged_and_builds_changed():

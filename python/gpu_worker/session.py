@@ -13,6 +13,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -3214,17 +3215,399 @@ def _run_anim_skyreels(
     }
 
 
+def group_fal_shot_chains(shots: list[dict]) -> list[list[tuple[int, dict]]]:
+    """Group a board into chains that may run at the same time.
+
+    Shots that share ``chain_id`` stay in one group, in board order, and run
+    strictly one after another. A shot with no chain id is its own group.
+    """
+    buckets: dict[str, list[tuple[int, dict]]] = {}
+    order: list[str] = []
+    for index, shot in enumerate(shots):
+        cid = str(shot.get("chain_id") or "").strip()
+        key = f"chain:{cid}" if cid else f"solo:{index}"
+        if key not in buckets:
+            buckets[key] = []
+            order.append(key)
+        buckets[key].append((index, dict(shot)))
+    return [buckets[key] for key in order]
+
+
+def _fal_picture_prompt(shot: dict) -> str:
+    from anime_factory.h3_storyboard import compile_picture_prompt
+
+    prompt = compile_picture_prompt(shot)
+    constraints = shot.get("h3_repair_constraints") or []
+    if isinstance(constraints, list):
+        for clause in constraints:
+            text = str(clause or "").strip()
+            if text and text not in prompt:
+                prompt = f"{prompt}, {text}"
+    return prompt
+
+
+def _fal_video_mode(shot: dict) -> str:
+    used = select_mode(shot)
+    if used == "ref2va":
+        return "r2v"
+    if used == "fl2va_first_last":
+        return "fl2v"
+    return "i2v"
+
+
+def _png_bytes(path: Any) -> bytes | None:
+    if not path or is_directory_like(path):
+        return None
+    file = Path(str(path))
+    if file.is_file() and file.stat().st_size >= 32:
+        return file.read_bytes()
+    return None
+
+
+def _fal_reference_bytes(root: Path, shot: dict) -> tuple[bytes | None, bytes | None, list[bytes], list[bytes]]:
+    sid = str(shot.get("id") or "")
+    first = _png_bytes(shot.get("first_frame_source_path")) or _png_bytes(shot.get("first_frame_path"))
+    if first is None and int(shot.get("chain_index") or 0) > 0:
+        first = _png_bytes(root / "episodes" / EP / "keyframes" / sid / "chain_first.png")
+    if first is None:
+        first = _png_bytes(root / "episodes" / EP / "keyframes" / sid / "f1.png")
+    last = _png_bytes(shot.get("last_frame_path")) if select_mode(shot) == "fl2va_first_last" else None
+    chars: list[bytes] = []
+    scenes: list[bytes] = []
+    refs = [str(item) for item in (shot.get("refs") or [])]
+    cid = str(shot.get("character_id") or "").strip()
+    if cid and all(f"char_{cid}_sheet" not in item for item in refs):
+        refs.append(f"char_{cid}_sheet")
+    plate = str(shot.get("plate_id") or "").strip()
+    if plate and plate not in refs:
+        refs.append(plate)
+    for ref in refs:
+        path = _resolve_ref_file(root, ref)
+        if path is None:
+            continue
+        blob = path.read_bytes()
+        low = ref.lower().replace("\\", "/")
+        if "char" in low or "sheet" in low or "/characters/" in low or low.endswith("master.png"):
+            chars.append(blob)
+        else:
+            scenes.append(blob)
+    return first, last, chars, scenes
+
+
+def _fal_open_conn(root: Path, shared):
+    path = Path(root) / "story.sqlite"
+    if not path.is_file():
+        return shared, False
+    from anime_factory.db import open_db
+
+    return open_db(path), True
+
+
+def _run_fal_chain(
+    story_id: str,
+    root: Path,
+    conn,
+    shots: list[dict],
+    group: list[tuple[int, dict]],
+    *,
+    fal_config: dict[str, Any] | None,
+    progress: ProgressCallback | None,
+    cpu: CpuPostQueue,
+    post_lock: threading.Lock,
+    state_lock: threading.Lock,
+    done: list[str],
+    failed: list[Any],
+    skipped: list[str],
+    repaired: list[str],
+) -> None:
+    from anime_factory.fal_client import FalBudgetExceeded
+    from anime_factory.fal_models import generate_fal_video
+    from anime_factory.models import FIXED_NEGATIVE, H3_MAX_RETRIES
+
+    prev_last: Path | None = None
+    prev_chain: str | None = None
+    for index, shot in group:
+        sid = str(shot.get("id") or shot.get("take_id") or f"s{index + 1:03d}")
+        shot = dict(shot)
+        shot["id"] = sid
+        try:
+            if progress and index == 0:
+                progress(f"production_started:{sid}")
+            if progress:
+                progress(f"anim:{sid}")
+            chain_id = str(shot.get("chain_id") or "")
+            if int(shot.get("chain_index") or 0) > 0:
+                if (
+                    prev_last is not None
+                    and prev_last.is_file()
+                    and chain_id
+                    and chain_id == str(prev_chain or "")
+                ):
+                    shot = apply_chain_first_frame(shot, prev_last)
+                else:
+                    with state_lock:
+                        failed.append({"id": sid, "error": "pending_chain_missing_last_frame"})
+                    prev_chain = chain_id or prev_chain
+                    continue
+            with state_lock:
+                shots[index] = shot
+            selected = select_passing_generation(conn, root, sid)
+            if selected is not None:
+                existing, _version, _how = selected
+                with state_lock:
+                    skipped.append(sid)
+                rel = existing.relative_to(root).as_posix()
+                mark_completed_passing(conn, sid, join_story(story_id, rel))
+                last_path = _ensure_last_frame(root, shot, existing)
+                if last_path is not None:
+                    _link_next_chain(shots, index, last_path)
+                    prev_last = last_path
+                    try:
+                        put_file(
+                            join_story(story_id, f"episodes/{EP}/keyframes/{sid}/last.png"),
+                            last_path,
+                            "image/png",
+                        )
+                    except Exception:
+                        pass
+                try:
+                    _upload_ok(put_file(join_story(story_id, rel), existing, "video/mp4"))
+                except Exception:
+                    pass
+                prev_chain = chain_id or prev_chain
+                continue
+            version, rel = next_generation_path(root, sid, conn)
+            dest = root / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            used_mode = select_mode(shot)
+            fal_mode = _fal_video_mode(shot)
+            attempt = 0
+            verdict = "pass"
+            last_path: Path | None = None
+            prev_shot = shots[index - 1] if index else None
+            while True:
+                prompt = _fal_picture_prompt(shot)
+                first, last, chars, scenes = _fal_reference_bytes(root, shot)
+                if fal_mode == "r2v" and first and first not in scenes:
+                    scenes = [*scenes, first]
+                    first_arg = None
+                    last_arg = None
+                else:
+                    first_arg = first
+                    last_arg = last if fal_mode == "fl2v" else None
+                negative = str(shot.get("negative_prompt") or "") or FIXED_NEGATIVE
+                try:
+                    duration_s = float(shot.get("duration") or shot.get("duration_s") or 6.0)
+                except (TypeError, ValueError):
+                    duration_s = 6.0
+                print(
+                    {
+                        "fal_submit": sid,
+                        "mode": fal_mode,
+                        "h3_mode": used_mode,
+                        "backend": "fal",
+                        "chain_index": shot.get("chain_index", 0),
+                        "attempt": attempt,
+                    },
+                    flush=True,
+                )
+                generate_fal_video(
+                    fal_mode,
+                    prompt,
+                    duration_s=duration_s,
+                    first_frame_png=first_arg,
+                    last_frame_png=last_arg,
+                    char_ref_pngs=chars,
+                    scene_ref_pngs=scenes,
+                    negative_prompt=negative,
+                    seed=shot.get("seed"),
+                    out_path=dest,
+                    fal_config=fal_config,
+                )
+                extracted = _ensure_last_frame(root, shot, dest)
+                if extracted is not None:
+                    last_path = extracted
+                    _link_next_chain(shots, index, extracted)
+                verdict, _, qc_last = _h3_normalize_and_qc(
+                    root,
+                    conn,
+                    shot,
+                    dest,
+                    prev_shot,
+                    version=version,
+                    rel=rel,
+                    story_id=story_id,
+                    progress=progress,
+                )
+                if qc_last is not None:
+                    last_path = qc_last
+                if verdict != "retry" or attempt >= H3_MAX_RETRIES:
+                    break
+                attempt += 1
+                c_verdict, c_details = continuity_qc(prev_shot, shot, used_mode)
+                issues = list(c_details.get("issues") or []) or ["visual_retry"]
+                try:
+                    from anime_factory.video_visual_qc import map_reasons_to_strategy
+
+                    report = dest.parent / "visual_qc.json"
+                    if report.is_file():
+                        payload = json.loads(report.read_text(encoding="utf-8"))
+                        reasons = list(payload.get("reasons") or [])
+                        if reasons:
+                            issues = list(dict.fromkeys([*issues, *reasons]))
+                        strategy_hint = payload.get("retry_strategy") or map_reasons_to_strategy(reasons)
+                        if strategy_hint and strategy_hint not in issues:
+                            issues.append(strategy_hint)
+                except Exception:  # noqa: BLE001
+                    pass
+                repair = plan_repair(shot, issues, attempt)
+                open_repair_task(conn, sid, issues, attempt, shot.get("h3_prompt"), repair)
+                shot = dict(
+                    shot,
+                    seed=repair["seed"],
+                    h3_prompt=repair["h3_prompt"],
+                    h3_repair_constraints=repair["h3_repair_constraints"],
+                    h3_mode=repair.get("h3_mode") or shot.get("h3_mode"),
+                )
+                with state_lock:
+                    shots[index] = shot
+                version, rel = next_generation_path(root, sid, conn)
+                dest = root / rel
+                used_mode = select_mode(shot)
+                fal_mode = _fal_video_mode(shot)
+                print(
+                    {"fal_repair": sid, "attempt": attempt, "strategy": repair["strategy"], "backend": "fal"},
+                    flush=True,
+                )
+                with state_lock:
+                    repaired.append(sid)
+            if verdict == "pass":
+                with post_lock:
+                    cpu.submit(_h3_upload_files, story_id, root, sid, dest, rel, last_path, progress)
+            else:
+                with state_lock:
+                    failed.append({"id": sid, "verdict": verdict})
+            if last_path is not None:
+                prev_last = last_path
+            prev_chain = chain_id or prev_chain
+        except (BudgetExceeded, ProgressStalled, StartupTimeout, FalBudgetExceeded):
+            raise
+        except Exception as exc:  # noqa: BLE001 — one shot must not drop the chain's siblings
+            with state_lock:
+                failed.append({"id": sid, "error": str(exc)[:800]})
+            prev_chain = str(shot.get("chain_id") or "") or prev_chain
+
+
+def _run_anim_fal(
+    story_id: str,
+    root: Path,
+    conn,
+    progress: ProgressCallback | None = None,
+    fal_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Same shot loop as H3, sampled on fal.ai. Independent chains run together."""
+    from anime_factory.fal_client import FalBudgetExceeded
+
+    shots = _board_shots(root)
+    done: list[str] = []
+    failed: list[Any] = []
+    skipped: list[str] = []
+    repaired: list[str] = []
+    resolution = {
+        "width": VIDEO_WIDTH,
+        "height": VIDEO_HEIGHT,
+        "fps": VIDEO_FPS,
+        "delivery_width": VIDEO_WIDTH,
+        "delivery_height": VIDEO_HEIGHT,
+        "video_backend": "fal",
+    }
+    groups = group_fal_shot_chains(shots)
+    cpu = CpuPostQueue()
+    post_lock = threading.Lock()
+    state_lock = threading.Lock()
+    workers = max(1, int(os.environ.get("FAL_MAX_CONCURRENCY") or "4"))
+
+    def _one(group: list[tuple[int, dict]]) -> None:
+        local, owned = _fal_open_conn(root, conn)
+        try:
+            _run_fal_chain(
+                story_id,
+                root,
+                local,
+                shots,
+                group,
+                fal_config=fal_config,
+                progress=progress,
+                cpu=cpu,
+                post_lock=post_lock,
+                state_lock=state_lock,
+                done=done,
+                failed=failed,
+                skipped=skipped,
+                repaired=repaired,
+            )
+        finally:
+            if owned:
+                try:
+                    local.close()
+                except Exception:
+                    pass
+
+    try:
+        if len(groups) <= 1 or not (Path(root) / "story.sqlite").is_file():
+            for group in groups:
+                _one(group)
+        else:
+            with ThreadPoolExecutor(max_workers=min(workers, len(groups))) as pool:
+                futures = [pool.submit(_one, group) for group in groups]
+                for future in futures:
+                    future.result()
+        posted = cpu.drain()
+        for item in posted:
+            if isinstance(item, dict) and item.get("sid"):
+                done.append(_h3_commit_passing(conn, story_id, root, item, progress=progress))
+            elif item:
+                done.append(str(item))
+    except (BudgetExceeded, ProgressStalled, StartupTimeout, FalBudgetExceeded):
+        raise
+    finally:
+        try:
+            cpu.close()
+        except Exception:
+            pass
+    try:
+        publish_approved_video_index(story_id, root, conn)
+    except Exception as exc:  # noqa: BLE001 — picture files are already uploaded per shot
+        print({"fal_index": str(exc)[:400]}, flush=True)
+    return {
+        "shots_total": len(shots),
+        "shots_done": len(done) + len(skipped),
+        "generated": done,
+        "skipped_existing": skipped,
+        "repaired": repaired,
+        "failed": failed,
+        "resolution": resolution,
+        "model_load_count": 0,
+        "video_backend": "fal",
+        "chains": len(groups),
+        "gpu_done": not failed and (len(done) + len(skipped)) > 0,
+    }
+
+
 def run_anim(
     story_id: str,
     root: Path,
     conn,
     router: ComfyRouter | None,
     progress: ProgressCallback | None = None,
+    fal_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     try:
         backend = lock_video_backend(root=root)
     except VideoBackendLockError as exc:
         raise RuntimeError(str(exc)) from exc
+    if backend == "fal":
+        return _run_anim_fal(story_id, root, conn, progress, fal_config=fal_config)
     if backend == "longlive":
         return _run_anim_longlive(story_id, root, conn, progress)
     if backend == "skyreels_v3_r2v":
@@ -3555,6 +3938,9 @@ def run_compose(
     moss_handoff_done = {"done": False}
 
     def _before_moss_sfx() -> None:
+        # fal workers have no GPU resident. SFX stays on Freesound / builtin.
+        if video_backend == "fal":
+            return
         release_gpu_for_moss_sfx(backend=video_backend)
         moss_handoff_done["done"] = True
 
@@ -3996,6 +4382,33 @@ def _idle_episode_result(
     }
 
 
+def _episode_uses_fal(render_mode: str | None = None) -> bool:
+    from gpu_worker.images import is_fal_worker_mode
+
+    if is_fal_worker_mode():
+        return True
+    mode = str(render_mode or "").strip().lower()
+    cap = str(os.environ.get("AF_IMAGE_CAPABILITY") or "").strip().lower()
+    if mode == "fal" and cap in {"", "fal"}:
+        return True
+    backend = str(os.environ.get("VIDEO_BACKEND") or os.environ.get("AF_VIDEO_BACKEND") or "").strip().lower()
+    return backend in {"fal", "fal.ai", "fal_ai", "fal-ai", "fal_api"} and cap in {"", "fal"}
+
+
+def _apply_render_mode(render_mode: str | None) -> None:
+    """Honor a control-plane render_mode without overriding a locked Vast H3 image."""
+    mode = str(render_mode or "").strip().lower()
+    if not mode or os.environ.get("AF_VIDEO_BACKEND_LOCKED"):
+        return
+    cap = str(os.environ.get("AF_IMAGE_CAPABILITY") or "").strip().lower()
+    if mode == "fal" and cap in {"", "fal"}:
+        os.environ["VIDEO_BACKEND"] = "fal"
+        os.environ["AF_VIDEO_BACKEND"] = "fal"
+    elif mode in {"vast_gpu", "h3", "vast"} and cap in {"", "h3"}:
+        os.environ["VIDEO_BACKEND"] = "h3"
+        os.environ["AF_VIDEO_BACKEND"] = "h3"
+
+
 def run_gpu_episode(
     story_id: str,
     root: Path | None = None,
@@ -4008,6 +4421,8 @@ def run_gpu_episode(
     story_status: str | None = None,
     until_stage: str | None = None,
     episode_status: str | None = None,
+    fal_config: dict[str, Any] | None = None,
+    render_mode: str | None = None,
 ) -> dict[str, Any]:
     global EP
     ep = _normalize_episode_code(episode_code)
@@ -4083,11 +4498,17 @@ def run_gpu_episode(
     else:
         conn = ensure_story_db(story_id, root)
     cached_anim = _completed_anim_from_disk(story_id, root, conn)
+    _apply_render_mode(render_mode)
+    if fal_config or _episode_uses_fal(render_mode):
+        from anime_factory.fal_models import begin_fal_episode
+
+        begin_fal_episode(fal_config if isinstance(fal_config, dict) else None)
     router = None
-    try:
-        router = ComfyRouter()
-    except Exception:  # noqa: BLE001
-        router = None
+    if not _episode_uses_fal(render_mode):
+        try:
+            router = ComfyRouter()
+        except Exception:  # noqa: BLE001
+            router = None
     if progress:
         progress("design")
     if control:
@@ -4156,6 +4577,9 @@ def run_gpu_episode(
         unload_still_models(router)
         if progress:
             progress("weights:skyreels")
+    elif backend == "fal":
+        if progress:
+            progress("weights:fal_api")
     else:
         if progress:
             progress("weights:h3_join")
@@ -4165,7 +4589,14 @@ def run_gpu_episode(
         join_h3_weights()
         ensure_h3_dits_for_shots(_board_shots(root))
         unload_still_models(router)
-    anim = cached_anim if cached_anim is not None else run_anim(story_id, root, conn, router, progress=progress)
+    anim = cached_anim if cached_anim is not None else run_anim(
+        story_id,
+        root,
+        conn,
+        router,
+        progress=progress,
+        fal_config=fal_config if isinstance(fal_config, dict) else None,
+    )
     if backend != "longlive" and anim.get("gpu_done"):
         try:
             flush_gpu_artifacts(story_id, root, conn, progress=progress)
@@ -4446,6 +4877,11 @@ def run_gpu_batch(
                     raise RuntimeError(f"claim failed: {claimed.get('error') or claimed}")
             langs = episode.get("langs") if isinstance(episode.get("langs"), list) else None
             skip_shorts = is_short_kind(episode.get("kind"))
+            episode_fal = {}
+            if isinstance(batch.get("fal_config"), dict):
+                episode_fal.update(batch["fal_config"])
+            if isinstance(episode.get("fal_config"), dict):
+                episode_fal.update(episode["fal_config"])
             episode_result = run_gpu_episode(
                 story_id,
                 root=story_root,
@@ -4461,6 +4897,8 @@ def run_gpu_batch(
                 or None,
                 until_stage=str(episode.get("until_stage") or "") or None,
                 episode_status=str(episode.get("episode_status") or "") or None,
+                fal_config=episode_fal or None,
+                render_mode=str(episode.get("render_mode") or batch.get("render_mode") or "") or None,
             )
             if int(episode_result.get("remaining") or 0) == 0:
                 status = "done"

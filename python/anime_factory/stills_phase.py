@@ -240,8 +240,12 @@ def generate_tier_a_keyframe(
     """A-tier: Qwen-Image-2.1 T2I. No character reference."""
     s = shot if isinstance(shot, ShotContract) else ShotContract.from_dict(shot)
     if dry_run is None:
-        dry_run = _dry_flag(env, "QWEN_IMAGE_21_DRY_RUN")
-    backend_name = select_image_backend(env=env)
+        dry_run = _dry_flag(env, "QWEN_IMAGE_21_DRY_RUN") or _dry_flag(env, "FAL_DRY_RUN")
+    mapping = dict(env or os.environ)
+    if dry_run:
+        mapping["FAL_DRY_RUN"] = "1"
+        mapping.setdefault("QWEN_IMAGE_21_DRY_RUN", "1")
+    backend_name = select_image_backend(env=mapping)
     if backend_name == "qwen_image_21" and dry_run:
         return (
             generate_qwen_image_21(
@@ -254,7 +258,7 @@ def generate_tier_a_keyframe(
             ),
             "qwen_image_21",
         )
-    result = get_image_backend(backend_name, env=env).generate(
+    result = get_image_backend(backend_name, env=mapping).generate(
         ImageGenerateRequest(
             prompt=s.prompt,
             negative_prompt=s.negative_prompt,
@@ -541,7 +545,7 @@ def run_video_phase(
         references=list(request_doc.references),
         aspect=aspect,
         rife=rife,
-        meta={"dry_run": _dry_flag(env, "QWEN_IMAGE_21_DRY_RUN")},
+        meta={"dry_run": _dry_flag(env, "QWEN_IMAGE_21_DRY_RUN") or _dry_flag(env, "FAL_DRY_RUN")},
     )
     result = gated_video_generate(pack, req, backend=backend, env=env)
     return video_contract_from_result(pack.shot_id, "", result, request=req)
